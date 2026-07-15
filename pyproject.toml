@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "urirun-connector-plesk"
+version = "0.1.0"
+description = "Secure Plesk REST API connector for urirun with vault-backed API key bootstrap"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+authors = [{name = "if-uri"}]
+dependencies = ["urirun>=0.4.14"]
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[project.scripts]
+urirun-connector-plesk = "urirun_connector_plesk.core:main"
+
+[project.entry-points."urirun.bindings"]
+plesk = "urirun_connector_plesk.core:urirun_bindings"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["urirun_connector_plesk*"]
+
+[tool.setuptools.package-data]
+urirun_connector_plesk = ["connector.manifest.json", "contracts.json"]

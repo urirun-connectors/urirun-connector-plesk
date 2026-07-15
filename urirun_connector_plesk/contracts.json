@@ -1,0 +1,100 @@
+{
+  "contracts": {
+    "auth/command/bootstrap-api-key": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "base_url": "?str",
+        "admin_vault_entry_id": "?str",
+        "runtime_vault_entry_id": "?str",
+        "login": "?str",
+        "ip": "?str",
+        "description": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "base_url": "str",
+        "vault_entry_id": "str",
+        "authorized": "bool",
+        "credential_type": "str"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {},
+          "result": {
+            "ok": true,
+            "base_url": "https://plesk.example.com:8443",
+            "vault_entry_id": "plesk-runtime",
+            "authorized": true,
+            "credential_type": "api_key"
+          }
+        }
+      ]
+    },
+    "auth/query/status": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "probe_path": "?str",
+        "vault_url": "?str"
+      },
+      "out": {"base_url": "str", "authorized": "bool", "http_status": "int"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {},
+          "result": {"ok": true, "base_url": "https://plesk.example.com:8443", "authorized": true, "http_status": 200}
+        }
+      ]
+    },
+    "api/query/request": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"path": "str", "base_url": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"http_status": "int", "data": "any"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {"payload": {"path": "/api/v2/domains"}, "result": {"ok": true, "http_status": 200, "data": []}}
+      ]
+    },
+    "api/command/request": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "path": "str",
+        "method": "?str",
+        "body": "?any",
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {"http_status": "int", "data": "any"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {"path": "/api/v2/domains", "method": "POST", "body": {"name": "example.com"}},
+          "result": {"ok": true, "http_status": 201, "data": {"id": 1}}
+        }
+      ]
+    },
+    "doctor/query/report": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {},
+      "out": {"connector": "str", "version": "str", "status": "str"},
+      "errors": [],
+      "examples": [
+        {"payload": {}, "result": {"ok": true, "connector": "plesk", "version": "0.1.0", "status": "ready"}}
+      ]
+    }
+  },
+  "wires": []
+}
