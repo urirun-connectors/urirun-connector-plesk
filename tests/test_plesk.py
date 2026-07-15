@@ -14,6 +14,7 @@ from urirun_connector_plesk import (
     auth_status,
     bootstrap_api_key,
     connector_manifest,
+    create_mailbox,
     urirun_bindings,
 )
 import urirun_connector_plesk.core as core
@@ -24,6 +25,7 @@ ROUTES = {
     "plesk://host/api/query/request",
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
+    "plesk://host/mailbox/command/create",
     "plesk://host/doctor/query/report",
 }
 
@@ -100,6 +102,42 @@ def test_bindings_contract_and_manifest():
     assert ROUTES <= {route["uri"] for route in urirun.list_routes(registry)}
     manifest = connector_manifest()
     assert manifest["id"] == "plesk" and set(manifest["routes"]) == ROUTES
+
+
+def test_mailbox_create_generates_password_and_stores_it_without_returning_it(monkeypatch):
+    request = {}
+    stored = {}
+
+    def fake_authorized_request(**kwargs):
+        request.update(kwargs)
+        return 200, {"status": "created"}
+
+    monkeypatch.setattr(core, "_authorized_request", fake_authorized_request)
+    monkeypatch.setattr(
+        core,
+        "_vault_store_secrets",
+        lambda entry, origin, label, values, vault_url: stored.update(
+            entry=entry, origin=origin, label=label, values=values,
+        ) or entry,
+    )
+    result = create_mailbox(
+        email="agent@prototypowanie.pl",
+        credential_vault_entry_id="agent-mailbox-runtime",
+        credential_origin="imap://mail.prototypowanie.pl",
+        base_url="https://plesk.example.com:8443",
+    )
+    assert result["ok"] and result["created"]
+    assert request["path"] == "/api/v2/cli/mail/call"
+    assert request["body"]["params"][:2] == ["--create", "agent@prototypowanie.pl"]
+    generated = request["body"]["params"][3]
+    assert len(generated) >= 24 and stored["values"] == {"username": "agent@prototypowanie.pl", "password": generated}
+    assert stored["entry"] == "agent-mailbox-runtime" and stored["origin"] == "imap://mail.prototypowanie.pl"
+    assert generated not in json.dumps(result)
+
+
+def test_mailbox_create_rejects_invalid_email_or_credential_origin():
+    assert create_mailbox(email="not-an-email", credential_origin="imap://mail.example.com")["ok"] is False
+    assert create_mailbox(email="agent@example.com", credential_origin="https://mail.example.com")["ok"] is False
 
 
 def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):

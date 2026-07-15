@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
+import secrets
 import ssl
 import urllib.error
 import urllib.parse
@@ -89,16 +91,29 @@ def _vault_lease(entry_id: str, origin: str, field: str, vault_url: str = "") ->
 
 
 def _vault_store(entry_id: str, origin: str, api_key: str, vault_url: str = "") -> str:
+    return _vault_store_secrets(entry_id, origin, "Plesk REST API key", {"api_key": api_key}, vault_url)
+
+
+def _vault_store_secrets(
+    entry_id: str, origin: str, label: str, values: dict[str, str], vault_url: str = "",
+) -> str:
     url, token = _vault_settings(vault_url)
     status, data = _request_json(
         f"{url}/vault",
         method="POST",
         headers={"authorization": f"Bearer {token}"},
-        body={"id": entry_id, "origin": origin, "label": "Plesk REST API key", "secrets": {"api_key": api_key}},
+        body={"id": entry_id, "origin": origin, "label": label, "secrets": values},
     )
     if status not in {200, 201}:
         raise RuntimeError("plesk_vault_store_failed")
     return str(data.get("entry", {}).get("id") or entry_id)
+
+
+def _credential_origin(value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"imap", "imaps"} or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("plesk_mailbox_credential_origin_invalid")
+    return f"{parsed.scheme}://{parsed.netloc}"
 
 
 def _redact(value: Any) -> Any:
@@ -221,9 +236,60 @@ def api_command(
     return urirun.ok(http_status=status, data=_redact(data))
 
 
+@conn.handler("mailbox/command/create", isolated=True, meta={"label": "Create a Plesk mailbox and store its generated credential"})
+def create_mailbox(
+    email: str = "",
+    display_name: str = "",
+    credential_vault_entry_id: str = "",
+    credential_origin: str = "",
+    base_url: str = "",
+    runtime_vault_entry_id: str = "plesk-runtime",
+    vault_url: str = "",
+    api_path: str = "/api/v2/cli/mail/call",
+) -> dict[str, Any]:
+    address = email.strip().lower()
+    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+", address):
+        return urirun.fail("plesk_mailbox_email_invalid")
+    try:
+        origin = _credential_origin(credential_origin)
+        entry_id = credential_vault_entry_id or f"plesk-mailbox-{hashlib.sha256(address.encode()).hexdigest()[:20]}"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]+", entry_id):
+            raise RuntimeError("plesk_mailbox_vault_entry_invalid")
+        password = f"{secrets.token_urlsafe(24)}!aA9"
+        status, data = _authorized_request(
+            base_url=base_url,
+            path=api_path,
+            method="POST",
+            body={"params": ["--create", address, "-passwd", password, "-mailbox", "true"]},
+            runtime_vault_entry_id=runtime_vault_entry_id,
+            vault_url=vault_url,
+        )
+        if not 200 <= status < 300:
+            raise RuntimeError(f"plesk_mailbox_create_failed:{status}")
+        stored_id = _vault_store_secrets(
+            entry_id,
+            origin,
+            f"Plesk mailbox {address}",
+            {"username": address, "password": password},
+            vault_url,
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    finally:
+        password = ""
+    return urirun.ok(
+        email=address,
+        display_name=display_name[:160],
+        created=True,
+        credential_vault_entry_id=stored_id,
+        credential_origin=origin,
+        api_result=_redact(data),
+    )
+
+
 @conn.handler("plesk://host/doctor/query/report", isolated=True, meta={"label": "Plesk connector readiness report"})
 def doctor() -> dict[str, Any]:
-    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.1.0", "status": "ready"}
+    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.2.0", "status": "ready"}
 
 
 def urirun_bindings() -> dict[str, Any]:

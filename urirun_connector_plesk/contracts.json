@@ -84,6 +84,48 @@
         }
       ]
     },
+    "mailbox/command/create": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "email": "str",
+        "display_name": "?str",
+        "credential_vault_entry_id": "?str",
+        "credential_origin": "str",
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str",
+        "api_path": "?str"
+      },
+      "out": {
+        "email": "str",
+        "display_name": "str",
+        "created": "bool",
+        "credential_vault_entry_id": "str",
+        "credential_origin": "str",
+        "api_result": "any"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {
+            "email": "agent@example.com",
+            "credential_vault_entry_id": "agent-mailbox-runtime",
+            "credential_origin": "imap://mail.example.com"
+          },
+          "result": {
+            "ok": true,
+            "email": "agent@example.com",
+            "display_name": "",
+            "created": true,
+            "credential_vault_entry_id": "agent-mailbox-runtime",
+            "credential_origin": "imap://mail.example.com",
+            "api_result": {}
+          }
+        }
+      ]
+    },
     "doctor/query/report": {
       "version": "v1",
       "effect": "query",
@@ -92,7 +134,7 @@
       "out": {"connector": "str", "version": "str", "status": "str"},
       "errors": [],
       "examples": [
-        {"payload": {}, "result": {"ok": true, "connector": "plesk", "version": "0.1.0", "status": "ready"}}
+        {"payload": {}, "result": {"ok": true, "connector": "plesk", "version": "0.2.0", "status": "ready"}}
       ]
     }
   },

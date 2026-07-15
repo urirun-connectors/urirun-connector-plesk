@@ -11,6 +11,7 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/auth/query/status` | validate the stored API key |
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
+| `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
 | `plesk://host/doctor/query/report` | connector readiness |
 
 The bootstrap follows the official Plesk flow:
