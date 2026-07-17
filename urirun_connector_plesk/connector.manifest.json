@@ -22,7 +22,7 @@
   ],
   "install": {
     "mode": "urirun-extra",
-    "pipSpec": "urirun-connector-plesk @ git+https://github.com/urirun-connectors/urirun-connector-plesk.git@v0.3.0"
+    "pipSpec": "urirun-connector-plesk @ git+https://github.com/urirun-connectors/urirun-connector-plesk.git@v0.4.0"
   },
   "provenance": "verified",
   "publisher": {
@@ -40,6 +40,8 @@
     "plesk://host/auth/query/status",
     "plesk://host/mailbox/command/create",
     "plesk://host/site/command/publish",
+    "plesk://host/site/command/sync",
+    "plesk://host/site/query/methods",
     "plesk://host/doctor/query/report"
   ],
   "examples": [
@@ -52,6 +54,17 @@
       "title": "List domains",
       "uri": "plesk://host/api/query/request",
       "payload": {"path": "/api/v2/domains"}
+    },
+    {
+      "title": "Dry-run www → httpdocs sync",
+      "uri": "plesk://host/site/command/sync",
+      "payload": {
+        "source_dir": "/repo/www",
+        "remote_path": "/httpdocs",
+        "host": "prototypowanie.pl",
+        "domain": "subactor.com",
+        "apply": false
+      }
     }
   ],
   "adapterKinds": ["local-function"]

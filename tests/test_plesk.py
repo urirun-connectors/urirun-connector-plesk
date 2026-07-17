@@ -16,6 +16,7 @@ from urirun_connector_plesk import (
     connector_manifest,
     create_mailbox,
     site_publish,
+    site_sync,
     urirun_bindings,
 )
 import urirun_connector_plesk.core as core
@@ -28,6 +29,8 @@ ROUTES = {
     "plesk://host/auth/query/status",
     "plesk://host/mailbox/command/create",
     "plesk://host/site/command/publish",
+    "plesk://host/site/command/sync",
+    "plesk://host/site/query/methods",
     "plesk://host/doctor/query/report",
 }
 
@@ -266,12 +269,55 @@ def _seed_site(tmp_path):
     (tmp_path / "pl" / "index.html").write_text("<h1>pl</h1>", encoding="utf-8")
 
 
+def test_site_sync_dry_run_plans_without_upload(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    fake_sftp = _FakeSFTP()
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda *a, **k: (_FakeTransport(), fake_sftp, "aa11bb22"),
+    )
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
+
+    result = site_sync(source_dir=str(www), remote_path="/httpdocs", host="prototypowanie.pl")
+
+    assert result["ok"] and result["dry_run"] is True and result["files_planned"] == 4
+    assert {item["path"] for item in result["plan"]} == {
+        "index.html", "assets/app.css", "assets/app.js", "pl/index.html",
+    }
+    assert fake_sftp.puts == []
+
+
+def test_site_sync_apply_requires_env(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    monkeypatch.delenv("PLESK_SYNC_APPLY", raising=False)
+    result = site_sync(
+        source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+    )
+    assert result.get("error") == "plesk_sync_apply_required"
+    assert result.get("dry_run") is True
+
+
+def test_site_sync_rejects_non_www_source(tmp_path):
+    other = tmp_path / "not-www"
+    other.mkdir()
+    (other / "index.html").write_text("x", encoding="utf-8")
+    result = site_sync(source_dir=str(other), host="prototypowanie.pl")
+    assert result.get("error") == "plesk_site_source_not_allowlisted"
+
+
 def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeypatch, tmp_path):
-    _seed_site(tmp_path)
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
     fake_sftp = _FakeSFTP()
     fake_transport = _FakeTransport()
     leases = {"username": "subactor_customer", "password": "s3cr3t-sftp"}
 
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
     monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": leases[field])
     monkeypatch.setattr(
         core, "_sftp_connect",
@@ -279,36 +325,45 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
     )
 
     result = site_publish(
-        source_dir=str(tmp_path),
+        source_dir=str(www),
         remote_path="/httpdocs",
         sftp_host="prototypowanie.pl",
         credential_origin="sftp://prototypowanie.pl",
         sftp_vault_entry_id="plesk-sftp-subactor",
+        transport="sftp",
+        apply=True,
     )
 
-    assert result["ok"] and result["files_uploaded"] == 4
+    assert result["ok"] and result["dry_run"] is False and result["files_uploaded"] == 4
     assert set(result["files"]) == {"index.html", "assets/app.css", "assets/app.js", "pl/index.html"}
     assert result["host_fingerprint"] == "aa11bb22" and result["remote_path"] == "/httpdocs"
-    # subdirectories were created remotely
     assert "/httpdocs/assets" in fake_sftp.made and "/httpdocs/pl" in fake_sftp.made
     assert len(fake_sftp.puts) == 4
-    # credentials never surface in the result
     assert "s3cr3t-sftp" not in json.dumps(result) and "subactor_customer" not in json.dumps(result)
     assert fake_transport.closed
 
 
 def test_site_publish_validates_inputs(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    monkeypatch.setenv("PLESK_SYNC_ALLOWED_SOURCES", str(tmp_path))
     monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
     assert site_publish(source_dir="/no/such/dir", sftp_host="h").get("error") == "plesk_site_source_dir_invalid"
-    assert site_publish(source_dir=str(tmp_path), remote_path="httpdocs", sftp_host="h").get("error") == "plesk_site_remote_path_invalid"
-    assert site_publish(source_dir=str(tmp_path), remote_path="/a/../b", sftp_host="h").get("error") == "plesk_site_remote_path_invalid"
-    assert site_publish(source_dir=str(tmp_path), sftp_host="bad host!").get("error") == "plesk_site_host_invalid"
-    assert site_publish(source_dir=str(tmp_path), sftp_host="h", sftp_port=0).get("error") == "plesk_site_port_invalid"
+    assert site_publish(source_dir=str(www), remote_path="httpdocs", sftp_host="h").get("error") == "plesk_site_remote_path_invalid"
+    assert site_publish(source_dir=str(www), remote_path="/a/../b", sftp_host="h").get("error") == "plesk_site_remote_path_invalid"
+    assert site_publish(source_dir=str(www), sftp_host="bad host!").get("error") == "plesk_site_host_invalid"
+    assert site_publish(source_dir=str(www), sftp_host="h", sftp_port=0).get("error") == "plesk_site_port_invalid"
 
 
 def test_site_publish_requires_paramiko(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
     monkeypatch.setattr(core, "paramiko", None)
-    assert site_publish(source_dir=str(tmp_path), sftp_host="h").get("error") == "plesk_sftp_paramiko_missing"
+    assert site_publish(
+        source_dir=str(www), sftp_host="h", transport="sftp", apply=True,
+    ).get("error") == "plesk_sftp_paramiko_missing"
 
 
 def test_sftp_connect_rejects_host_key_mismatch(monkeypatch):

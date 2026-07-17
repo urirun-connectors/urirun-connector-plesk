@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import ftplib
 import hashlib
 import json
 import os
@@ -194,6 +195,114 @@ def _sftp_upload_dir(sftp, source_dir: str, remote_path: str) -> list[str]:
     return uploaded
 
 
+def _ftp_connect(host: str, port: int, username: str, password: str, tls: bool = True):
+    """Open an authenticated FTP session (FTPS by default)."""
+    ftp = ftplib.FTP_TLS() if tls else ftplib.FTP()
+    ftp.connect(host, port, timeout=30)
+    ftp.login(username, password)
+    if tls:
+        ftp.prot_p()
+    return ftp
+
+
+def _ftp_mkdirs(ftp, remote_dir: str, made: set[str]) -> None:
+    path = ""
+    for part in [p for p in remote_dir.split("/") if p]:
+        path = f"{path}/{part}"
+        if path in made:
+            continue
+        try:
+            ftp.mkd(path)
+        except ftplib.error_perm:
+            pass  # already exists
+        made.add(path)
+
+
+def _ftp_upload_dir(ftp, source_dir: str, remote_path: str) -> list[str]:
+    base = os.path.abspath(source_dir)
+    made: set[str] = set()
+    uploaded: list[str] = []
+    for root, _dirs, files in os.walk(base):
+        rel = os.path.relpath(root, base)
+        remote_dir = remote_path if rel == "." else f"{remote_path}/{rel.replace(os.sep, '/')}"
+        _ftp_mkdirs(ftp, remote_dir, made)
+        for name in sorted(files):
+            with open(os.path.join(root, name), "rb") as handle:
+                ftp.storbinary(f"STOR {remote_dir}/{name}", handle)
+            uploaded.append(name if rel == "." else f"{rel.replace(os.sep, '/')}/{name}")
+    return uploaded
+
+
+# ── Deployment transport router ──────────────────────────────────────────────
+# Detect which file-deployment authorization actually works for this host and
+# route the publish through it, instead of assuming a single mechanism.
+
+def _probe_sftp(host: str, port: int, username: str, password: str, host_fingerprint: str = "") -> tuple[bool, str]:
+    if paramiko is None:
+        return False, "paramiko_missing"
+    transport = None
+    try:
+        transport, sftp, _fp = _sftp_connect(host, port, username, password, host_fingerprint)
+        sftp.close()
+        return True, "ok"
+    except Exception as error:  # auth/host-key/transport failures are all "unavailable"
+        return False, type(error).__name__
+    finally:
+        if transport is not None:
+            transport.close()
+
+
+def _probe_ftp(host: str, port: int, username: str, password: str, tls: bool = True) -> tuple[bool, str]:
+    ftp = None
+    try:
+        ftp = _ftp_connect(host, port, username, password, tls)
+        return True, "ok"
+    except Exception as error:
+        return False, type(error).__name__
+    finally:
+        if ftp is not None:
+            try:
+                ftp.quit()
+            except Exception:
+                pass
+
+
+# transport name -> (default vault entry, default port, probe function signature marker)
+_TRANSPORT_ORDER = ("sftp", "ftp")
+
+
+def _transport_origin(transport: str, host: str, credential_origin: str = "") -> str:
+    return credential_origin or f"{transport}://{host}"
+
+
+def _detect_transports(host: str, *, sftp_port: int, ftp_port: int, ftp_tls: bool,
+                       sftp_vault_entry_id: str, ftp_vault_entry_id: str,
+                       credential_origin: str, host_fingerprint: str, vault_url: str) -> list[dict[str, Any]]:
+    """Probe each deployment transport with its vault credentials; return availability."""
+    plans = [
+        ("sftp", sftp_vault_entry_id, sftp_port),
+        ("ftp", ftp_vault_entry_id, ftp_port),
+    ]
+    results: list[dict[str, Any]] = []
+    for name, entry, port in plans:
+        origin = _transport_origin(name, host, credential_origin)
+        try:
+            username = _vault_lease(entry, origin, "username", vault_url)
+            password = _vault_lease(entry, origin, "password", vault_url)
+        except RuntimeError as error:
+            results.append({"transport": name, "available": False, "detail": str(error)})
+            continue
+        try:
+            if name == "sftp":
+                ok, detail = _probe_sftp(host, port, username, password, host_fingerprint)
+            else:
+                ok, detail = _probe_ftp(host, port, username, password, ftp_tls)
+        finally:
+            username = password = ""
+        results.append({"transport": name, "available": ok, "detail": detail})
+    return results
+
+
 @conn.handler("auth/command/bootstrap-api-key", isolated=True, meta={"label": "Exchange Plesk admin login for a vault-backed REST API key"})
 def bootstrap_api_key(
     base_url: str = "",
@@ -351,61 +460,314 @@ def create_mailbox(
     )
 
 
-@conn.handler("site/command/publish", isolated=True, meta={"label": "Publish a static site directory to a Plesk subscription over SFTP"})
-def site_publish(
-    source_dir: str = "",
-    remote_path: str = "/httpdocs",
-    sftp_host: str = "",
-    sftp_port: int = 22,
-    sftp_vault_entry_id: str = "plesk-sftp",
-    credential_origin: str = "",
-    host_fingerprint: str = "",
-    vault_url: str = "",
-) -> dict[str, Any]:
-    if paramiko is None:
-        return urirun.fail("plesk_sftp_paramiko_missing")
+def _validate_publish_inputs(source_dir: str, remote_path: str, host: str) -> str:
     if not source_dir or not os.path.isdir(source_dir):
-        return urirun.fail("plesk_site_source_dir_invalid")
+        return "plesk_site_source_dir_invalid"
     if not _SAFE_REMOTE.fullmatch(remote_path) or ".." in remote_path:
-        return urirun.fail("plesk_site_remote_path_invalid")
-    if not sftp_host or not re.fullmatch(r"[A-Za-z0-9.-]+", sftp_host):
-        return urirun.fail("plesk_site_host_invalid")
-    try:
-        port = int(sftp_port)
-        if not 1 <= port <= 65535:
-            raise ValueError
-    except (TypeError, ValueError):
-        return urirun.fail("plesk_site_port_invalid")
+        return "plesk_site_remote_path_invalid"
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return "plesk_site_host_invalid"
+    return ""
 
-    username = password = ""
+
+def _validate_port(port: int) -> str:
+    try:
+        value = int(port)
+    except (TypeError, ValueError):
+        return "plesk_site_port_invalid"
+    if not 1 <= value <= 65535:
+        return "plesk_site_port_invalid"
+    return ""
+
+
+_PRESERVE_REMOTE_NAMES = (".htaccess", ".well-known")
+
+
+def _source_allowed(source_dir: str) -> bool:
+    """Allow only www/ (or explicit PLESK_SYNC_ALLOWED_SOURCES prefixes)."""
+    abs_path = os.path.abspath(source_dir)
+    if ".." in source_dir.replace("\\", "/"):
+        return False
+    raw = os.environ.get("PLESK_SYNC_ALLOWED_SOURCES", "").strip()
+    if raw:
+        for prefix in raw.split(":"):
+            prefix = prefix.strip()
+            if not prefix:
+                continue
+            root = os.path.abspath(prefix)
+            if abs_path == root or abs_path.startswith(root + os.sep):
+                return True
+        return False
+    return os.path.basename(abs_path.rstrip(os.sep)) == "www"
+
+
+def _plan_local_tree(source_dir: str, remote_path: str) -> list[dict[str, Any]]:
+    """Build a dry-run upload plan: relative path, size, sha256, remote target."""
+    base = os.path.abspath(source_dir)
+    planned: list[dict[str, Any]] = []
+    for root, dirs, files in os.walk(base):
+        # never sync VCS / local tooling into httpdocs
+        dirs[:] = [d for d in sorted(dirs) if d not in {".git", ".venv", "node_modules", "__pycache__"}]
+        rel_root = os.path.relpath(root, base)
+        for name in sorted(files):
+            if name in {".DS_Store"}:
+                continue
+            local = os.path.join(root, name)
+            rel = name if rel_root == "." else f"{rel_root.replace(os.sep, '/')}/{name}"
+            digest = hashlib.sha256()
+            with open(local, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+            planned.append({
+                "path": rel,
+                "bytes": os.path.getsize(local),
+                "sha256": digest.hexdigest(),
+                "remote": f"{remote_path}/{rel}",
+            })
+    return planned
+
+
+def _apply_permitted(apply: bool) -> tuple[bool, str | None]:
+    """Uploads require apply=true AND PLESK_SYNC_APPLY=1. Default is dry-run."""
+    if not apply:
+        return False, None
+    if os.environ.get("PLESK_SYNC_APPLY", "").strip() != "1":
+        return False, "plesk_sync_apply_required"
+    return True, None
+
+
+def _publish_over_sftp(source_dir, remote_path, host, port, username, password, host_fingerprint):
     transport = None
     try:
-        origin = _sftp_origin(credential_origin or f"sftp://{sftp_host}")
-        username = _vault_lease(sftp_vault_entry_id, origin, "username", vault_url)
-        password = _vault_lease(sftp_vault_entry_id, origin, "password", vault_url)
-        transport, sftp, fingerprint = _sftp_connect(sftp_host, port, username, password, host_fingerprint)
+        transport, sftp, fingerprint = _sftp_connect(host, port, username, password, host_fingerprint)
         try:
             uploaded = _sftp_upload_dir(sftp, source_dir, remote_path)
         finally:
             sftp.close()
-    except RuntimeError as error:
-        return urirun.fail(str(error))
     finally:
-        username = password = ""
         if transport is not None:
             transport.close()
+    return uploaded, {"host_fingerprint": fingerprint}
+
+
+def _publish_over_ftp(source_dir, remote_path, host, port, username, password, tls):
+    ftp = _ftp_connect(host, port, username, password, tls)
+    try:
+        uploaded = _ftp_upload_dir(ftp, source_dir, remote_path)
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+    return uploaded, {"tls": bool(tls)}
+
+
+@conn.handler("site/query/methods", isolated=True, meta={"label": "Detect which file-deployment transports are authorized for a Plesk host"})
+def site_methods(
+    host: str = "",
+    sftp_port: int = 22,
+    ftp_port: int = 21,
+    ftp_tls: bool = True,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    ftp_vault_entry_id: str = "plesk-ftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    results = _detect_transports(
+        host, sftp_port=int(sftp_port), ftp_port=int(ftp_port), ftp_tls=bool(ftp_tls),
+        sftp_vault_entry_id=sftp_vault_entry_id, ftp_vault_entry_id=ftp_vault_entry_id,
+        credential_origin=credential_origin, host_fingerprint=host_fingerprint, vault_url=vault_url,
+    )
+    available = [r["transport"] for r in results if r["available"]]
+    return urirun.ok(host=host, methods=results, available=available,
+                     recommended=(available[0] if available else None))
+
+
+def _site_tree_sync(
+    *,
+    source_dir: str,
+    remote_path: str,
+    host: str,
+    transport: str,
+    sftp_port: int,
+    ftp_port: int,
+    ftp_tls: bool,
+    sftp_vault_entry_id: str,
+    ftp_vault_entry_id: str,
+    credential_origin: str,
+    host_fingerprint: str,
+    vault_url: str,
+    apply: bool,
+    domain: str = "",
+) -> dict[str, Any]:
+    invalid = _validate_publish_inputs(source_dir, remote_path, host)
+    if invalid:
+        return urirun.fail(invalid)
+    for port in (sftp_port, ftp_port):
+        bad = _validate_port(port)
+        if bad:
+            return urirun.fail(bad)
+    if transport not in {"auto", "sftp", "ftp"}:
+        return urirun.fail("plesk_site_transport_invalid")
+    if not _source_allowed(source_dir):
+        return urirun.fail("plesk_site_source_not_allowlisted")
+
+    plan = _plan_local_tree(source_dir, remote_path)
+    may_write, apply_error = _apply_permitted(bool(apply))
+    if apply_error:
+        return urirun.fail(apply_error, dry_run=True, files_planned=len(plan), plan=plan,
+                           preserve_remote=list(_PRESERVE_REMOTE_NAMES), domain=domain or None)
+    if not may_write:
+        return urirun.ok(
+            dry_run=True,
+            host=host,
+            remote_path=remote_path,
+            domain=domain or None,
+            files_planned=len(plan),
+            plan=plan,
+            preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+            note="set apply=true and PLESK_SYNC_APPLY=1 to upload",
+        )
+
+    chosen = transport
+    detection: list[dict[str, Any]] | None = None
+    if transport == "auto":
+        detection = _detect_transports(
+            host, sftp_port=int(sftp_port), ftp_port=int(ftp_port), ftp_tls=bool(ftp_tls),
+            sftp_vault_entry_id=sftp_vault_entry_id, ftp_vault_entry_id=ftp_vault_entry_id,
+            credential_origin=credential_origin, host_fingerprint=host_fingerprint, vault_url=vault_url,
+        )
+        available = [r["transport"] for r in detection if r["available"]]
+        if not available:
+            return urirun.fail("plesk_site_no_authorized_transport", methods=detection)
+        chosen = available[0]
+
+    if chosen == "sftp" and paramiko is None:
+        return urirun.fail("plesk_sftp_paramiko_missing")
+
+    entry = sftp_vault_entry_id if chosen == "sftp" else ftp_vault_entry_id
+    port = int(sftp_port) if chosen == "sftp" else int(ftp_port)
+    origin = _transport_origin(chosen, host, credential_origin)
+    username = password = ""
+    try:
+        username = _vault_lease(entry, origin, "username", vault_url)
+        password = _vault_lease(entry, origin, "password", vault_url)
+        if chosen == "sftp":
+            uploaded, extra = _publish_over_sftp(
+                source_dir, remote_path, host, port, username, password, host_fingerprint,
+            )
+        else:
+            uploaded, extra = _publish_over_ftp(
+                source_dir, remote_path, host, port, username, password, bool(ftp_tls),
+            )
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    except Exception as error:
+        return urirun.fail(f"plesk_site_sync_failed:{type(error).__name__}")
+    finally:
+        username = password = ""
     return urirun.ok(
-        host=sftp_host,
+        dry_run=False,
+        host=host,
+        transport=chosen,
         remote_path=remote_path,
+        domain=domain or None,
         files_uploaded=len(uploaded),
         files=uploaded,
-        host_fingerprint=fingerprint,
+        files_planned=len(plan),
+        preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+        methods=detection,
+        **extra,
+    )
+
+
+@conn.handler(
+    "site/command/sync",
+    isolated=True,
+    meta={"label": "Dry-run (default) or apply www→httpdocs tree sync over SFTP/FTP"},
+)
+def site_sync(
+    source_dir: str = "",
+    remote_path: str = "/httpdocs",
+    host: str = "",
+    sftp_host: str = "",
+    transport: str = "auto",
+    sftp_port: int = 22,
+    ftp_port: int = 21,
+    ftp_tls: bool = True,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    ftp_vault_entry_id: str = "plesk-ftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    apply: bool = False,
+    domain: str = "",
+) -> dict[str, Any]:
+    return _site_tree_sync(
+        source_dir=source_dir,
+        remote_path=remote_path,
+        host=host or sftp_host,
+        transport=transport,
+        sftp_port=int(sftp_port),
+        ftp_port=int(ftp_port),
+        ftp_tls=bool(ftp_tls),
+        sftp_vault_entry_id=sftp_vault_entry_id,
+        ftp_vault_entry_id=ftp_vault_entry_id,
+        credential_origin=credential_origin,
+        host_fingerprint=host_fingerprint,
+        vault_url=vault_url,
+        apply=bool(apply),
+        domain=domain,
+    )
+
+
+@conn.handler(
+    "site/command/publish",
+    isolated=True,
+    meta={"label": "Alias of site/command/sync (dry-run by default; apply requires PLESK_SYNC_APPLY=1)"},
+)
+def site_publish(
+    source_dir: str = "",
+    remote_path: str = "/httpdocs",
+    host: str = "",
+    sftp_host: str = "",
+    transport: str = "auto",
+    sftp_port: int = 22,
+    ftp_port: int = 21,
+    ftp_tls: bool = True,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    ftp_vault_entry_id: str = "plesk-ftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    apply: bool = False,
+    domain: str = "",
+) -> dict[str, Any]:
+    return site_sync(
+        source_dir=source_dir,
+        remote_path=remote_path,
+        host=host,
+        sftp_host=sftp_host,
+        transport=transport,
+        sftp_port=sftp_port,
+        ftp_port=ftp_port,
+        ftp_tls=ftp_tls,
+        sftp_vault_entry_id=sftp_vault_entry_id,
+        ftp_vault_entry_id=ftp_vault_entry_id,
+        credential_origin=credential_origin,
+        host_fingerprint=host_fingerprint,
+        vault_url=vault_url,
+        apply=apply,
+        domain=domain,
     )
 
 
 @conn.handler("plesk://host/doctor/query/report", isolated=True, meta={"label": "Plesk connector readiness report"})
 def doctor() -> dict[str, Any]:
-    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.3.0", "status": "ready"}
+    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.4.0", "status": "ready"}
 
 
 def urirun_bindings() -> dict[str, Any]:

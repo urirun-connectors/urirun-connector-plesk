@@ -12,27 +12,74 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
 | `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
-| `plesk://host/site/command/publish` | upload a local static-site directory to a subscription's `httpdocs` over SFTP, with vault-leased credentials and host-key pinning |
+| `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |
+| `plesk://host/site/command/sync` | dry-run (default) or apply `www/` → `/httpdocs` tree sync (SFTP preferred, FTP fallback) |
+| `plesk://host/site/command/publish` | alias of `site/command/sync` |
 | `plesk://host/doctor/query/report` | connector readiness |
 
-## Static site publication (SFTP)
+## Static site sync (`www` → `httpdocs`)
 
-`plesk://host/site/command/publish` uploads a directory tree (e.g. a built website)
-to a Plesk subscription over SFTP. Credentials are leased from the vault, never
-passed in the URI payload, and the remote host key is pinned before the password
-is sent.
+Canonical URI: `plesk://host/site/command/sync`.
+
+**Safety defaults**
+
+- Always plans locally first (file list + sha256). Never uploads unless both
+  `apply=true` **and** environment `PLESK_SYNC_APPLY=1`.
+- Source must be a directory named `www`, or under
+  `PLESK_SYNC_ALLOWED_SOURCES` (colon-separated absolute prefixes).
+- Sync is additive overwrite of listed files; it does not delete remote
+  `.htaccess` or `.well-known/` (preserve list returned in the result).
+- Credentials are leased from the vault; never accepted in the URI payload.
 
 ```text
-source_dir           local directory to upload (its contents map to remote_path)
+source_dir           local directory (allowlisted www/)
 remote_path          target path, default /httpdocs
-sftp_host            SFTP/SSH host (the Plesk server)
-sftp_port            default 22
-sftp_vault_entry_id  vault entry holding username + password, default plesk-sftp
-credential_origin    sftp://<host> credential scope, default sftp://<sftp_host>
-host_fingerprint     optional SHA-256 host key to pin (hex); mismatch aborts
+host / sftp_host     Plesk SSH/FTP host
+domain               optional subscription/domain label (metadata)
+transport            auto | sftp | ftp  (auto prefers SFTP)
+apply                false (dry-run) | true (requires PLESK_SYNC_APPLY=1)
+sftp_port / ftp_port defaults 22 / 21
+sftp_vault_entry_id  default plesk-sftp
+ftp_vault_entry_id   default plesk-ftp
+credential_origin    e.g. sftp://host
+host_fingerprint     optional SHA-256 host key pin (hex)
 ```
 
-Requires the `sftp` extra: `pip install 'urirun-connector-plesk[sftp]'` (pulls `paramiko`).
+Requires the `sftp` extra for SFTP: `pip install 'urirun-connector-plesk[sftp]'`.
+
+Dry-run:
+
+```json
+{
+  "uri": "plesk://host/site/command/sync",
+  "payload": {
+    "source_dir": "/home/tom/github/subactor/www",
+    "host": "prototypowanie.pl",
+    "domain": "subactor.com",
+    "apply": false
+  }
+}
+```
+
+Apply (explicit opt-in):
+
+```bash
+export PLESK_SYNC_APPLY=1
+```
+
+```json
+{
+  "uri": "plesk://host/site/command/sync",
+  "payload": {
+    "source_dir": "/home/tom/github/subactor/www",
+    "host": "prototypowanie.pl",
+    "domain": "subactor.com",
+    "apply": true
+  }
+}
+```
+
+## REST API bootstrap
 
 The bootstrap follows the official Plesk flow:
 
