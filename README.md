@@ -12,10 +12,37 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
 | `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
+| `plesk://host/ftpuser/command/ensure` | rotate system SFTP/FTP password (XML) or ensure additional FTP user; store as `plesk-sftp` / `plesk-ftp` (https origin) |
 | `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |
 | `plesk://host/site/command/sync` | dry-run (default) or apply `www/` → `/httpdocs` tree sync (SFTP preferred, FTP fallback) |
 | `plesk://host/site/command/publish` | alias of `site/command/sync` |
 | `plesk://host/doctor/query/report` | connector readiness |
+
+### Credentials (`ftpuser/command/ensure`)
+
+Vault entries use **https** origins (the vault rejects `sftp://` / `ftp://`).
+
+| kind | What it does | Default vault ids |
+| --- | --- | --- |
+| `system` (preferred) | Rotate subscription system FTP password via XML, enable SSH shell, store for SFTP | `plesk-sftp` + mirror `plesk-ftp` |
+| `additional` | XML `ftp-user` set/add for a dedicated login | `plesk-ftp` |
+
+Requires vault entry `plesk-subscription` (`username`/`password` of the customer panel login, origin = Plesk base URL including `:8443`).
+
+```json
+{
+  "uri": "plesk://host/ftpuser/command/ensure",
+  "payload": {
+    "kind": "system",
+    "domain": "subactor.com",
+    "base_url": "https://prototypowanie.pl:8443",
+    "credential_vault_entry_id": "plesk-sftp",
+    "also_ftp_vault_entry_id": "plesk-ftp"
+  }
+}
+```
+
+Note: FTPS data ports are often firewalled on shared hosting; prefer SFTP (`transport: auto` / `sftp`).
 
 ## Static site sync (`www` → `httpdocs`)
 
@@ -41,7 +68,7 @@ apply                false (dry-run) | true (requires PLESK_SYNC_APPLY=1)
 sftp_port / ftp_port defaults 22 / 21
 sftp_vault_entry_id  default plesk-sftp
 ftp_vault_entry_id   default plesk-ftp
-credential_origin    e.g. sftp://host
+credential_origin    e.g. https://host (vault rejects sftp://ftp:// schemes)
 host_fingerprint     optional SHA-256 host key pin (hex)
 ```
 

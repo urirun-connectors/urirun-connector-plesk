@@ -39,6 +39,7 @@
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
     "plesk://host/mailbox/command/create",
+    "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
     "plesk://host/site/query/methods",

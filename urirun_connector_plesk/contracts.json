@@ -126,6 +126,59 @@
         }
       ]
     },
+    "ftpuser/command/ensure": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "name": "?str",
+        "home": "?str",
+        "domain": "?str",
+        "kind": "?str",
+        "credential_vault_entry_id": "?str",
+        "also_ftp_vault_entry_id": "?str",
+        "credential_origin": "?str",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "enable_ssh": "?bool",
+        "vault_url": "?str"
+      },
+      "out": {
+        "kind": "str",
+        "name": "str",
+        "home": "str",
+        "domain": "?str",
+        "created": "bool",
+        "recreated": "bool",
+        "existed": "bool",
+        "credential_vault_entry_id": "str",
+        "credential_origin": "str",
+        "transport_hint": "?str"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {
+            "kind": "system",
+            "domain": "subactor.com",
+            "credential_vault_entry_id": "plesk-sftp"
+          },
+          "result": {
+            "ok": true,
+            "kind": "system",
+            "name": "subactor_ssh",
+            "home": "/",
+            "domain": "subactor.com",
+            "created": true,
+            "recreated": true,
+            "existed": true,
+            "credential_vault_entry_id": "plesk-sftp",
+            "credential_origin": "https://prototypowanie.pl",
+            "transport_hint": "sftp"
+          }
+        }
+      ]
+    },
     "doctor/query/report": {
       "version": "v1",
       "effect": "query",

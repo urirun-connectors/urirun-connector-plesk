@@ -15,6 +15,7 @@ from urirun_connector_plesk import (
     bootstrap_api_key,
     connector_manifest,
     create_mailbox,
+    ensure_ftp_user,
     site_publish,
     site_sync,
     urirun_bindings,
@@ -28,6 +29,7 @@ ROUTES = {
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
     "plesk://host/mailbox/command/create",
+    "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
     "plesk://host/site/query/methods",
@@ -143,6 +145,68 @@ def test_mailbox_create_generates_password_and_stores_it_without_returning_it(mo
 def test_mailbox_create_rejects_invalid_email_or_credential_origin():
     assert create_mailbox(email="not-an-email", credential_origin="imap://mail.example.com")["ok"] is False
     assert create_mailbox(email="agent@example.com", credential_origin="https://mail.example.com")["ok"] is False
+
+
+def test_ensure_ftp_user_recreates_and_stores_without_leaking_password(monkeypatch):
+    calls = []
+    stored = {}
+    leases = {"username": "cust", "password": "cust-pass"}
+
+    def fake_lease(entry, origin, field, vault_url=""):
+        return leases[field]
+
+    def fake_xml(base_url, username, password, packet):
+        calls.append(packet)
+        if "<webspace><set>" in packet.replace("\n", "").replace(" ", ""):
+            return "<packet><webspace><set><result><status>ok</status></result></set></webspace></packet>"
+        if "<webspace><get>" in packet.replace("\n", "").replace(" ", ""):
+            return (
+                "<packet><webspace><get><result><status>ok</status>"
+                "<name>ftp_login</name><value>subactor_ssh</value>"
+                "<name>ftp_password</name><value>ignore</value>"
+                "</result></get></webspace></packet>"
+            )
+        return "<packet><result><status>error</status></result></packet>"
+
+    def fake_store(entry, origin, label, values, vault_url):
+        stored[entry] = {"origin": origin, "label": label, "values": dict(values)}
+        return entry
+
+    monkeypatch.setattr(core, "_vault_lease", fake_lease)
+    monkeypatch.setattr(core, "_xml_agent", fake_xml)
+    monkeypatch.setattr(core, "_vault_store_secrets", fake_store)
+    result = ensure_ftp_user(
+        kind="system",
+        domain="subactor.com",
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp",
+        also_ftp_vault_entry_id="plesk-ftp",
+    )
+    assert result["ok"] and result["kind"] == "system" and result["name"] == "subactor_ssh"
+    assert stored["plesk-sftp"]["origin"] == "https://prototypowanie.pl"
+    assert stored["plesk-ftp"]["values"]["username"] == "subactor_ssh"
+    assert len(stored["plesk-sftp"]["values"]["password"]) >= 16
+    assert stored["plesk-sftp"]["values"]["password"] not in json.dumps(result)
+    assert "cust-pass" not in json.dumps(result)
+
+
+def test_transport_origin_defaults_to_https():
+    assert core._transport_origin("ftp", "prototypowanie.pl") == "https://prototypowanie.pl"
+    assert core._transport_origin("sftp", "h", "https://custom") == "https://custom"
+
+
+def test_plan_skips_git_and_deployment_junk(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    (www / "index.html").write_text("ok", encoding="utf-8")
+    (www / "Dockerfile").write_text("FROM scratch", encoding="utf-8")
+    (www / ".git").mkdir()
+    (www / ".git" / "config").write_text("x", encoding="utf-8")
+    (www / "deployment").mkdir()
+    (www / "deployment" / "PLESK.md").write_text("x", encoding="utf-8")
+    plan = core._plan_local_tree(str(www), "/httpdocs")
+    paths = {item["path"] for item in plan}
+    assert paths == {"index.html"}
 
 
 def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):
