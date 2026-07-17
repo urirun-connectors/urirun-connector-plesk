@@ -17,10 +17,16 @@ import urirun
 
 from . import _urirun_compat
 
+try:  # paramiko is only needed for SFTP site publication; keep the connector importable without it
+    import paramiko
+except ImportError:  # pragma: no cover - exercised only where the extra is absent
+    paramiko = None
+
 CONNECTOR_ID = "plesk"
 conn = _urirun_compat.connector(CONNECTOR_ID, scheme="plesk")
 _SAFE_API_PATH = re.compile(r"^/api/v2/[A-Za-z0-9_./-]+$")
 _SENSITIVE = re.compile(r"password|secret|token|api.?key|authorization", re.I)
+_SAFE_REMOTE = re.compile(r"^/[A-Za-z0-9_./-]+$")
 
 
 def _base_url(value: str = "") -> str:
@@ -128,6 +134,64 @@ def _api_path(path: str) -> str:
     if not _SAFE_API_PATH.fullmatch(path) or ".." in path:
         raise RuntimeError("plesk_api_path_not_allowed")
     return path
+
+
+def _sftp_origin(value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme != "sftp" or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("plesk_sftp_origin_invalid")
+    return f"sftp://{parsed.netloc}"
+
+
+def _sftp_connect(host: str, port: int, username: str, password: str, host_fingerprint: str = ""):
+    """Open an authenticated SFTP session, pinning the host key before sending credentials."""
+    if paramiko is None:
+        raise RuntimeError("plesk_sftp_paramiko_missing")
+    transport = paramiko.Transport((host, port))
+    try:
+        transport.start_client(timeout=30)
+        key = transport.get_remote_server_key()
+        fingerprint = hashlib.sha256(key.asbytes()).hexdigest()
+        wanted = host_fingerprint.replace(":", "").strip().lower()
+        if wanted and wanted != fingerprint.lower():
+            raise RuntimeError("plesk_sftp_host_key_mismatch")
+        transport.auth_password(username, password)
+        sftp = paramiko.SFTPClient.from_transport(transport)
+        if sftp is None:
+            raise RuntimeError("plesk_sftp_session_failed")
+    except Exception:
+        transport.close()
+        raise
+    return transport, sftp, fingerprint
+
+
+def _sftp_mkdirs(sftp, remote_dir: str, made: set[str]) -> None:
+    parts = [p for p in remote_dir.split("/") if p]
+    path = ""
+    for part in parts:
+        path = f"{path}/{part}"
+        if path in made:
+            continue
+        try:
+            sftp.stat(path)
+        except IOError:
+            sftp.mkdir(path)
+        made.add(path)
+
+
+def _sftp_upload_dir(sftp, source_dir: str, remote_path: str) -> list[str]:
+    """Upload every file under source_dir to remote_path, preserving structure."""
+    base = os.path.abspath(source_dir)
+    made: set[str] = set()
+    uploaded: list[str] = []
+    for root, _dirs, files in os.walk(base):
+        rel = os.path.relpath(root, base)
+        remote_dir = remote_path if rel == "." else f"{remote_path}/{rel.replace(os.sep, '/')}"
+        _sftp_mkdirs(sftp, remote_dir, made)
+        for name in sorted(files):
+            sftp.put(os.path.join(root, name), f"{remote_dir}/{name}")
+            uploaded.append(name if rel == "." else f"{rel.replace(os.sep, '/')}/{name}")
+    return uploaded
 
 
 @conn.handler("auth/command/bootstrap-api-key", isolated=True, meta={"label": "Exchange Plesk admin login for a vault-backed REST API key"})
@@ -287,9 +351,61 @@ def create_mailbox(
     )
 
 
+@conn.handler("site/command/publish", isolated=True, meta={"label": "Publish a static site directory to a Plesk subscription over SFTP"})
+def site_publish(
+    source_dir: str = "",
+    remote_path: str = "/httpdocs",
+    sftp_host: str = "",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    if paramiko is None:
+        return urirun.fail("plesk_sftp_paramiko_missing")
+    if not source_dir or not os.path.isdir(source_dir):
+        return urirun.fail("plesk_site_source_dir_invalid")
+    if not _SAFE_REMOTE.fullmatch(remote_path) or ".." in remote_path:
+        return urirun.fail("plesk_site_remote_path_invalid")
+    if not sftp_host or not re.fullmatch(r"[A-Za-z0-9.-]+", sftp_host):
+        return urirun.fail("plesk_site_host_invalid")
+    try:
+        port = int(sftp_port)
+        if not 1 <= port <= 65535:
+            raise ValueError
+    except (TypeError, ValueError):
+        return urirun.fail("plesk_site_port_invalid")
+
+    username = password = ""
+    transport = None
+    try:
+        origin = _sftp_origin(credential_origin or f"sftp://{sftp_host}")
+        username = _vault_lease(sftp_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(sftp_vault_entry_id, origin, "password", vault_url)
+        transport, sftp, fingerprint = _sftp_connect(sftp_host, port, username, password, host_fingerprint)
+        try:
+            uploaded = _sftp_upload_dir(sftp, source_dir, remote_path)
+        finally:
+            sftp.close()
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    finally:
+        username = password = ""
+        if transport is not None:
+            transport.close()
+    return urirun.ok(
+        host=sftp_host,
+        remote_path=remote_path,
+        files_uploaded=len(uploaded),
+        files=uploaded,
+        host_fingerprint=fingerprint,
+    )
+
+
 @conn.handler("plesk://host/doctor/query/report", isolated=True, meta={"label": "Plesk connector readiness report"})
 def doctor() -> dict[str, Any]:
-    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.2.0", "status": "ready"}
+    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.3.0", "status": "ready"}
 
 
 def urirun_bindings() -> dict[str, Any]:

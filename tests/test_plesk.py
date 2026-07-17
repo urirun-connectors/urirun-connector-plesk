@@ -15,6 +15,7 @@ from urirun_connector_plesk import (
     bootstrap_api_key,
     connector_manifest,
     create_mailbox,
+    site_publish,
     urirun_bindings,
 )
 import urirun_connector_plesk.core as core
@@ -26,6 +27,7 @@ ROUTES = {
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
     "plesk://host/mailbox/command/create",
+    "plesk://host/site/command/publish",
     "plesk://host/doctor/query/report",
 }
 
@@ -223,3 +225,109 @@ def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):
         ("GET", "/api/v2/domains"),
     ]
     assert "new-runtime-api-key" not in json.dumps([bootstrap, status, domains])
+
+
+class _FakeSFTP:
+    def __init__(self):
+        self.puts = []
+        self.made = []
+        self._existing = set()
+
+    def stat(self, path):
+        if path not in self._existing:
+            raise IOError("no such file")
+        return object()
+
+    def mkdir(self, path):
+        self.made.append(path)
+        self._existing.add(path)
+
+    def put(self, local, remote):
+        self.puts.append((local, remote))
+
+    def close(self):
+        pass
+
+
+class _FakeTransport:
+    def __init__(self):
+        self.closed = False
+
+    def close(self):
+        self.closed = True
+
+
+def _seed_site(tmp_path):
+    (tmp_path / "index.html").write_text("<h1>subactor</h1>", encoding="utf-8")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "app.css").write_text("body{}", encoding="utf-8")
+    (tmp_path / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    (tmp_path / "pl").mkdir()
+    (tmp_path / "pl" / "index.html").write_text("<h1>pl</h1>", encoding="utf-8")
+
+
+def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeypatch, tmp_path):
+    _seed_site(tmp_path)
+    fake_sftp = _FakeSFTP()
+    fake_transport = _FakeTransport()
+    leases = {"username": "subactor_customer", "password": "s3cr3t-sftp"}
+
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": leases[field])
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda host, port, username, password, host_fingerprint="": (fake_transport, fake_sftp, "aa11bb22"),
+    )
+
+    result = site_publish(
+        source_dir=str(tmp_path),
+        remote_path="/httpdocs",
+        sftp_host="prototypowanie.pl",
+        credential_origin="sftp://prototypowanie.pl",
+        sftp_vault_entry_id="plesk-sftp-subactor",
+    )
+
+    assert result["ok"] and result["files_uploaded"] == 4
+    assert set(result["files"]) == {"index.html", "assets/app.css", "assets/app.js", "pl/index.html"}
+    assert result["host_fingerprint"] == "aa11bb22" and result["remote_path"] == "/httpdocs"
+    # subdirectories were created remotely
+    assert "/httpdocs/assets" in fake_sftp.made and "/httpdocs/pl" in fake_sftp.made
+    assert len(fake_sftp.puts) == 4
+    # credentials never surface in the result
+    assert "s3cr3t-sftp" not in json.dumps(result) and "subactor_customer" not in json.dumps(result)
+    assert fake_transport.closed
+
+
+def test_site_publish_validates_inputs(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
+    assert site_publish(source_dir="/no/such/dir", sftp_host="h").get("error") == "plesk_site_source_dir_invalid"
+    assert site_publish(source_dir=str(tmp_path), remote_path="httpdocs", sftp_host="h").get("error") == "plesk_site_remote_path_invalid"
+    assert site_publish(source_dir=str(tmp_path), remote_path="/a/../b", sftp_host="h").get("error") == "plesk_site_remote_path_invalid"
+    assert site_publish(source_dir=str(tmp_path), sftp_host="bad host!").get("error") == "plesk_site_host_invalid"
+    assert site_publish(source_dir=str(tmp_path), sftp_host="h", sftp_port=0).get("error") == "plesk_site_port_invalid"
+
+
+def test_site_publish_requires_paramiko(monkeypatch, tmp_path):
+    monkeypatch.setattr(core, "paramiko", None)
+    assert site_publish(source_dir=str(tmp_path), sftp_host="h").get("error") == "plesk_sftp_paramiko_missing"
+
+
+def test_sftp_connect_rejects_host_key_mismatch(monkeypatch):
+    class _K:
+        def asbytes(self):
+            return b"server-key-bytes"
+
+    class _T:
+        def __init__(self, addr):
+            self.authed = False
+        def start_client(self, timeout=0):
+            pass
+        def get_remote_server_key(self):
+            return _K()
+        def auth_password(self, u, p):
+            self.authed = True
+        def close(self):
+            pass
+
+    monkeypatch.setattr(core.paramiko, "Transport", _T)
+    with pytest.raises(RuntimeError, match="plesk_sftp_host_key_mismatch"):
+        core._sftp_connect("h", 22, "u", "p", host_fingerprint="deadbeef")
