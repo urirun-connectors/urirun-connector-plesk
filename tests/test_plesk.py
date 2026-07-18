@@ -350,6 +350,57 @@ def test_site_sync_dry_run_plans_without_upload(monkeypatch, tmp_path):
     assert {item["path"] for item in result["plan"]} == {
         "index.html", "assets/app.css", "assets/app.js", "pl/index.html",
     }
+    assert result["plan_hash"] and result["manifest"]["plan_hash"] == result["plan_hash"]
+    assert result["manifest"]["files"]
+    assert fake_sftp.puts == []
+
+
+def test_immutable_manifest_stable_and_byte_sensitive(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    plan = core._plan_local_tree(str(www), "/httpdocs")
+    from urirun_connector_plesk.immutable_manifest import build_immutable_manifest, canonical_json
+
+    a = build_immutable_manifest(plan=plan, host="h", domain="d", remote_path="/httpdocs")
+    b = build_immutable_manifest(plan=plan, host="h", domain="d", remote_path="/httpdocs")
+    assert a["plan_hash"] == b["plan_hash"]
+    assert len(a["plan_hash"]) == 64
+    # secrets must never appear in manifest keys/values
+    blob = canonical_json(a)
+    assert "password" not in blob.lower()
+    assert "token" not in blob.lower()
+    assert "secret" not in blob.lower()
+
+    (www / "index.html").write_text("<h1>changed</h1>", encoding="utf-8")
+    plan2 = core._plan_local_tree(str(www), "/httpdocs")
+    c = build_immutable_manifest(plan=plan2, host="h", domain="d", remote_path="/httpdocs")
+    assert c["plan_hash"] != a["plan_hash"]
+
+
+def test_site_sync_apply_denies_plan_hash_mismatch_with_zero_upload(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    fake_sftp = _FakeSFTP()
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no lease")))
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda *a, **k: (_FakeTransport(), fake_sftp, "aa11bb22"),
+    )
+    dry = site_sync(source_dir=str(www), host="prototypowanie.pl", remote_path="/httpdocs")
+    (www / "index.html").write_text("<h1>tampered</h1>", encoding="utf-8")
+    result = site_sync(
+        source_dir=str(www),
+        host="prototypowanie.pl",
+        remote_path="/httpdocs",
+        apply=True,
+        transport="sftp",
+        plan_hash=dry["plan_hash"],
+    )
+    assert result.get("error") == "plan_hash_mismatch"
+    assert result.get("files_uploaded", 0) == 0
     assert fake_sftp.puts == []
 
 
@@ -360,9 +411,11 @@ def test_site_sync_apply_requires_env(monkeypatch, tmp_path):
     monkeypatch.delenv("PLESK_SYNC_APPLY", raising=False)
     result = site_sync(
         source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+        plan_hash="deadbeef",
     )
     assert result.get("error") == "plesk_sync_apply_required"
     assert result.get("dry_run") is True
+    assert result.get("plan_hash")
 
 
 def test_site_sync_rejects_non_www_source(tmp_path):
@@ -398,6 +451,11 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
         lambda host, port, username, password, host_fingerprint="": (fake_transport, fake_sftp, "aa11bb22"),
     )
 
+    dry = site_sync(
+        source_dir=str(www),
+        remote_path="/httpdocs",
+        sftp_host="prototypowanie.pl",
+    )
     result = site_publish(
         source_dir=str(www),
         remote_path="/httpdocs",
@@ -406,15 +464,35 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
         sftp_vault_entry_id="plesk-sftp-subactor",
         transport="sftp",
         apply=True,
+        plan_hash=dry["plan_hash"],
     )
 
     assert result["ok"] and result["dry_run"] is False and result["files_uploaded"] == 4
+    assert result["plan_hash"] == dry["plan_hash"]
     assert set(result["files"]) == {"index.html", "assets/app.css", "assets/app.js", "pl/index.html"}
     assert result["host_fingerprint"] == "aa11bb22" and result["remote_path"] == "/httpdocs"
     assert "/httpdocs/assets" in fake_sftp.made and "/httpdocs/pl" in fake_sftp.made
     assert len(fake_sftp.puts) == 4
     assert "s3cr3t-sftp" not in json.dumps(result) and "subactor_customer" not in json.dumps(result)
     assert fake_transport.closed
+
+
+def test_site_publish_apply_without_plan_hash_denied(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    fake_sftp = _FakeSFTP()
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no lease")))
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda *a, **k: (_FakeTransport(), fake_sftp, "aa"),
+    )
+    result = site_publish(
+        source_dir=str(www), sftp_host="prototypowanie.pl", transport="sftp", apply=True,
+    )
+    assert result.get("error") == "plan_hash_mismatch"
+    assert fake_sftp.puts == []
 
 
 def test_site_publish_validates_inputs(monkeypatch, tmp_path):
@@ -435,8 +513,9 @@ def test_site_publish_requires_paramiko(monkeypatch, tmp_path):
     _seed_site(www)
     monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
     monkeypatch.setattr(core, "paramiko", None)
+    dry = site_sync(source_dir=str(www), sftp_host="h")
     assert site_publish(
-        source_dir=str(www), sftp_host="h", transport="sftp", apply=True,
+        source_dir=str(www), sftp_host="h", transport="sftp", apply=True, plan_hash=dry["plan_hash"],
     ).get("error") == "plesk_sftp_paramiko_missing"
 
 

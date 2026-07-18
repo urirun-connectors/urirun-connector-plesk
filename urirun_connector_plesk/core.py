@@ -18,6 +18,7 @@ from typing import Any
 import urirun
 
 from . import _urirun_compat
+from .immutable_manifest import build_immutable_manifest, verify_plan_hash
 
 try:  # paramiko is only needed for SFTP site publication; keep the connector importable without it
     import paramiko
@@ -861,6 +862,10 @@ def _site_tree_sync(
     apply: bool,
     domain: str = "",
     exclude: list[str] | None = None,
+    plan_hash: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    recipe_ref: str = "",
 ) -> dict[str, Any]:
     invalid = _validate_publish_inputs(source_dir, remote_path, host)
     if invalid:
@@ -876,10 +881,27 @@ def _site_tree_sync(
 
     exclude_patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
     plan = _plan_local_tree(source_dir, remote_path, exclude_patterns)
+    manifest = build_immutable_manifest(
+        plan=plan,
+        host=host,
+        domain=domain,
+        remote_path=remote_path,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        recipe_ref=recipe_ref,
+    )
     may_write, apply_error = _apply_permitted(bool(apply))
     if apply_error:
-        return urirun.fail(apply_error, dry_run=True, files_planned=len(plan), plan=plan,
-                           preserve_remote=list(_PRESERVE_REMOTE_NAMES), domain=domain or None)
+        return urirun.fail(
+            apply_error,
+            dry_run=True,
+            files_planned=len(plan),
+            plan=plan,
+            manifest=manifest,
+            plan_hash=manifest["plan_hash"],
+            preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+            domain=domain or None,
+        )
     if not may_write:
         return urirun.ok(
             dry_run=True,
@@ -888,10 +910,34 @@ def _site_tree_sync(
             domain=domain or None,
             files_planned=len(plan),
             plan=plan,
+            manifest=manifest,
+            plan_hash=manifest["plan_hash"],
             preserve_remote=list(_PRESERVE_REMOTE_NAMES),
             exclude=list(exclude_patterns),
-            note="set apply=true and PLESK_SYNC_APPLY=1 to upload",
+            note="set apply=true and PLESK_SYNC_APPLY=1 with dry-run plan_hash to upload",
         )
+
+    # PR5a: apply must bind to dry-run plan_hash — no free re-scan divergence / zero upload on mismatch.
+    matched, verified, mismatch = verify_plan_hash(
+        plan=plan,
+        expected_plan_hash=plan_hash,
+        host=host,
+        domain=domain,
+        remote_path=remote_path,
+    )
+    if not matched:
+        return urirun.fail(
+            mismatch or "plan_hash_mismatch",
+            dry_run=True,
+            files_planned=len(plan),
+            plan=plan,
+            manifest=verified,
+            plan_hash=verified["plan_hash"],
+            files_uploaded=0,
+            preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+            domain=domain or None,
+        )
+    manifest = verified
 
     chosen = transport
     detection: list[dict[str, Any]] | None = None
@@ -939,6 +985,8 @@ def _site_tree_sync(
         files_uploaded=len(uploaded),
         files=uploaded,
         files_planned=len(plan),
+        manifest=manifest,
+        plan_hash=manifest["plan_hash"],
         preserve_remote=list(_PRESERVE_REMOTE_NAMES),
         exclude=list(exclude_patterns),
         methods=detection,
@@ -968,6 +1016,10 @@ def site_sync(
     apply: bool = False,
     domain: str = "",
     exclude: list[str] | None = None,
+    plan_hash: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    recipe_ref: str = "",
 ) -> dict[str, Any]:
     return _site_tree_sync(
         source_dir=source_dir,
@@ -985,13 +1037,17 @@ def site_sync(
         apply=bool(apply),
         domain=domain,
         exclude=exclude,
+        plan_hash=plan_hash,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        recipe_ref=recipe_ref,
     )
 
 
 @conn.handler(
     "site/command/publish",
     isolated=True,
-    meta={"label": "Alias of site/command/sync (dry-run by default; apply requires PLESK_SYNC_APPLY=1)"},
+    meta={"label": "Alias of site/command/sync (dry-run by default; apply requires PLESK_SYNC_APPLY=1 + plan_hash)"},
 )
 def site_publish(
     source_dir: str = "",
@@ -1010,6 +1066,10 @@ def site_publish(
     apply: bool = False,
     domain: str = "",
     exclude: list[str] | None = None,
+    plan_hash: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    recipe_ref: str = "",
 ) -> dict[str, Any]:
     return site_sync(
         source_dir=source_dir,
@@ -1028,6 +1088,10 @@ def site_publish(
         apply=apply,
         domain=domain,
         exclude=exclude,
+        plan_hash=plan_hash,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        recipe_ref=recipe_ref,
     )
 
 
