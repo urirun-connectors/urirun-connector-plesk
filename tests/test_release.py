@@ -107,7 +107,7 @@ def test_local_activate_symlink_and_rollback(tmp_path):
     assert rolled["status"] == "rolled_back"
     assert rolled["current"] == "rel_001"
     assert rolled["rolled_back_from"] == "rel_002"
-    assert rolled["verify"]["origin"] == "stub"
+    assert rolled["verify"]["origin"] == "pending"
 
 
 def test_local_activate_pointer_fallback(tmp_path):
@@ -140,7 +140,9 @@ def test_doctor_reports_release_capabilities(monkeypatch):
     assert report["capabilities"]["release_activation"] is True
     assert report["capabilities"]["rollback"] is True
     assert "symlink" in report["capabilities"]["release_activation_strategies"]
-    assert report["version"] == "0.7.0"
+    assert report["version"] == "0.8.0"
+    assert report["capabilities"]["publish_verify"] is True
+    assert report["staging_domain_recommendation"] == "docs-stage.subactor.com"
 
     monkeypatch.setattr(core, "paramiko", None)
     degraded = doctor()
@@ -217,6 +219,10 @@ def test_release_upload_apply_writes_meta(monkeypatch, tmp_path):
     meta = json.loads(meta_fs.writes[meta_path])
     assert meta["release_id"] == "rel_up_1"
     assert meta["plan_hash"] == dry["plan_hash"]
+    assert meta["artifact_sha256"]
+    assert meta["cache_control"] == "no-store"
+    assert meta["pack_version"] == "1"
+    assert meta["built_at"]
 
 
 def test_release_activate_and_rollback_handlers(monkeypatch, tmp_path):
@@ -283,7 +289,7 @@ def test_release_activate_and_rollback_handlers(monkeypatch, tmp_path):
     assert rolled["ok"] is True
     assert rolled["status"] == "rolled_back"
     assert rolled["current"] == "rel_a"
-    assert rolled["verify"]["origin"] == "stub"
+    assert rolled["verify"]["origin"] == "pending"
 
 
 def test_release_activate_denies_without_gates(monkeypatch):
@@ -313,7 +319,7 @@ def test_release_verify_reads_meta(monkeypatch, tmp_path):
     transport = type("T", (), {"close": lambda self: None})()
     monkeypatch.setattr(core, "_open_sftp_release_fs", lambda **k: (transport, local, "fp"))
     out = release_verify(release_id="rel_v", release_root=root, host="h.example", plan_hash="ph")
-    assert out["ok"] and out["origin_verify"] == "stub"
+    assert out["ok"] and out["origin_verify"] == "files_only"
     assert out["release_id"] == "rel_v"
 
 
@@ -322,6 +328,7 @@ def test_manifest_lists_release_routes():
     for uri in (
         "plesk://host/site/command/release-upload",
         "plesk://host/site/command/release-verify",
+        "plesk://host/site/command/publish-verify",
         "plesk://host/site/command/release-activate",
         "plesk://host/site/command/release-rollback",
         "plesk://host/site/query/release-current",

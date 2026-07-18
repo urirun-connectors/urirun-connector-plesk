@@ -37,11 +37,19 @@ def require_sftp_for_apply(*, transport: str, production: bool | None = None) ->
     return not ftp_fallback_allowed()
 
 
-def build_capabilities(*, paramiko_mod: Any, release_activation: bool | None = None, rollback: bool | None = None) -> dict[str, Any]:
+def build_capabilities(
+    *,
+    paramiko_mod: Any,
+    release_activation: bool | None = None,
+    rollback: bool | None = None,
+    publish_verify: bool | None = None,
+) -> dict[str, Any]:
     sftp_ok = paramiko_available(paramiko_mod)
     # PR7: release activate/rollback available whenever SFTP transport is.
     release_ok = sftp_ok if release_activation is None else bool(release_activation)
     rollback_ok = sftp_ok if rollback is None else bool(rollback)
+    # PR8: DNS/TLS/fingerprint ladder is stdlib — always available as capability.
+    verify_ok = True if publish_verify is None else bool(publish_verify)
     return {
         "sftp": {
             "available": sftp_ok,
@@ -54,6 +62,10 @@ def build_capabilities(*, paramiko_mod: Any, release_activation: bool | None = N
         "release_activation": release_ok,
         "rollback": rollback_ok,
         "release_activation_strategies": ["auto", "symlink", "pointer"],
+        "publish_verify": verify_ok,
+        "dns_preflight": verify_ok,
+        "tls_san_check": verify_ok,
+        "content_fingerprint": verify_ok,
     }
 
 

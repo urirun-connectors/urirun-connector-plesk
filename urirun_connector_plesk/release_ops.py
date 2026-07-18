@@ -82,22 +82,42 @@ def build_release_meta(
     files: list[dict[str, Any]] | None = None,
     git_commit: str = "",
     content_sha256: str = "",
+    artifact_sha256: str = "",
+    source_commit: str = "",
+    pack_version: str = "",
+    built_at: str = "",
 ) -> dict[str, Any]:
+    """Build ``__subactor_release.json`` marker (ADR-004 / PR8 public fingerprint).
+
+    Canonical public fields: ``release_id``, ``artifact_sha256``, ``source_commit``,
+    ``built_at``, ``pack_version``. Legacy aliases (``content_sha256``, ``git_commit``,
+    ``created_at``) retained for PR7 readers. Servers should emit
+    ``Cache-Control: no-store`` when serving this path.
+    """
     planned = files or []
-    if not content_sha256 and planned:
+    digest_hex = artifact_sha256 or content_sha256
+    if not digest_hex and planned:
         digest = hashlib.sha256()
         for item in planned:
             digest.update(f"{item.get('path', '')}:{item.get('sha256', '')}\n".encode())
-        content_sha256 = digest.hexdigest()
+        digest_hex = digest.hexdigest()
+    commit = source_commit or git_commit or ""
+    stamped = built_at or time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     return {
         "release_id": release_id,
+        "artifact_sha256": digest_hex or None,
+        "source_commit": commit or None,
+        "built_at": stamped,
+        "pack_version": pack_version or None,
+        "cache_control": "no-store",
+        # Back-compat / ops context
         "plan_hash": plan_hash,
         "host": host,
         "domain": domain or None,
-        "git_commit": git_commit or None,
-        "content_sha256": content_sha256 or None,
+        "git_commit": commit or None,
+        "content_sha256": digest_hex or None,
         "files": len(planned),
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "created_at": stamped,
     }
 
 
@@ -408,7 +428,10 @@ def rollback_release(
         **activated,
         "status": "rolled_back",
         "rolled_back_from": state.get("current"),
-        "verify": {"origin": "stub", "note": "public/origin fingerprint verify is PR8"},
+        "verify": {
+            "origin": "pending",
+            "note": "call publish-verify / release-verify with verify_origin|verify_public",
+        },
     }
 
 
@@ -419,7 +442,7 @@ def verify_release_local(
     expected_plan_hash: str = "",
     meta: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Hash-level verify of an uploaded release plan (path hooks; origin stub)."""
+    """Hash-level verify of an uploaded release plan (path/files step of the ladder)."""
     if not meta or not meta.get("release_id"):
         raise RuntimeError("plesk_release_not_found")
     if meta.get("release_id") != release_id:
@@ -434,8 +457,9 @@ def verify_release_local(
         "release_id": release_id,
         "files_verified": len(plan) if plan else int(meta.get("files") or 0),
         "plan_hash": meta.get("plan_hash") or expected_plan_hash or None,
-        "origin_verify": "stub",
-        "note": "path/hash verify only; public HTTPS fingerprint is PR8",
+        "artifact_sha256": meta.get("artifact_sha256") or meta.get("content_sha256"),
+        "origin_verify": "files_only",
+        "note": "path/hash ok; enable verify_origin/verify_public for ADR-004 DoD",
     }
 
 

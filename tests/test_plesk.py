@@ -36,6 +36,7 @@ ROUTES = {
     "plesk://host/site/command/sync",
     "plesk://host/site/command/release-upload",
     "plesk://host/site/command/release-verify",
+    "plesk://host/site/command/publish-verify",
     "plesk://host/site/command/release-activate",
     "plesk://host/site/command/release-rollback",
     "plesk://host/site/query/release-current",

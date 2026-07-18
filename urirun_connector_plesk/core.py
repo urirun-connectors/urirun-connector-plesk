@@ -1438,6 +1438,8 @@ def release_upload(
         domain=domain,
         files=planned.get("plan") or [],
         git_commit=git_commit,
+        pack_version=pack_version,
+        artifact_sha256=(planned.get("manifest") or {}).get("source_sha256") or "",
     )
     result = {
         **{k: v for k, v in planned.items() if k != "ok"},
@@ -1478,7 +1480,7 @@ def release_upload(
 @conn.handler(
     "site/command/release-verify",
     isolated=True,
-    meta={"label": "Verify release hashes (origin/public fingerprint stub → PR8)"},
+    meta={"label": "Verify release hashes; optional origin/public fingerprint (ADR-004)"},
 )
 def release_verify(
     release_id: str = "",
@@ -1492,6 +1494,13 @@ def release_verify(
     host_fingerprint: str = "",
     vault_url: str = "",
     domain: str = "",
+    verify_origin: bool = False,
+    verify_public: bool = False,
+    origin_ip: str = "",
+    dns_targets: list[str] | None = None,
+    expected_artifact_sha256: str = "",
+    expected_source_commit: str = "",
+    expected_pack_version: str = "",
 ) -> dict[str, Any]:
     from .release_ops import (
         RELEASE_META_NAME,
@@ -1500,6 +1509,7 @@ def release_verify(
         validate_release_root,
         verify_release_local,
     )
+    from .verify_ladder import run_publish_verify_ladder
 
     host = host or sftp_host
     if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
@@ -1531,7 +1541,122 @@ def release_verify(
         return urirun.fail(str(error))
     except (ValueError, UnicodeDecodeError):
         return urirun.fail(REMOTE_HASH_MISMATCH)
-    return urirun.ok(host=host, domain=domain or None, release_root=release_root, **verified)
+
+    if not (verify_origin or verify_public):
+        return urirun.ok(host=host, domain=domain or None, release_root=release_root, **verified)
+
+    hostname = domain or host
+    expected = {
+        "release_id": release_id,
+        "artifact_sha256": expected_artifact_sha256
+        or (meta.get("artifact_sha256") if isinstance(meta, dict) else None)
+        or (meta.get("content_sha256") if isinstance(meta, dict) else None)
+        or "",
+        "source_commit": expected_source_commit
+        or (meta.get("source_commit") if isinstance(meta, dict) else None)
+        or (meta.get("git_commit") if isinstance(meta, dict) else None)
+        or "",
+        "pack_version": expected_pack_version
+        or (meta.get("pack_version") if isinstance(meta, dict) else None)
+        or "",
+        "dns_targets": list(dns_targets or []),
+        "tls_hostname": hostname,
+    }
+    ladder = run_publish_verify_ladder(
+        hostname=hostname,
+        expected=expected,
+        origin_ip=origin_ip,
+        check_dns_step=bool(dns_targets),
+        check_tls_step=True,
+        check_origin=bool(verify_origin),
+        check_public=bool(verify_public),
+        release_files_ok=True,
+    )
+    if not ladder.get("ok"):
+        extra = {k: v for k, v in ladder.items() if k not in {"ok", "error"}}
+        return urirun.fail(
+            ladder.get("error") or "applied_unverified",
+            host=host,
+            domain=domain or None,
+            release_id=release_id,
+            **extra,
+        )
+    return urirun.ok(
+        host=host,
+        domain=domain or None,
+        release_root=release_root,
+        **verified,
+        publish_verify=ladder,
+    )
+
+
+@conn.handler(
+    "site/command/publish-verify",
+    isolated=True,
+    meta={"label": "ADR-004 DNS/TLS/HTTPS + content fingerprint verify ladder"},
+)
+def publish_verify(
+    hostname: str = "",
+    domain: str = "",
+    release_id: str = "",
+    artifact_sha256: str = "",
+    source_commit: str = "",
+    pack_version: str = "",
+    origin_ip: str = "",
+    dns_targets: list[str] | None = None,
+    verify_origin: bool = True,
+    verify_public: bool = True,
+    check_dns: bool = True,
+    check_tls: bool = True,
+    release_files_ok: bool = True,
+) -> dict[str, Any]:
+    """Public/origin verify DoD. Does not mutate DNS (PR9 cutover is separate).
+
+    Staging recommendation: use ``docs-stage.subactor.com`` (or origin_ip + Host)
+    before pointing production ``docs.subactor.com`` at Plesk.
+    """
+    from .verify_ladder import curl_resolve_hint, run_publish_verify_ladder
+
+    host = (hostname or domain or "").strip()
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    if not release_id or not artifact_sha256:
+        return urirun.fail("fingerprint_missing", note="release_id and artifact_sha256 required")
+
+    caps = build_capabilities(paramiko_mod=paramiko)
+    ladder = run_publish_verify_ladder(
+        hostname=host,
+        expected={
+            "release_id": release_id,
+            "artifact_sha256": artifact_sha256,
+            "source_commit": source_commit,
+            "pack_version": pack_version,
+            "dns_targets": list(dns_targets or []),
+            "tls_hostname": host,
+        },
+        origin_ip=origin_ip,
+        check_dns_step=bool(check_dns) and bool(dns_targets),
+        check_tls_step=bool(check_tls),
+        check_origin=bool(verify_origin),
+        check_public=bool(verify_public),
+        release_files_ok=bool(release_files_ok),
+    )
+    hint = curl_resolve_hint(host, origin_ip) if origin_ip else None
+    if not ladder.get("ok"):
+        extra = {k: v for k, v in ladder.items() if k not in {"ok", "error"}}
+        return urirun.fail(
+            ladder.get("error") or "applied_unverified",
+            capabilities=caps,
+            curl_resolve=hint,
+            staging_note="Prefer docs-stage.subactor.com or origin_ip Host-header preflight before PR9 cutover",
+            **extra,
+        )
+    return urirun.ok(
+        capabilities=caps,
+        curl_resolve=hint,
+        staging_note="Prefer docs-stage.subactor.com for end-to-end rehearsal; production DNS cutover is PR9",
+        **ladder,
+    )
 
 
 @conn.handler(
@@ -1778,7 +1903,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.7.0",
+        "version": "0.8.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,
@@ -1789,6 +1914,7 @@ def doctor() -> dict[str, Any]:
             "operation": budgets.operation,
             "total": budgets.total,
         },
+        "staging_domain_recommendation": "docs-stage.subactor.com",
         "note": None if ready else "SFTP/paramiko missing — blocks production publish readiness",
     }
 

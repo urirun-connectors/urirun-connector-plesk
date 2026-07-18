@@ -16,12 +16,13 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |
 | `plesk://host/site/command/sync` | dry-run (default) or apply `www/` → `/httpdocs` tree sync (SFTP preferred, FTP fallback) |
 | `plesk://host/site/command/publish` | alias of `site/command/sync` |
-| `plesk://host/site/command/release-upload` | upload tree to `releases/rel_…` (does **not** activate) |
-| `plesk://host/site/command/release-verify` | verify release meta/hashes (origin/public fingerprint stub → PR8) |
+| `plesk://host/site/command/release-upload` | upload tree to `releases/rel_…` + write `__subactor_release.json` (does **not** activate) |
+| `plesk://host/site/command/release-verify` | verify release meta/hashes; optional `verify_origin` / `verify_public` fingerprint ladder |
+| `plesk://host/site/command/publish-verify` | ADR-004 DNS/TLS/HTTPS + content fingerprint DoD (origin via Host / `--resolve`) |
 | `plesk://host/site/command/release-activate` | atomically point `current` at a release (symlink or pointer) |
 | `plesk://host/site/query/release-current` | report `current` / `previous` release ids |
 | `plesk://host/site/command/release-rollback` | activate previous; result `status: rolled_back` |
-| `plesk://host/doctor/query/report` | connector readiness |
+| `plesk://host/doctor/query/report` | connector readiness (`publish_verify`, staging note `docs-stage.subactor.com`) |
 
 ### Credentials (`ftpuser/command/ensure`)
 

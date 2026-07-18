@@ -19,6 +19,14 @@ REMOTE_HASH_MISMATCH = "remote_hash_mismatch"
 CAPABILITY_UNAVAILABLE = "capability_unavailable"
 RATE_LIMITED = "rate_limited"
 
+# PR8 / ADR-004 verify ladder (upload OK + verify FAIL → applied_unverified).
+DNS_MISMATCH = "dns_mismatch"
+TLS_SAN_MISMATCH = "tls_san_mismatch"
+HTTPS_STATUS_UNEXPECTED = "https_status_unexpected"
+FINGERPRINT_MISMATCH = "fingerprint_mismatch"
+FINGERPRINT_STALE = "fingerprint_stale"
+APPLIED_UNVERIFIED = "applied_unverified"
+
 # Legacy aliases still emitted where useful for ops grep.
 PARAMIKO_MISSING = "capability_unavailable"  # was plesk_sftp_paramiko_missing
 
