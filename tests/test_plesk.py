@@ -373,6 +373,16 @@ def test_site_sync_rejects_non_www_source(tmp_path):
     assert result.get("error") == "plesk_site_source_not_allowlisted"
 
 
+def test_site_sync_allows_docs_basename(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "index.html").write_text("<h1>docs</h1>", encoding="utf-8")
+    result = site_sync(source_dir=str(docs), host="prototypowanie.pl", domain="docs.subactor.com")
+    assert result["ok"] and result["dry_run"] is True
+    assert result["files_planned"] == 1
+    assert result.get("domain") == "docs.subactor.com"
+
+
 def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeypatch, tmp_path):
     www = tmp_path / "www"
     www.mkdir()

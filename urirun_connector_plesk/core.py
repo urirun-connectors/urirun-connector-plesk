@@ -740,7 +740,7 @@ _PRESERVE_REMOTE_NAMES = (".htaccess", ".well-known")
 
 
 def _source_allowed(source_dir: str) -> bool:
-    """Allow only www/ (or explicit PLESK_SYNC_ALLOWED_SOURCES prefixes)."""
+    """Allow www/ or docs/ (or explicit PLESK_SYNC_ALLOWED_SOURCES prefixes)."""
     abs_path = os.path.abspath(source_dir)
     if ".." in source_dir.replace("\\", "/"):
         return False
@@ -754,7 +754,7 @@ def _source_allowed(source_dir: str) -> bool:
             if abs_path == root or abs_path.startswith(root + os.sep):
                 return True
         return False
-    return os.path.basename(abs_path.rstrip(os.sep)) == "www"
+    return os.path.basename(abs_path.rstrip(os.sep)) in {"www", "docs"}
 
 
 def _plan_local_tree(source_dir: str, remote_path: str, exclude: tuple[str, ...] = ()) -> list[dict[str, Any]]:
