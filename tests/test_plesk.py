@@ -370,6 +370,67 @@ def test_ensure_ssl_assign_strategy(monkeypatch):
     assert result["certificate_name"] == "docs.subactor.com-san"
 
 
+def test_sslit_domain_only_fields_omit_wildcard_mail():
+    from urirun_connector_plesk import ssl_ops
+
+    fields = ssl_ops.sslit_domain_only_fields(site_id=308, token="tok")
+    assert fields["validateDomain"] == "1"
+    assert fields["vendorId"] == "letsencrypt.letsencrypt"
+    lowered = {k.lower() for k in fields}
+    assert "wildcard" not in lowered
+    assert not any("mail" in k for k in lowered)
+    assert not any("www" in k for k in lowered)
+    assert ssl_ops.classify_sslit_le_error(
+        "Could not issue a certificate: mail.example is redundant with a wildcard"
+    ) == "plesk_ssl_le_san_conflict"
+
+
+def test_panel_sslit_letsencrypt_posts_domain_only(monkeypatch):
+    from urirun_connector_plesk import ssl_ops
+
+    posted: dict = {}
+
+    class FakeResp:
+        def __init__(self, body: bytes):
+            self._body = body
+
+        def read(self):
+            return self._body
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    class FakeOpener:
+        def open(self, req, timeout=0):
+            url = getattr(req, "full_url", None) or str(req)
+            data = getattr(req, "data", None)
+            if data is None:
+                html = (
+                    '<meta name="forgery_protection_token" content="csrf-tok">'
+                ).encode()
+                return FakeResp(html)
+            body = data.decode("utf-8", errors="replace")
+            posted["body"] = body
+            posted["url"] = url
+            return FakeResp(b'{"status":"success","actionMessages":[]}')
+
+    result = ssl_ops.panel_sslit_letsencrypt(
+        opener=FakeOpener(),
+        base_url="https://plesk.example.com:8443",
+        site_id=308,
+        hostname="docs.subactor.com",
+    )
+    assert result["ok"] is True
+    assert result["san_mode"] == "domain_only"
+    assert "validateDomain" in posted["body"]
+    assert "wildcard" not in posted["body"].lower()
+    assert "secureMail" not in posted["body"]
+    assert "secureWww" not in posted["body"]
+
+
 def test_doctor_reports_ssl_capabilities(monkeypatch):
     from urirun_connector_plesk import doctor
 
@@ -1127,3 +1188,13 @@ def test_site_sync_allows_docs_basename(tmp_path):
     assert result["ok"] and result["dry_run"] is True
     assert result["files_planned"] == 1
     assert result.get("domain") == "docs.subactor.com"
+
+
+def test_site_sync_allows_logo_basename(tmp_path):
+    logo = tmp_path / "logo"
+    logo.mkdir()
+    (logo / "index.html").write_text("<h1>logo</h1>", encoding="utf-8")
+    result = site_sync(source_dir=str(logo), host="prototypowanie.pl", domain="logo.subactor.com")
+    assert result["ok"] and result["dry_run"] is True
+    assert result["files_planned"] == 1
+    assert result.get("domain") == "logo.subactor.com"

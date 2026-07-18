@@ -89,7 +89,10 @@ def build_capabilities(
             "detail": (
                 "ok"
                 if le_ok
-                else "xml_apirpc_unimplemented; rest_cli_needs_admin; panel_sslit_le_san_flags"
+                else (
+                    "xml_apirpc_unimplemented; rest_cli_needs_admin; "
+                    "panel_sslit_le_domain_only (omit wildcard/mail SANs)"
+                )
             ),
         },
         "certificate_assign": True,

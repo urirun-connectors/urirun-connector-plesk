@@ -41,9 +41,11 @@ Fail-closed: default is probe-only. Mutate requires `apply=true`,
 | `rest-cli` | `/api/v2/cli/extension/call` (needs admin `plesk-runtime` API key) |
 
 Known panel limits: XML `extension/letsencrypt` returns **1013** (ApiRpc not
-implemented); customer REST CLI is **403**. SSL It LE may fail ACME orders that
-include both `mail.*` and `*.` SANs — uncheck Wildcard/Mail in the panel, or use
-`panel-pem` for origin SAN coverage without public LE.
+implemented); customer REST CLI is **403**. SSL It LE FormData is **domain-only**
+(`validateDomain=1`; wildcard/mail flags omitted — PHP treats `"false"` as
+truthy and otherwise builds a bad ACME order). On conflict, results include
+structured `hitl` (exact panel click). Fallback: `panel-pem` for origin SAN
+without public LE.
 
 ```json
 {
@@ -94,7 +96,7 @@ Canonical URI: `plesk://host/site/command/sync`.
   `apply=true`, `AUTONOMY_MUTATIONS_ENABLED=1`, `PLESK_SYNC_APPLY=1`, a valid
   signed `apply_grant`, matching dry-run `plan_hash`, and an unused `jti`
   (replay → `apply_grant_replay`). Optional `APPLY_GRANT_JTI_STORE` JSON path.
-- Source must be a directory named `www` or `docs`, or under
+- Source must be a directory named `www`, `docs`, or `logo`, or under
   `PLESK_SYNC_ALLOWED_SOURCES` (colon-separated absolute prefixes).
 - Sync is additive overwrite of listed files; it does not delete remote
   `.htaccess` or `.well-known/` (preserve list returned in the result).

@@ -29,9 +29,49 @@ from .verify_ladder import check_tls_san, hostname_matches_san
 
 PANEL_ACTION_LE = (
     "Plesk → Websites & Domains → docs host → SSL/TLS Certificates (SSL It!) → "
-    "Get it free (Let's Encrypt). Uncheck Wildcard and Mail SANs before install "
-    "(ACME rejects mail.* together with *.)."
+    "Get it free (Let's Encrypt). Keep only the domain checkbox checked — "
+    "uncheck Wildcard and Mail before Install (ACME rejects mail.* with *.)."
 )
+
+# Structured HITL when autonomous LE cannot finish (panel click remaining).
+HITL_LE_DOMAIN_ONLY = {
+    "kind": "panel_click",
+    "surface": "sslit",
+    "click": (
+        "SSL It! → Get it free (Let's Encrypt) → domain only "
+        "(Wildcard off, Mail off) → Install"
+    ),
+    "reason": "acme_san_conflict_or_panel_required",
+}
+
+
+def sslit_domain_only_fields(*, site_id: int, token: str) -> dict[str, str]:
+    """SSL It! FormData for LE with domain-only SAN (no wildcard / mail aliases).
+
+    PHP treats any non-empty string as truthy, so never send
+    ``secureWww``/``secureMail``/``wildcard`` as ``\"false\"`` — omit them.
+    """
+    return {
+        "validateDomain": "1",
+        "id": str(int(site_id)),
+        "vendorId": "letsencrypt.letsencrypt",
+        "productId": "base",
+        "forgery_protection_token": token,
+    }
+
+
+def classify_sslit_le_error(text: str) -> str:
+    """Map SSL It! actionMessages into stable error codes."""
+    lower = (text or "").lower()
+    if "redundant with a wildcard" in lower or (
+        "wildcard" in lower and ("mail" in lower or "could not" in lower)
+    ):
+        return "plesk_ssl_le_san_conflict"
+    if "rate limit" in lower or "too many certificates" in lower:
+        return "plesk_ssl_le_rate_limited"
+    if "could not" in lower or "failed" in lower:
+        return "plesk_ssl_letsencrypt_failed"
+    return "plesk_ssl_letsencrypt_failed"
 
 XmlAgent = Callable[[str, str, str, str], str]
 VaultLease = Callable[[str, str, str, str], str]
@@ -426,21 +466,16 @@ def panel_sslit_letsencrypt(
     site_id: int,
     hostname: str,
 ) -> dict[str, Any]:
-    """Issue LE via SSL It! panel install FormData (validateDomain only)."""
+    """Issue LE via SSL It! panel install FormData (domain-only SAN)."""
     origin = base_url.rstrip("/")
     page_url = f"{origin}/modules/sslit/index.php/index/certificate/id/{int(site_id)}"
     with opener.open(page_url, timeout=30) as resp:
         html = resp.read().decode("utf-8", errors="replace")
     token = _forgery_token(html)
-    # Omit false flags — PHP treats non-empty "false" as truthy and then ACME
-    # requests wildcard+mail together (malformed order).
-    fields = {
-        "validateDomain": "1",
-        "id": str(int(site_id)),
-        "vendorId": "letsencrypt.letsencrypt",
-        "productId": "base",
-        "forgery_protection_token": token,
-    }
+    fields = sslit_domain_only_fields(site_id=site_id, token=token)
+    # Guard: never ship wildcard/mail toggles (PHP truthy-string trap).
+    banned = ("wildcard", "securemail", "securewww", "validatemail", "validatewildcard")
+    assert not any(k.lower() in banned for k in fields), "sslit_domain_only_san_violation"
     body, boundary = _multipart(fields)
     req = urllib.request.Request(
         f"{origin}/modules/sslit/index.php/index/install/",
@@ -472,17 +507,18 @@ def panel_sslit_letsencrypt(
     text = re.sub(r"<[^>]+>", " ", msg)
     text = re.sub(r"\s+", " ", text).strip()
     ok = payload.get("status") == "success" and "Could not" not in text
-    error = None if ok else "plesk_ssl_letsencrypt_failed"
-    if "redundant with a wildcard" in text:
-        error = "plesk_ssl_le_san_conflict"
+    error = None if ok else classify_sslit_le_error(text)
+    hitl = None if ok else {**HITL_LE_DOMAIN_ONLY, "detail": (text or error)[:300]}
     return {
         "ok": ok,
         "strategy": "panel_sslit_le",
         "site_id": site_id,
         "hostname": hostname,
+        "san_mode": "domain_only",
         "error": error,
         "detail": text[:500] if text else str(payload)[:300],
         "panel_action": None if ok else PANEL_ACTION_LE,
+        "hitl": hitl,
     }
 
 

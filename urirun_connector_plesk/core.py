@@ -1057,13 +1057,19 @@ def ensure_ssl(
                     site_id=site_id,
                     hostname=host,
                 )
-                attempts.append({k: le.get(k) for k in ("strategy", "ok", "error", "detail")})
+                attempts.append(
+                    {
+                        k: le.get(k)
+                        for k in ("strategy", "ok", "error", "detail", "san_mode", "hitl")
+                        if k in le
+                    }
+                )
                 if le.get("ok"):
                     return _finish(le)
             except RuntimeError as error:
                 attempts.append({"strategy": "panel_sslit_le", "ok": False, "error": str(error)})
 
-        # 5) REST CLI (admin API key)
+        # 5) REST CLI (admin API key) — domain-only (-d hostname, no wildcard/mail)
         if mode in {"auto", "rest-cli", "letsencrypt"}:
             try:
                 api_key = _vault_lease(runtime_vault_entry_id, origin_api, "api_key", vault_url)
@@ -1081,6 +1087,7 @@ def ensure_ssl(
                 attempts.append({"strategy": "rest_cli_le", "ok": False, "error": str(error)})
 
         last = attempts[-1] if attempts else {}
+        hitl = last.get("hitl") or {**ssl_ops.HITL_LE_DOMAIN_ONLY, "detail": last.get("detail")}
         return urirun.fail(
             last.get("error") or "plesk_ssl_ensure_failed",
             hostname=host,
@@ -1091,6 +1098,8 @@ def ensure_ssl(
             capabilities=caps,
             panel_action=ssl_ops.PANEL_ACTION_LE,
             detail=last.get("detail"),
+            hitl=hitl,
+            san_mode="domain_only",
         )
     except RuntimeError as error:
         return urirun.fail(str(error), hostname=host, capabilities=caps, attempts=attempts)
@@ -1209,7 +1218,7 @@ _PRESERVE_REMOTE_NAMES = (".htaccess", ".well-known")
 
 
 def _source_allowed(source_dir: str) -> bool:
-    """Allow www/ or docs/ (or explicit PLESK_SYNC_ALLOWED_SOURCES prefixes)."""
+    """Allow approved static roots or explicit PLESK_SYNC_ALLOWED_SOURCES prefixes."""
     abs_path = os.path.abspath(source_dir)
     if ".." in source_dir.replace("\\", "/"):
         return False
@@ -1223,7 +1232,7 @@ def _source_allowed(source_dir: str) -> bool:
             if abs_path == root or abs_path.startswith(root + os.sep):
                 return True
         return False
-    return os.path.basename(abs_path.rstrip(os.sep)) in {"www", "docs"}
+    return os.path.basename(abs_path.rstrip(os.sep)) in {"www", "docs", "logo"}
 
 
 def _plan_local_tree(source_dir: str, remote_path: str, exclude: tuple[str, ...] = ()) -> list[dict[str, Any]]:
