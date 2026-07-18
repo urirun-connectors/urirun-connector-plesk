@@ -19,7 +19,7 @@ import urirun
 
 from . import _urirun_compat
 from .immutable_manifest import build_immutable_manifest, verify_plan_hash
-from .apply_grant import autonomy_mutations_enabled, format_intent_pack, verify_apply_grant
+from .apply_grant import autonomy_mutations_enabled, consume_apply_grant_jti, format_intent_pack, verify_apply_grant
 
 try:  # paramiko is only needed for SFTP site publication; keep the connector importable without it
     import paramiko
@@ -975,6 +975,24 @@ def _site_tree_sync(
             domain=domain or None,
         )
     manifest = verified
+
+    # PR5c: consume jti after gates pass, before any network mutation.
+    jti = (grant_claims or {}).get("jti") or ""
+    expires_at = (grant_claims or {}).get("expires_at") or ""
+    replay_ok, replay_error = consume_apply_grant_jti(jti, expires_at)
+    if not replay_ok:
+        return urirun.fail(
+            replay_error or "apply_grant_replay",
+            dry_run=True,
+            files_planned=len(plan),
+            plan=plan,
+            manifest=manifest,
+            plan_hash=manifest["plan_hash"],
+            files_uploaded=0,
+            preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+            domain=domain or None,
+            grant_claims=grant_claims,
+        )
 
     chosen = transport
     detection: list[dict[str, Any]] | None = None

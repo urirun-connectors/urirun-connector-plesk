@@ -52,7 +52,8 @@ Canonical URI: `plesk://host/site/command/sync`.
 
 - Always plans locally first (file list + sha256). Never uploads unless
   `apply=true`, `AUTONOMY_MUTATIONS_ENABLED=1`, `PLESK_SYNC_APPLY=1`, a valid
-  signed `apply_grant`, and matching dry-run `plan_hash`.
+  signed `apply_grant`, matching dry-run `plan_hash`, and an unused `jti`
+  (replay → `apply_grant_replay`). Optional `APPLY_GRANT_JTI_STORE` JSON path.
 - Source must be a directory named `www` or `docs`, or under
   `PLESK_SYNC_ALLOWED_SOURCES` (colon-separated absolute prefixes).
 - Sync is additive overwrite of listed files; it does not delete remote

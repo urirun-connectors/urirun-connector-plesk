@@ -22,6 +22,7 @@ from urirun_connector_plesk import (
 )
 import urirun_connector_plesk.core as core
 from urirun_connector_plesk.apply_grant import CLOCK_SKEW_SECONDS, issue_apply_grant
+from urirun_connector_plesk.apply_grant_replay import reset_default_jti_replay_store
 
 
 ROUTES = {
@@ -339,6 +340,8 @@ def _enable_apply(monkeypatch, secret="test-apply-grant-hmac"):
     monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
     monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", secret)
     monkeypatch.delenv("APPLY_GRANT_HMAC_SECRET_NEXT", raising=False)
+    monkeypatch.delenv("APPLY_GRANT_JTI_STORE", raising=False)
+    reset_default_jti_replay_store()
 
 
 def _grant_for(dry, host="prototypowanie.pl", **extra):
@@ -351,6 +354,7 @@ def _grant_for(dry, host="prototypowanie.pl", **extra):
         target=host,
         risk_class="reversible",
         ttl_seconds=extra.get("ttl_seconds", 900),
+        jti=extra.get("jti", ""),
         environ={"APPLY_GRANT_HMAC_SECRET": extra.get("secret", "test-apply-grant-hmac")},
         now=extra.get("now"),
     )
@@ -571,6 +575,68 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
     assert "s3cr3t-sftp" not in json.dumps(result) and "subactor_customer" not in json.dumps(result)
     assert "test-apply-grant-hmac" not in json.dumps(result)
     assert fake_transport.closed
+
+
+def test_site_publish_apply_grant_jti_replay_denied(monkeypatch, tmp_path):
+    """PR5c: first apply OK; same jti → apply_grant_replay with zero second upload; new jti OK."""
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    fake_sftp = _FakeSFTP()
+    leases = {"username": "u", "password": "p"}
+    _enable_apply(monkeypatch)
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": leases[field])
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda *a, **k: (_FakeTransport(), fake_sftp, "aa11bb22"),
+    )
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant_a = _grant_for(dry, jti="replay-jti-fixed")
+
+    first = site_publish(
+        source_dir=str(www),
+        sftp_host="prototypowanie.pl",
+        transport="sftp",
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        apply_grant=grant_a,
+        actor="test-actor",
+        pack_id="docs",
+        pack_version="1",
+    )
+    assert first["ok"] and first["dry_run"] is False
+    assert first["files_uploaded"] == 4
+    puts_after_first = len(fake_sftp.puts)
+
+    second = site_publish(
+        source_dir=str(www),
+        sftp_host="prototypowanie.pl",
+        transport="sftp",
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        apply_grant=grant_a,
+        actor="test-actor",
+        pack_id="docs",
+        pack_version="1",
+    )
+    assert second.get("error") == "apply_grant_replay"
+    assert second.get("files_uploaded", 0) == 0
+    assert len(fake_sftp.puts) == puts_after_first
+
+    grant_b = _grant_for(dry, jti="replay-jti-other")
+    third = site_publish(
+        source_dir=str(www),
+        sftp_host="prototypowanie.pl",
+        transport="sftp",
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        apply_grant=grant_b,
+        actor="test-actor",
+        pack_id="docs",
+        pack_version="1",
+    )
+    assert third["ok"] and third["dry_run"] is False
+    assert len(fake_sftp.puts) == puts_after_first + 4
 
 
 def test_site_publish_apply_without_plan_hash_denied(monkeypatch, tmp_path):

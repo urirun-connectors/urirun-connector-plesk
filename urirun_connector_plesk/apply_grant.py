@@ -6,7 +6,8 @@ Canonical claim key order (string values):
   expires_at, risk_class, jti, iat
 
 Secrets: APPLY_GRANT_HMAC_SECRET || TOKEN_PEPPER; NEXT for rotation.
-jti issued for PR5c replay store (not enforced here).
+Replay: verify_apply_grant is crypto-only; mutate paths call
+consume_apply_grant_jti after plan_hash (ADR-003 / PR5c).
 """
 from __future__ import annotations
 
@@ -19,6 +20,8 @@ import secrets
 import time
 from datetime import datetime, timezone
 from typing import Any
+
+from .apply_grant_replay import consume_apply_grant_jti
 
 APPLY_GRANT_ALG = "HS256"
 APPLY_GRANT_TYP = "apply-grant"
@@ -249,6 +252,47 @@ def verify_apply_grant(
     if claims["risk_class"] not in RISK_CLASSES or not claims["jti"]:
         return False, "apply_grant_signature_invalid", claims
 
+    return True, None, claims
+
+
+def verify_and_consume_apply_grant(
+    token: str,
+    *,
+    plan_hash: str = "",
+    target: str = "",
+    actor: str = "",
+    intent_pack: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    artifact_sha256: str = "",
+    now: float | None = None,
+    environ: dict[str, str] | None = None,
+    replay_store: Any = None,
+) -> tuple[bool, str | None, dict[str, str] | None]:
+    """Verify then consume jti (mutate path). Second use → apply_grant_replay."""
+    ok, error, claims = verify_apply_grant(
+        token,
+        plan_hash=plan_hash,
+        target=target,
+        actor=actor,
+        intent_pack=intent_pack,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        artifact_sha256=artifact_sha256,
+        now=now,
+        environ=environ,
+    )
+    if not ok or not claims:
+        return ok, error, claims
+    consumed_ok, replay_error = consume_apply_grant_jti(
+        claims["jti"],
+        claims["expires_at"],
+        store=replay_store,
+        environ=environ,
+        now=now,
+    )
+    if not consumed_ok:
+        return False, replay_error or "apply_grant_replay", claims
     return True, None, claims
 
 
