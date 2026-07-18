@@ -19,6 +19,7 @@ import urirun
 
 from . import _urirun_compat
 from .immutable_manifest import build_immutable_manifest, verify_plan_hash
+from .apply_grant import autonomy_mutations_enabled, format_intent_pack, verify_apply_grant
 
 try:  # paramiko is only needed for SFTP site publication; keep the connector importable without it
     import paramiko
@@ -786,13 +787,35 @@ def _plan_local_tree(source_dir: str, remote_path: str, exclude: tuple[str, ...]
     return planned
 
 
-def _apply_permitted(apply: bool) -> tuple[bool, str | None]:
-    """Uploads require apply=true AND PLESK_SYNC_APPLY=1. Default is dry-run."""
+def _apply_permitted(
+    apply: bool,
+    *,
+    apply_grant: str = "",
+    plan_hash: str = "",
+    target: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    artifact_sha256: str = "",
+) -> tuple[bool, str | None, dict | None]:
+    """Uploads require apply + master + PLESK gate + valid signed grant (ADR-003)."""
     if not apply:
-        return False, None
+        return False, None, None
+    if not autonomy_mutations_enabled():
+        return False, "autonomy_mutations_disabled", None
     if os.environ.get("PLESK_SYNC_APPLY", "").strip() != "1":
-        return False, "plesk_sync_apply_required"
-    return True, None
+        return False, "plesk_sync_apply_required", None
+    ok, error, claims = verify_apply_grant(
+        apply_grant,
+        plan_hash=plan_hash,
+        target=target,
+        actor=actor,
+        intent_pack=format_intent_pack(pack_id, pack_version),
+        artifact_sha256=artifact_sha256,
+    )
+    if not ok:
+        return False, error or "apply_grant_required", claims
+    return True, None, claims
 
 
 def _publish_over_sftp(source_dir, remote_path, host, port, username, password, host_fingerprint, exclude=()):
@@ -863,6 +886,8 @@ def _site_tree_sync(
     domain: str = "",
     exclude: list[str] | None = None,
     plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
     pack_id: str = "",
     pack_version: str = "",
     recipe_ref: str = "",
@@ -890,7 +915,18 @@ def _site_tree_sync(
         pack_version=pack_version,
         recipe_ref=recipe_ref,
     )
-    may_write, apply_error = _apply_permitted(bool(apply))
+    may_write, apply_error, grant_claims = _apply_permitted(
+        bool(apply),
+        apply_grant=apply_grant,
+        plan_hash=plan_hash,
+        target=host or "",
+        actor=actor,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        # Do not bind grant artifact to recomputed tree here — PR5a plan_hash
+        # mismatch is the content gate; optional artifact check is request-driven.
+        artifact_sha256="",
+    )
     if apply_error:
         return urirun.fail(
             apply_error,
@@ -901,6 +937,7 @@ def _site_tree_sync(
             plan_hash=manifest["plan_hash"],
             preserve_remote=list(_PRESERVE_REMOTE_NAMES),
             domain=domain or None,
+            grant_claims=grant_claims,
         )
     if not may_write:
         return urirun.ok(
@@ -914,7 +951,7 @@ def _site_tree_sync(
             plan_hash=manifest["plan_hash"],
             preserve_remote=list(_PRESERVE_REMOTE_NAMES),
             exclude=list(exclude_patterns),
-            note="set apply=true and PLESK_SYNC_APPLY=1 with dry-run plan_hash to upload",
+            note="set apply=true, AUTONOMY_MUTATIONS_ENABLED=1, PLESK_SYNC_APPLY=1, plan_hash, and signed apply_grant",
         )
 
     # PR5a: apply must bind to dry-run plan_hash — no free re-scan divergence / zero upload on mismatch.
@@ -990,6 +1027,7 @@ def _site_tree_sync(
         preserve_remote=list(_PRESERVE_REMOTE_NAMES),
         exclude=list(exclude_patterns),
         methods=detection,
+        grant_jti=(grant_claims or {}).get("jti"),
         **extra,
     )
 
@@ -1017,6 +1055,8 @@ def site_sync(
     domain: str = "",
     exclude: list[str] | None = None,
     plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
     pack_id: str = "",
     pack_version: str = "",
     recipe_ref: str = "",
@@ -1038,6 +1078,8 @@ def site_sync(
         domain=domain,
         exclude=exclude,
         plan_hash=plan_hash,
+        apply_grant=apply_grant,
+        actor=actor,
         pack_id=pack_id,
         pack_version=pack_version,
         recipe_ref=recipe_ref,
@@ -1047,7 +1089,7 @@ def site_sync(
 @conn.handler(
     "site/command/publish",
     isolated=True,
-    meta={"label": "Alias of site/command/sync (dry-run by default; apply requires PLESK_SYNC_APPLY=1 + plan_hash)"},
+    meta={"label": "Alias of site/command/sync (dry-run by default; apply requires grant + plan_hash)"},
 )
 def site_publish(
     source_dir: str = "",
@@ -1067,6 +1109,8 @@ def site_publish(
     domain: str = "",
     exclude: list[str] | None = None,
     plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
     pack_id: str = "",
     pack_version: str = "",
     recipe_ref: str = "",
@@ -1089,6 +1133,8 @@ def site_publish(
         domain=domain,
         exclude=exclude,
         plan_hash=plan_hash,
+        apply_grant=apply_grant,
+        actor=actor,
         pack_id=pack_id,
         pack_version=pack_version,
         recipe_ref=recipe_ref,

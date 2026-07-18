@@ -50,21 +50,25 @@ Canonical URI: `plesk://host/site/command/sync`.
 
 **Safety defaults**
 
-- Always plans locally first (file list + sha256). Never uploads unless both
-  `apply=true` **and** environment `PLESK_SYNC_APPLY=1`.
-- Source must be a directory named `www`, or under
+- Always plans locally first (file list + sha256). Never uploads unless
+  `apply=true`, `AUTONOMY_MUTATIONS_ENABLED=1`, `PLESK_SYNC_APPLY=1`, a valid
+  signed `apply_grant`, and matching dry-run `plan_hash`.
+- Source must be a directory named `www` or `docs`, or under
   `PLESK_SYNC_ALLOWED_SOURCES` (colon-separated absolute prefixes).
 - Sync is additive overwrite of listed files; it does not delete remote
   `.htaccess` or `.well-known/` (preserve list returned in the result).
 - Credentials are leased from the vault; never accepted in the URI payload.
 
 ```text
-source_dir           local directory (allowlisted www/)
+source_dir           local directory (allowlisted www/ or docs/)
 remote_path          target path, default /httpdocs
 host / sftp_host     Plesk SSH/FTP host
 domain               optional subscription/domain label (metadata)
 transport            auto | sftp | ftp  (auto prefers SFTP)
-apply                false (dry-run) | true (requires PLESK_SYNC_APPLY=1)
+apply                false (dry-run) | true (requires gates + grant + plan_hash)
+plan_hash            from dry-run response (required on apply)
+apply_grant          signed grant from control POST /api/apply-grants
+actor / pack_id      optional binding checks against grant claims
 sftp_port / ftp_port defaults 22 / 21
 sftp_vault_entry_id  default plesk-sftp
 ftp_vault_entry_id   default plesk-ftp

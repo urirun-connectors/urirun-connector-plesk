@@ -21,6 +21,7 @@ from urirun_connector_plesk import (
     urirun_bindings,
 )
 import urirun_connector_plesk.core as core
+from urirun_connector_plesk.apply_grant import CLOCK_SKEW_SECONDS, issue_apply_grant
 
 
 ROUTES = {
@@ -333,6 +334,30 @@ def _seed_site(tmp_path):
     (tmp_path / "pl" / "index.html").write_text("<h1>pl</h1>", encoding="utf-8")
 
 
+def _enable_apply(monkeypatch, secret="test-apply-grant-hmac"):
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", secret)
+    monkeypatch.delenv("APPLY_GRANT_HMAC_SECRET_NEXT", raising=False)
+
+
+def _grant_for(dry, host="prototypowanie.pl", **extra):
+    issued = issue_apply_grant(
+        run_id=extra.get("run_id", "run_test"),
+        actor=extra.get("actor", "test-actor"),
+        intent_pack=extra.get("intent_pack", "docs@1"),
+        plan_hash=dry["plan_hash"],
+        artifact_sha256=dry["manifest"]["source_sha256"],
+        target=host,
+        risk_class="reversible",
+        ttl_seconds=extra.get("ttl_seconds", 900),
+        environ={"APPLY_GRANT_HMAC_SECRET": extra.get("secret", "test-apply-grant-hmac")},
+        now=extra.get("now"),
+    )
+    assert issued["ok"], issued
+    return issued["grant"]
+
+
 def test_site_sync_dry_run_plans_without_upload(monkeypatch, tmp_path):
     www = tmp_path / "www"
     www.mkdir()
@@ -383,13 +408,14 @@ def test_site_sync_apply_denies_plan_hash_mismatch_with_zero_upload(monkeypatch,
     www.mkdir()
     _seed_site(www)
     fake_sftp = _FakeSFTP()
-    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    _enable_apply(monkeypatch)
     monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no lease")))
     monkeypatch.setattr(
         core, "_sftp_connect",
         lambda *a, **k: (_FakeTransport(), fake_sftp, "aa11bb22"),
     )
     dry = site_sync(source_dir=str(www), host="prototypowanie.pl", remote_path="/httpdocs")
+    grant = _grant_for(dry)
     (www / "index.html").write_text("<h1>tampered</h1>", encoding="utf-8")
     result = site_sync(
         source_dir=str(www),
@@ -398,6 +424,10 @@ def test_site_sync_apply_denies_plan_hash_mismatch_with_zero_upload(monkeypatch,
         apply=True,
         transport="sftp",
         plan_hash=dry["plan_hash"],
+        apply_grant=grant,
+        actor="test-actor",
+        pack_id="docs",
+        pack_version="1",
     )
     assert result.get("error") == "plan_hash_mismatch"
     assert result.get("files_uploaded", 0) == 0
@@ -409,6 +439,8 @@ def test_site_sync_apply_requires_env(monkeypatch, tmp_path):
     www.mkdir()
     _seed_site(www)
     monkeypatch.delenv("PLESK_SYNC_APPLY", raising=False)
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "test-apply-grant-hmac")
     result = site_sync(
         source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
         plan_hash="deadbeef",
@@ -418,22 +450,80 @@ def test_site_sync_apply_requires_env(monkeypatch, tmp_path):
     assert result.get("plan_hash")
 
 
-def test_site_sync_rejects_non_www_source(tmp_path):
-    other = tmp_path / "not-www"
-    other.mkdir()
-    (other / "index.html").write_text("x", encoding="utf-8")
-    result = site_sync(source_dir=str(other), host="prototypowanie.pl")
-    assert result.get("error") == "plesk_site_source_not_allowlisted"
+def test_site_sync_apply_requires_master_kill_switch(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    monkeypatch.delenv("AUTONOMY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "test-apply-grant-hmac")
+    dry = site_sync(source_dir=str(www), host="prototypowanie.pl")
+    result = site_sync(
+        source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+        plan_hash=dry["plan_hash"], apply_grant=_grant_for(dry),
+    )
+    assert result.get("error") == "autonomy_mutations_disabled"
 
 
-def test_site_sync_allows_docs_basename(tmp_path):
-    docs = tmp_path / "docs"
-    docs.mkdir()
-    (docs / "index.html").write_text("<h1>docs</h1>", encoding="utf-8")
-    result = site_sync(source_dir=str(docs), host="prototypowanie.pl", domain="docs.subactor.com")
-    assert result["ok"] and result["dry_run"] is True
-    assert result["files_planned"] == 1
-    assert result.get("domain") == "docs.subactor.com"
+def test_site_sync_apply_requires_grant(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+    dry = site_sync(source_dir=str(www), host="prototypowanie.pl")
+    result = site_sync(
+        source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+        plan_hash=dry["plan_hash"],
+    )
+    assert result.get("error") == "apply_grant_required"
+
+
+def test_site_sync_apply_denies_wrong_target_grant(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+    dry = site_sync(source_dir=str(www), host="prototypowanie.pl")
+    grant = _grant_for(dry, host="evil.example")
+    result = site_sync(
+        source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor",
+        pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "apply_grant_target_mismatch"
+
+
+def test_site_sync_apply_denies_expired_grant(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+    dry = site_sync(source_dir=str(www), host="prototypowanie.pl")
+    past = __import__("time").time() - (CLOCK_SKEW_SECONDS + 120)
+    grant = _grant_for(dry, ttl_seconds=1, now=past)
+    result = site_sync(
+        source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor",
+        pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "apply_grant_expired"
+
+
+def test_site_sync_apply_denies_bad_signer(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch, secret="verifier-secret")
+    dry = site_sync(source_dir=str(www), host="prototypowanie.pl")
+    grant = _grant_for(dry, secret="other-issuer-secret")
+    result = site_sync(
+        source_dir=str(www), host="prototypowanie.pl", apply=True, transport="sftp",
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor",
+        pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "apply_grant_signature_invalid"
+    blob = json.dumps(result)
+    assert "verifier-secret" not in blob and "other-issuer-secret" not in blob
 
 
 def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeypatch, tmp_path):
@@ -444,7 +534,7 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
     fake_transport = _FakeTransport()
     leases = {"username": "subactor_customer", "password": "s3cr3t-sftp"}
 
-    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    _enable_apply(monkeypatch)
     monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": leases[field])
     monkeypatch.setattr(
         core, "_sftp_connect",
@@ -456,6 +546,7 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
         remote_path="/httpdocs",
         sftp_host="prototypowanie.pl",
     )
+    grant = _grant_for(dry)
     result = site_publish(
         source_dir=str(www),
         remote_path="/httpdocs",
@@ -465,6 +556,10 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
         transport="sftp",
         apply=True,
         plan_hash=dry["plan_hash"],
+        apply_grant=grant,
+        actor="test-actor",
+        pack_id="docs",
+        pack_version="1",
     )
 
     assert result["ok"] and result["dry_run"] is False and result["files_uploaded"] == 4
@@ -474,6 +569,7 @@ def test_site_publish_uploads_tree_over_sftp_without_leaking_credentials(monkeyp
     assert "/httpdocs/assets" in fake_sftp.made and "/httpdocs/pl" in fake_sftp.made
     assert len(fake_sftp.puts) == 4
     assert "s3cr3t-sftp" not in json.dumps(result) and "subactor_customer" not in json.dumps(result)
+    assert "test-apply-grant-hmac" not in json.dumps(result)
     assert fake_transport.closed
 
 
@@ -482,14 +578,17 @@ def test_site_publish_apply_without_plan_hash_denied(monkeypatch, tmp_path):
     www.mkdir()
     _seed_site(www)
     fake_sftp = _FakeSFTP()
-    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    _enable_apply(monkeypatch)
     monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no lease")))
     monkeypatch.setattr(
         core, "_sftp_connect",
         lambda *a, **k: (_FakeTransport(), fake_sftp, "aa"),
     )
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant = _grant_for(dry)
     result = site_publish(
         source_dir=str(www), sftp_host="prototypowanie.pl", transport="sftp", apply=True,
+        apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
     )
     assert result.get("error") == "plan_hash_mismatch"
     assert fake_sftp.puts == []
@@ -511,11 +610,13 @@ def test_site_publish_requires_paramiko(monkeypatch, tmp_path):
     www = tmp_path / "www"
     www.mkdir()
     _seed_site(www)
-    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    _enable_apply(monkeypatch)
     monkeypatch.setattr(core, "paramiko", None)
     dry = site_sync(source_dir=str(www), sftp_host="h")
+    grant = _grant_for(dry, host="h")
     assert site_publish(
         source_dir=str(www), sftp_host="h", transport="sftp", apply=True, plan_hash=dry["plan_hash"],
+        apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
     ).get("error") == "plesk_sftp_paramiko_missing"
 
 
@@ -539,3 +640,21 @@ def test_sftp_connect_rejects_host_key_mismatch(monkeypatch):
     monkeypatch.setattr(core.paramiko, "Transport", _T)
     with pytest.raises(RuntimeError, match="plesk_sftp_host_key_mismatch"):
         core._sftp_connect("h", 22, "u", "p", host_fingerprint="deadbeef")
+
+
+def test_site_sync_rejects_non_www_source(tmp_path):
+    other = tmp_path / "not-www"
+    other.mkdir()
+    (other / "index.html").write_text("x", encoding="utf-8")
+    result = site_sync(source_dir=str(other), host="prototypowanie.pl")
+    assert result.get("error") == "plesk_site_source_not_allowlisted"
+
+
+def test_site_sync_allows_docs_basename(tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "index.html").write_text("<h1>docs</h1>", encoding="utf-8")
+    result = site_sync(source_dir=str(docs), host="prototypowanie.pl", domain="docs.subactor.com")
+    assert result["ok"] and result["dry_run"] is True
+    assert result["files_planned"] == 1
+    assert result.get("domain") == "docs.subactor.com"
