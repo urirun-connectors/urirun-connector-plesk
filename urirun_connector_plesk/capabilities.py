@@ -37,8 +37,11 @@ def require_sftp_for_apply(*, transport: str, production: bool | None = None) ->
     return not ftp_fallback_allowed()
 
 
-def build_capabilities(*, paramiko_mod: Any, release_activation: bool = False, rollback: bool = False) -> dict[str, Any]:
+def build_capabilities(*, paramiko_mod: Any, release_activation: bool | None = None, rollback: bool | None = None) -> dict[str, Any]:
     sftp_ok = paramiko_available(paramiko_mod)
+    # PR7: release activate/rollback available whenever SFTP transport is.
+    release_ok = sftp_ok if release_activation is None else bool(release_activation)
+    rollback_ok = sftp_ok if rollback is None else bool(rollback)
     return {
         "sftp": {
             "available": sftp_ok,
@@ -48,8 +51,9 @@ def build_capabilities(*, paramiko_mod: Any, release_activation: bool = False, r
             "available": True,  # stdlib ftplib always present
             "detail": "ok",
         },
-        "release_activation": bool(release_activation),  # PR7
-        "rollback": bool(rollback),  # PR7
+        "release_activation": release_ok,
+        "rollback": rollback_ok,
+        "release_activation_strategies": ["auto", "symlink", "pointer"],
     }
 
 

@@ -16,6 +16,11 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |
 | `plesk://host/site/command/sync` | dry-run (default) or apply `www/` → `/httpdocs` tree sync (SFTP preferred, FTP fallback) |
 | `plesk://host/site/command/publish` | alias of `site/command/sync` |
+| `plesk://host/site/command/release-upload` | upload tree to `releases/rel_…` (does **not** activate) |
+| `plesk://host/site/command/release-verify` | verify release meta/hashes (origin/public fingerprint stub → PR8) |
+| `plesk://host/site/command/release-activate` | atomically point `current` at a release (symlink or pointer) |
+| `plesk://host/site/query/release-current` | report `current` / `previous` release ids |
+| `plesk://host/site/command/release-rollback` | activate previous; result `status: rolled_back` |
 | `plesk://host/doctor/query/report` | connector readiness |
 
 ### Credentials (`ftpuser/command/ensure`)
@@ -102,14 +107,54 @@ Doctor (`plesk://host/doctor/query/report`) returns capability JSON:
   "capabilities": {
     "sftp": { "available": true, "detail": "ok" },
     "ftp": { "available": true, "detail": "ok" },
-    "release_activation": false,
-    "rollback": false
+    "release_activation": true,
+    "rollback": true,
+    "release_activation_strategies": ["auto", "symlink", "pointer"]
   },
   "production_publish_ready": true,
   "ftp_fallback_allowed": false,
+  "release_activation_default": "auto",
   "timeouts": { "connect": 15, "operation": 120, "total": 180 }
 }
 ```
+
+## Release-based deploy (PR7)
+
+Do **not** treat destructive sync into the live docroot as the only model.
+Preferred flow:
+
+```text
+release-upload → release-verify → release-activate → (PR8 public verify)
+on_fail → release-rollback  (status rolled_back, never fake ok)
+```
+
+Layout under `release_root` (default `/httpdocs`):
+
+```text
+{release_root}/
+  releases/rel_…/
+  current → releases/rel_…     # or .release_current.json pointer
+  previous → releases/rel_…
+```
+
+### Activation strategy (`PLESK_RELEASE_ACTIVATION`)
+
+| Value | Behavior |
+| --- | --- |
+| `auto` (default) | try SFTP symlink; fall back to JSON pointer files |
+| `symlink` | require `current` / `previous` symlinks |
+| `pointer` | write `.release_current.json` / `.release_previous.json` |
+
+**Staging note:** Plesk REST “set docroot” / panel API atomic switch is **not**
+assumed — it is unknown/unverified on the target host. Recipes call the stable
+URIs above; the connector hides symlink vs pointer. Confirm symlink allowance
+on the subscription before forcing `symlink` in production. Lab/unit tests use
+`LocalReleaseFs` (see `tests/test_release.py`); `mock-plesk` remains the REST
+mailbox/site fixture and does not emulate SFTP release FS.
+
+Mutating release URIs keep the same fail-closed gates as sync: master kill
+switch, `PLESK_SYNC_APPLY=1`, signed `apply_grant`, `plan_hash`, jti replay,
+SFTP readiness.
 
 Dry-run:
 

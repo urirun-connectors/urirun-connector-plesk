@@ -1305,6 +1305,471 @@ def site_publish(
     )
 
 
+def _open_sftp_release_fs(
+    *,
+    host: str,
+    sftp_port: int,
+    sftp_vault_entry_id: str,
+    credential_origin: str,
+    host_fingerprint: str,
+    vault_url: str,
+):
+    """Lease SFTP creds and return (transport, SftpReleaseFs)."""
+    from .release_ops import SftpReleaseFs
+
+    if paramiko is None:
+        raise RuntimeError(CAPABILITY_UNAVAILABLE)
+    origin = _transport_origin("sftp", host, credential_origin)
+    username = password = ""
+    try:
+        username = _vault_lease(sftp_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(sftp_vault_entry_id, origin, "password", vault_url)
+        transport, sftp, fingerprint = _sftp_connect(
+            host, int(sftp_port), username, password, host_fingerprint,
+        )
+    finally:
+        username = password = ""
+    return transport, SftpReleaseFs(sftp), fingerprint
+
+
+def _release_mutate_gates(
+    *,
+    apply: bool,
+    apply_grant: str,
+    plan_hash: str,
+    host: str,
+    actor: str,
+    pack_id: str,
+    pack_version: str,
+) -> tuple[bool, str | None, dict | None]:
+    return _apply_permitted(
+        bool(apply),
+        apply_grant=apply_grant,
+        plan_hash=plan_hash,
+        target=host or "",
+        actor=actor,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        artifact_sha256="",
+    )
+
+
+@conn.handler(
+    "site/command/release-upload",
+    isolated=True,
+    meta={"label": "Upload a release tree under releases/rel_… (does not activate)"},
+)
+def release_upload(
+    source_dir: str = "",
+    release_root: str = "/httpdocs",
+    release_id: str = "",
+    host: str = "",
+    sftp_host: str = "",
+    transport: str = "sftp",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    apply: bool = False,
+    domain: str = "",
+    exclude: list[str] | None = None,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    recipe_ref: str = "",
+    git_commit: str = "",
+) -> dict[str, Any]:
+    """Upload into releases/rel_… — never writes the live docroot directly."""
+    from .release_ops import (
+        RELEASE_META_NAME,
+        build_release_meta,
+        new_release_id,
+        release_dir,
+        validate_release_id,
+        validate_release_root,
+    )
+
+    host = host or sftp_host
+    bad_root = validate_release_root(release_root)
+    if bad_root:
+        return urirun.fail(bad_root)
+    rid = release_id or new_release_id()
+    bad_id = validate_release_id(rid)
+    if bad_id:
+        return urirun.fail(bad_id)
+    if transport not in {"auto", "sftp"}:
+        return urirun.fail("plesk_release_sftp_required")
+
+    remote_path = release_dir(release_root, rid)
+    # Reuse tree sync planner/gates with remote_path = releases/rel_…
+    planned = _site_tree_sync(
+        source_dir=source_dir,
+        remote_path=remote_path,
+        host=host,
+        transport="sftp",
+        sftp_port=int(sftp_port),
+        ftp_port=21,
+        ftp_tls=True,
+        sftp_vault_entry_id=sftp_vault_entry_id,
+        ftp_vault_entry_id="plesk-ftp",
+        credential_origin=credential_origin,
+        host_fingerprint=host_fingerprint,
+        vault_url=vault_url,
+        apply=bool(apply),
+        domain=domain,
+        exclude=exclude,
+        plan_hash=plan_hash,
+        apply_grant=apply_grant,
+        actor=actor,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        recipe_ref=recipe_ref,
+    )
+    if not planned.get("ok"):
+        return planned
+
+    meta = build_release_meta(
+        release_id=rid,
+        plan_hash=planned.get("plan_hash") or "",
+        host=host,
+        domain=domain,
+        files=planned.get("plan") or [],
+        git_commit=git_commit,
+    )
+    result = {
+        **{k: v for k, v in planned.items() if k != "ok"},
+        "ok": True,
+        "release_id": rid,
+        "release_root": release_root,
+        "remote_path": remote_path,
+        "activated": False,
+        "release_meta": meta,
+        "note": planned.get("note")
+        or ("dry-run only" if planned.get("dry_run") else "uploaded; call release-activate to switch current"),
+    }
+    if planned.get("dry_run"):
+        return result
+
+    # Write release metadata marker into the uploaded tree (best-effort over SFTP).
+    try:
+        transport_obj, fs, _fp = _open_sftp_release_fs(
+            host=host,
+            sftp_port=int(sftp_port),
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            credential_origin=credential_origin,
+            host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        try:
+            fs.write_bytes(
+                f"{remote_path}/{RELEASE_META_NAME}",
+                json.dumps(meta, separators=(",", ":"), sort_keys=True).encode("utf-8"),
+            )
+        finally:
+            transport_obj.close()
+    except RuntimeError as error:
+        return urirun.fail(str(error), release_id=rid, files_uploaded=planned.get("files_uploaded", 0))
+    return result
+
+
+@conn.handler(
+    "site/command/release-verify",
+    isolated=True,
+    meta={"label": "Verify release hashes (origin/public fingerprint stub → PR8)"},
+)
+def release_verify(
+    release_id: str = "",
+    release_root: str = "/httpdocs",
+    plan_hash: str = "",
+    host: str = "",
+    sftp_host: str = "",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    domain: str = "",
+) -> dict[str, Any]:
+    from .release_ops import (
+        RELEASE_META_NAME,
+        release_dir,
+        validate_release_id,
+        validate_release_root,
+        verify_release_local,
+    )
+
+    host = host or sftp_host
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    bad = validate_release_root(release_root) or validate_release_id(release_id)
+    if bad:
+        return urirun.fail(bad)
+    try:
+        transport_obj, fs, _fp = _open_sftp_release_fs(
+            host=host,
+            sftp_port=int(sftp_port),
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            credential_origin=credential_origin,
+            host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        try:
+            raw = fs.read_bytes(f"{release_dir(release_root, release_id)}/{RELEASE_META_NAME}")
+            meta = json.loads(raw.decode("utf-8")) if raw else {}
+            verified = verify_release_local(
+                plan=[],
+                release_id=release_id,
+                expected_plan_hash=plan_hash,
+                meta=meta if isinstance(meta, dict) else None,
+            )
+        finally:
+            transport_obj.close()
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    except (ValueError, UnicodeDecodeError):
+        return urirun.fail(REMOTE_HASH_MISMATCH)
+    return urirun.ok(host=host, domain=domain or None, release_root=release_root, **verified)
+
+
+@conn.handler(
+    "site/command/release-activate",
+    isolated=True,
+    meta={"label": "Atomically activate a release (symlink or pointer; hides strategy)"},
+)
+def release_activate(
+    release_id: str = "",
+    release_root: str = "/httpdocs",
+    host: str = "",
+    sftp_host: str = "",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    apply: bool = False,
+    activation_strategy: str = "",
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    domain: str = "",
+) -> dict[str, Any]:
+    from .release_ops import activate_release, validate_release_id, validate_release_root
+
+    host = host or sftp_host
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    bad = validate_release_root(release_root) or validate_release_id(release_id)
+    if bad:
+        return urirun.fail(bad)
+
+    if apply and not str(plan_hash or "").strip():
+        return urirun.fail("plan_hash_required")
+    may_write, apply_error, grant_claims = _release_mutate_gates(
+        apply=apply,
+        apply_grant=apply_grant,
+        plan_hash=plan_hash,
+        host=host,
+        actor=actor,
+        pack_id=pack_id,
+        pack_version=pack_version,
+    )
+    if apply_error:
+        return urirun.fail(apply_error, grant_claims=grant_claims)
+    if not may_write:
+        return urirun.ok(
+            dry_run=True,
+            release_id=release_id,
+            release_root=release_root,
+            host=host,
+            note="set apply=true + plan_hash (from release-upload) + grant to activate",
+        )
+
+    jti = (grant_claims or {}).get("jti") or ""
+    expires_at = (grant_claims or {}).get("expires_at") or ""
+    replay_ok, replay_error = consume_apply_grant_jti(jti, expires_at)
+    if not replay_ok:
+        return urirun.fail(replay_error or "apply_grant_replay")
+
+    caps = build_capabilities(paramiko_mod=paramiko)
+    if not caps["release_activation"]:
+        return urirun.fail(CAPABILITY_UNAVAILABLE, capabilities=caps)
+
+    try:
+        transport_obj, fs, fingerprint = _open_sftp_release_fs(
+            host=host,
+            sftp_port=int(sftp_port),
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            credential_origin=credential_origin,
+            host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        try:
+            activated = activate_release(
+                fs,
+                release_root=release_root,
+                release_id=release_id,
+                strategy=activation_strategy,
+            )
+        finally:
+            transport_obj.close()
+    except RuntimeError as error:
+        return urirun.fail(str(error), capabilities=caps)
+    return urirun.ok(
+        dry_run=False,
+        host=host,
+        domain=domain or None,
+        host_fingerprint=fingerprint,
+        capabilities=caps,
+        grant_jti=jti or None,
+        **activated,
+    )
+
+
+@conn.handler(
+    "site/query/release-current",
+    isolated=True,
+    meta={"label": "Report current and previous release pointers"},
+)
+def release_current(
+    release_root: str = "/httpdocs",
+    host: str = "",
+    sftp_host: str = "",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    domain: str = "",
+) -> dict[str, Any]:
+    from .release_ops import read_current_state, validate_release_root
+
+    host = host or sftp_host
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    bad = validate_release_root(release_root)
+    if bad:
+        return urirun.fail(bad)
+    try:
+        transport_obj, fs, _fp = _open_sftp_release_fs(
+            host=host,
+            sftp_port=int(sftp_port),
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            credential_origin=credential_origin,
+            host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        try:
+            state = read_current_state(fs, release_root)
+        finally:
+            transport_obj.close()
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    return urirun.ok(host=host, domain=domain or None, **state)
+
+
+@conn.handler(
+    "site/command/release-rollback",
+    isolated=True,
+    meta={"label": "Activate previous release; status rolled_back (not fake ok)"},
+)
+def release_rollback(
+    release_root: str = "/httpdocs",
+    previous_release: str = "",
+    host: str = "",
+    sftp_host: str = "",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    apply: bool = False,
+    activation_strategy: str = "",
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    domain: str = "",
+) -> dict[str, Any]:
+    from .release_ops import rollback_release, validate_release_root
+
+    host = host or sftp_host
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    bad = validate_release_root(release_root)
+    if bad:
+        return urirun.fail(bad)
+
+    if apply and not str(plan_hash or "").strip():
+        return urirun.fail("plan_hash_required")
+    may_write, apply_error, grant_claims = _release_mutate_gates(
+        apply=apply,
+        apply_grant=apply_grant,
+        plan_hash=plan_hash,
+        host=host,
+        actor=actor,
+        pack_id=pack_id,
+        pack_version=pack_version,
+    )
+    if apply_error:
+        return urirun.fail(apply_error, grant_claims=grant_claims)
+    if not may_write:
+        return urirun.ok(
+            dry_run=True,
+            release_root=release_root,
+            host=host,
+            status="rollback_planned",
+            note="set apply=true + plan_hash + grant to rollback",
+        )
+
+    jti = (grant_claims or {}).get("jti") or ""
+    expires_at = (grant_claims or {}).get("expires_at") or ""
+    replay_ok, replay_error = consume_apply_grant_jti(jti, expires_at)
+    if not replay_ok:
+        return urirun.fail(replay_error or "apply_grant_replay")
+
+    caps = build_capabilities(paramiko_mod=paramiko)
+    if not caps["rollback"]:
+        return urirun.fail(CAPABILITY_UNAVAILABLE, capabilities=caps)
+
+    try:
+        transport_obj, fs, fingerprint = _open_sftp_release_fs(
+            host=host,
+            sftp_port=int(sftp_port),
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            credential_origin=credential_origin,
+            host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        try:
+            rolled = rollback_release(
+                fs,
+                release_root=release_root,
+                strategy=activation_strategy,
+                previous_release=previous_release,
+            )
+        finally:
+            transport_obj.close()
+    except RuntimeError as error:
+        return urirun.fail(str(error), capabilities=caps)
+
+    # Connector op succeeded, but status is rolled_back — never pretend deploy ok.
+    return urirun.ok(
+        dry_run=False,
+        host=host,
+        domain=domain or None,
+        host_fingerprint=fingerprint,
+        capabilities=caps,
+        grant_jti=jti or None,
+        **rolled,
+    )
+
+
 @conn.handler("plesk://host/doctor/query/report", isolated=True, meta={"label": "Plesk connector readiness report"})
 def doctor() -> dict[str, Any]:
     caps = build_capabilities(paramiko_mod=paramiko)
@@ -1313,11 +1778,12 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.6.0",
+        "version": "0.7.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,
         "ftp_fallback_allowed": ftp_fallback_allowed(),
+        "release_activation_default": os.environ.get("PLESK_RELEASE_ACTIVATION", "auto"),
         "timeouts": {
             "connect": budgets.connect,
             "operation": budgets.operation,

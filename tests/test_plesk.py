@@ -34,6 +34,11 @@ ROUTES = {
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
+    "plesk://host/site/command/release-upload",
+    "plesk://host/site/command/release-verify",
+    "plesk://host/site/command/release-activate",
+    "plesk://host/site/command/release-rollback",
+    "plesk://host/site/query/release-current",
     "plesk://host/site/query/methods",
     "plesk://host/doctor/query/report",
 }
@@ -697,7 +702,8 @@ def test_doctor_reports_sftp_capability_and_timeouts(monkeypatch):
     assert report["ok"] is True
     assert report["capabilities"]["sftp"]["available"] is True
     assert report["capabilities"]["ftp"]["available"] is True
-    assert report["capabilities"]["release_activation"] is False
+    assert report["capabilities"]["release_activation"] is True
+    assert report["capabilities"]["rollback"] is True
     assert report["production_publish_ready"] is True
     assert report["timeouts"] == {"connect": 15.0, "operation": 120.0, "total": 180.0}
 
@@ -706,6 +712,8 @@ def test_doctor_reports_sftp_capability_and_timeouts(monkeypatch):
     assert degraded["production_publish_ready"] is False
     assert degraded["capabilities"]["sftp"]["available"] is False
     assert degraded["capabilities"]["sftp"]["detail"] == "paramiko_missing"
+    assert degraded["capabilities"]["release_activation"] is False
+    assert degraded["capabilities"]["rollback"] is False
     assert degraded["status"] == "degraded"
 
 
