@@ -16,6 +16,7 @@ from urirun_connector_plesk import (
     connector_manifest,
     create_mailbox,
     ensure_ftp_user,
+    ensure_subdomain,
     site_publish,
     site_sync,
     urirun_bindings,
@@ -32,6 +33,7 @@ ROUTES = {
     "plesk://host/auth/query/status",
     "plesk://host/mailbox/command/create",
     "plesk://host/ftpuser/command/ensure",
+    "plesk://host/site/command/subdomain-ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
     "plesk://host/site/command/release-upload",
@@ -196,6 +198,64 @@ def test_ensure_ftp_user_recreates_and_stores_without_leaking_password(monkeypat
     assert len(stored["plesk-sftp"]["values"]["password"]) >= 16
     assert stored["plesk-sftp"]["values"]["password"] not in json.dumps(result)
     assert "cust-pass" not in json.dumps(result)
+
+
+def test_ensure_subdomain_idempotent_when_exists(monkeypatch):
+    calls = []
+
+    def fake_lease(entry, origin, field, vault_url=""):
+        return {"username": "cust", "password": "cust-pass"}[field]
+
+    def fake_xml(base_url, username, password, packet):
+        calls.append(packet)
+        if "<subdomain><get>" in packet.replace("\n", "").replace(" ", ""):
+            return (
+                "<packet><subdomain><get><result><status>ok</status>"
+                "<id>308</id><data><name>docs</name></data>"
+                "</result></get></subdomain></packet>"
+            )
+        return "<packet><result><status>error</status></result></packet>"
+
+    monkeypatch.setattr(core, "_vault_lease", fake_lease)
+    monkeypatch.setattr(core, "_xml_agent", fake_xml)
+    result = ensure_subdomain(
+        parent_domain="subactor.com",
+        subdomain="docs",
+        base_url="https://prototypowanie.pl:8443",
+    )
+    assert result["ok"] and result["existed"] is True and result["created"] is False
+    assert result["subdomain"] == "docs.subactor.com" and result["subdomain_id"] == 308
+    assert len(calls) == 1
+
+
+def test_ensure_subdomain_adds_when_missing(monkeypatch):
+    calls = []
+
+    def fake_lease(entry, origin, field, vault_url=""):
+        return {"username": "cust", "password": "cust-pass"}[field]
+
+    def fake_xml(base_url, username, password, packet):
+        calls.append(packet)
+        compact = packet.replace("\n", "").replace(" ", "")
+        if "<subdomain><get>" in compact:
+            return "<packet><subdomain><get><result><status>error</status></result></get></subdomain></packet>"
+        if "<subdomain><add>" in compact:
+            return (
+                "<packet><subdomain><add><result><status>ok</status>"
+                "<id>310</id></result></add></subdomain></packet>"
+            )
+        return "<packet><result><status>error</status></result></packet>"
+
+    monkeypatch.setattr(core, "_vault_lease", fake_lease)
+    monkeypatch.setattr(core, "_xml_agent", fake_xml)
+    result = ensure_subdomain(
+        parent_domain="subactor.com",
+        subdomain="docs-stage",
+        base_url="https://prototypowanie.pl:8443",
+    )
+    assert result["ok"] and result["created"] is True and result["subdomain_id"] == 310
+    assert result["www_root"] == "docs-stage.subactor.com"
+    assert any("<parent>subactor.com</parent>" in c for c in calls)
 
 
 def test_transport_origin_defaults_to_https():

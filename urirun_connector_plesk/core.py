@@ -805,6 +805,102 @@ def ensure_ftp_user(
         password = cust_pass = cust_user = ""
 
 
+def _xml_escape(value: str) -> str:
+    return (
+        value.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+@conn.handler(
+    "site/command/subdomain-ensure",
+    isolated=True,
+    meta={"label": "Idempotent Plesk subdomain add under parent webspace (XML API)"},
+)
+def ensure_subdomain(
+    parent_domain: str = "",
+    subdomain: str = "",
+    www_root: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    """Ensure ``subdomain.parent_domain`` exists (XML ``subdomain.add``; ok if already present).
+
+    Does not mutate DNS. Used so docs.subactor.com can be created without ad-hoc scripts.
+    """
+    parent = (parent_domain or "").strip().lower()
+    label = (subdomain or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", parent):
+        return urirun.fail("plesk_subdomain_parent_invalid")
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", label):
+        return urirun.fail("plesk_subdomain_label_invalid")
+    root = (www_root or f"{label}.{parent}").strip().lstrip("/")
+    if not re.fullmatch(r"[A-Za-z0-9_./-]+", root) or ".." in root:
+        return urirun.fail("plesk_subdomain_www_root_invalid")
+    fqdn = f"{label}.{parent}"
+    cust_user = cust_pass = ""
+    try:
+        origin_api = _base_url(base_url)
+        cust_user = _vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url)
+        cust_pass = _vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url)
+        get_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
+<packet>
+  <subdomain>
+    <get><filter><name>{_xml_escape(fqdn)}</name></filter></get>
+  </subdomain>
+</packet>"""
+        existing = _xml_agent(base_url, cust_user, cust_pass, get_packet)
+        if _xml_ok(existing) and re.search(r"<id>\d+</id>", existing):
+            id_match = re.search(r"<id>(\d+)</id>", existing)
+            return urirun.ok(
+                created=False,
+                existed=True,
+                subdomain=fqdn,
+                parent_domain=parent,
+                www_root=root,
+                subdomain_id=int(id_match.group(1)) if id_match else None,
+            )
+        add_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
+<packet>
+  <subdomain>
+    <add>
+      <parent>{_xml_escape(parent)}</parent>
+      <name>{_xml_escape(label)}</name>
+      <property><name>www_root</name><value>{_xml_escape(root)}</value></property>
+    </add>
+  </subdomain>
+</packet>"""
+        raw = _xml_agent(base_url, cust_user, cust_pass, add_packet)
+        if not _xml_ok(raw):
+            # Race / already exists → treat as idempotent success when get works.
+            if "already" in raw.lower() or "exists" in raw.lower():
+                return urirun.ok(
+                    created=False,
+                    existed=True,
+                    subdomain=fqdn,
+                    parent_domain=parent,
+                    www_root=root,
+                    note="add reported exists; treated as ensure-ok",
+                )
+            return urirun.fail("plesk_subdomain_add_failed", detail=raw[:400])
+        id_match = re.search(r"<id>(\d+)</id>", raw)
+        return urirun.ok(
+            created=True,
+            existed=False,
+            subdomain=fqdn,
+            parent_domain=parent,
+            www_root=root,
+            subdomain_id=int(id_match.group(1)) if id_match else None,
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    finally:
+        cust_user = cust_pass = ""
+
+
 def _validate_publish_inputs(source_dir: str, remote_path: str, host: str) -> str:
     if not source_dir or not os.path.isdir(source_dir):
         return "plesk_site_source_dir_invalid"

@@ -179,6 +179,42 @@
         }
       ]
     },
+    "site/command/subdomain-ensure": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "parent_domain": "str",
+        "subdomain": "str",
+        "www_root": "?str",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "created": "bool",
+        "existed": "bool",
+        "subdomain": "str",
+        "parent_domain": "str",
+        "www_root": "str",
+        "subdomain_id": "?int"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {"parent_domain": "subactor.com", "subdomain": "docs"},
+          "result": {
+            "ok": true,
+            "created": false,
+            "existed": true,
+            "subdomain": "docs.subactor.com",
+            "parent_domain": "subactor.com",
+            "www_root": "docs.subactor.com",
+            "subdomain_id": 308
+          }
+        }
+      ]
+    },
     "doctor/query/report": {
       "version": "v1",
       "effect": "query",
