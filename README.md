@@ -77,7 +77,39 @@ credential_origin    e.g. https://host (vault rejects sftp://ftp:// schemes)
 host_fingerprint     optional SHA-256 host key pin (hex)
 ```
 
-Requires the `sftp` extra for SFTP: `pip install 'urirun-connector-plesk[sftp]'`.
+Requires `paramiko` (hard dependency since PR6; also baked into the `urirun-node`
+image). Do **not** `pip install` paramiko into a running container.
+
+### Transport policy (PR6)
+
+- **Production publish** requires SFTP (`production_publish_ready` in doctor).
+  Missing SFTP blocks readiness even when FTP works.
+- `transport=auto` prefers SFTP; FTP fallback only when
+  `PLESK_SYNC_ALLOW_FTP_FALLBACK=1`.
+- Explicit `transport=ftp` apply is denied unless that fallback env is set.
+- Timeouts (env-overridable): connect 15s / operation 120s / total budget 180s
+  (`PLESK_TRANSPORT_CONNECT_TIMEOUT`, `PLESK_TRANSPORT_OPERATION_TIMEOUT`,
+  `PLESK_TRANSPORT_TOTAL_BUDGET`).
+- Structured errors: `authentication_failed`, `credential_expired`,
+  `transport_connect_timeout`, `transfer_timeout`, `remote_permission_denied`,
+  `partial_upload`, `remote_hash_mismatch`, `capability_unavailable`,
+  `rate_limited`.
+
+Doctor (`plesk://host/doctor/query/report`) returns capability JSON:
+
+```json
+{
+  "capabilities": {
+    "sftp": { "available": true, "detail": "ok" },
+    "ftp": { "available": true, "detail": "ok" },
+    "release_activation": false,
+    "rollback": false
+  },
+  "production_publish_ready": true,
+  "ftp_fallback_allowed": false,
+  "timeouts": { "connect": 15, "operation": 120, "total": 180 }
+}
+```
 
 Dry-run:
 

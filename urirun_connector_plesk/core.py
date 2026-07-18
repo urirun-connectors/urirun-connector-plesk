@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import ssl
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -18,12 +19,25 @@ from typing import Any
 import urirun
 
 from . import _urirun_compat
+from .capabilities import (
+    build_capabilities,
+    deny_if_sftp_required,
+    ftp_fallback_allowed,
+    production_publish_ready,
+)
+from .errors import (
+    CAPABILITY_UNAVAILABLE,
+    PARTIAL_UPLOAD,
+    REMOTE_HASH_MISMATCH,
+    map_exception,
+)
 from .immutable_manifest import build_immutable_manifest, verify_plan_hash
 from .apply_grant import autonomy_mutations_enabled, consume_apply_grant_jti, format_intent_pack, verify_apply_grant
+from .timeouts import transport_timeouts
 
-try:  # paramiko is only needed for SFTP site publication; keep the connector importable without it
+try:  # paramiko ships in urirun-node image (PR6); keep importable if extra absent in lab
     import paramiko
-except ImportError:  # pragma: no cover - exercised only where the extra is absent
+except ImportError:  # pragma: no cover - exercised only where the dep is absent
     paramiko = None
 
 CONNECTOR_ID = "plesk"
@@ -97,14 +111,23 @@ def _vault_settings(vault_url: str = "") -> tuple[str, str]:
 
 
 def _vault_lease(entry_id: str, origin: str, field: str, vault_url: str = "") -> str:
+    """Lease a vault field. Test hook: monkeypatch this (no real secrets in unit tests)."""
     url, token = _vault_settings(vault_url)
-    status, data = _request_json(
-        f"{url}/internal/vault/{urllib.parse.quote(entry_id, safe='')}/lease",
-        method="POST",
-        headers={"authorization": f"Bearer {token}"},
-        body={"origin": origin, "field": field},
-    )
+    try:
+        status, data = _request_json(
+            f"{url}/internal/vault/{urllib.parse.quote(entry_id, safe='')}/lease",
+            method="POST",
+            headers={"authorization": f"Bearer {token}"},
+            body={"origin": origin, "field": field},
+            timeout=transport_timeouts().connect,
+        )
+    except RuntimeError as error:
+        raise RuntimeError(map_exception(error, phase="lease")) from error
     secret = str(data.get("secret") or "")
+    if status in {401, 403}:
+        raise RuntimeError("credential_expired")
+    if status == 429:
+        raise RuntimeError("rate_limited")
     if status != 200 or not secret:
         raise RuntimeError(f"plesk_vault_lease_failed:{field}")
     return secret
@@ -160,22 +183,32 @@ def _sftp_origin(value: str) -> str:
 def _sftp_connect(host: str, port: int, username: str, password: str, host_fingerprint: str = ""):
     """Open an authenticated SFTP session, pinning the host key before sending credentials."""
     if paramiko is None:
-        raise RuntimeError("plesk_sftp_paramiko_missing")
+        raise RuntimeError(CAPABILITY_UNAVAILABLE)
+    budgets = transport_timeouts()
     transport = paramiko.Transport((host, port))
     try:
-        transport.start_client(timeout=30)
+        try:
+            transport.start_client(timeout=budgets.connect)
+        except Exception as error:
+            raise RuntimeError(map_exception(error, phase="connect")) from error
         key = transport.get_remote_server_key()
         fingerprint = hashlib.sha256(key.asbytes()).hexdigest()
         wanted = host_fingerprint.replace(":", "").strip().lower()
         if wanted and wanted != fingerprint.lower():
             raise RuntimeError("plesk_sftp_host_key_mismatch")
-        transport.auth_password(username, password)
+        try:
+            transport.auth_password(username, password)
+        except Exception as error:
+            raise RuntimeError(map_exception(error, phase="connect")) from error
         sftp = paramiko.SFTPClient.from_transport(transport)
         if sftp is None:
-            raise RuntimeError("plesk_sftp_session_failed")
-    except Exception:
+            raise RuntimeError(CAPABILITY_UNAVAILABLE)
+    except RuntimeError:
         transport.close()
         raise
+    except Exception as error:
+        transport.close()
+        raise RuntimeError(map_exception(error, phase="connect")) from error
     return transport, sftp, fingerprint
 
 
@@ -193,12 +226,24 @@ def _sftp_mkdirs(sftp, remote_dir: str, made: set[str]) -> None:
         made.add(path)
 
 
-def _sftp_upload_dir(sftp, source_dir: str, remote_path: str, exclude: tuple[str, ...] = ()) -> list[str]:
+def _sftp_upload_dir(
+    sftp,
+    source_dir: str,
+    remote_path: str,
+    exclude: tuple[str, ...] = (),
+    *,
+    plan: list[dict[str, Any]] | None = None,
+    verify_remote_hash: bool = False,
+    deadline: float | None = None,
+) -> list[str]:
     """Upload every file under source_dir to remote_path, preserving structure."""
     base = os.path.abspath(source_dir)
     made: set[str] = set()
     uploaded: list[str] = []
     patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
+    planned_by_path = {item["path"]: item for item in (plan or [])}
+    budgets = transport_timeouts()
+    op_deadline = time.monotonic() + budgets.operation
     for root, dirs, files in os.walk(base):
         dirs[:] = [d for d in sorted(dirs) if d not in _SKIP_DIRS and not _excluded(d, patterns)]
         rel = os.path.relpath(root, base)
@@ -210,16 +255,39 @@ def _sftp_upload_dir(sftp, source_dir: str, remote_path: str, exclude: tuple[str
             rel_path = name if rel == "." else f"{rel.replace(os.sep, '/')}/{name}"
             if _excluded(rel_path, patterns):
                 continue
-            sftp.put(os.path.join(root, name), f"{remote_dir}/{name}")
+            now = time.monotonic()
+            if (deadline is not None and now > deadline) or now > op_deadline:
+                raise RuntimeError(PARTIAL_UPLOAD if uploaded else "transfer_timeout")
+            remote_file = f"{remote_dir}/{name}"
+            try:
+                sftp.put(os.path.join(root, name), remote_file)
+            except Exception as error:
+                code = map_exception(error, phase="transfer")
+                if uploaded:
+                    raise RuntimeError(PARTIAL_UPLOAD) from error
+                raise RuntimeError(code) from error
+            if verify_remote_hash and rel_path in planned_by_path:
+                expected = planned_by_path[rel_path].get("sha256") or ""
+                if expected:
+                    digest = hashlib.sha256()
+                    with sftp.open(remote_file, "rb") as handle:
+                        for chunk in iter(lambda: handle.read(65536), b""):
+                            digest.update(chunk)
+                    if digest.hexdigest() != expected:
+                        raise RuntimeError(REMOTE_HASH_MISMATCH)
             uploaded.append(rel_path)
     return uploaded
 
 
 def _ftp_connect(host: str, port: int, username: str, password: str, tls: bool = True):
     """Open an authenticated FTP session (FTPS by default)."""
+    budgets = transport_timeouts()
     ftp = ftplib.FTP_TLS() if tls else ftplib.FTP()
-    ftp.connect(host, port, timeout=30)
-    ftp.login(username, password)
+    try:
+        ftp.connect(host, port, timeout=budgets.connect)
+        ftp.login(username, password)
+    except Exception as error:
+        raise RuntimeError(map_exception(error, phase="connect")) from error
     if tls:
         ftp.prot_p()
     return ftp
@@ -246,11 +314,20 @@ def _excluded(rel_path: str, patterns: tuple[str, ...]) -> bool:
     return any(fnmatch.fnmatch(rel_path, p) or fnmatch.fnmatch(base, p) for p in patterns)
 
 
-def _ftp_upload_dir(ftp, source_dir: str, remote_path: str, exclude: tuple[str, ...] = ()) -> list[str]:
+def _ftp_upload_dir(
+    ftp,
+    source_dir: str,
+    remote_path: str,
+    exclude: tuple[str, ...] = (),
+    *,
+    deadline: float | None = None,
+) -> list[str]:
     base = os.path.abspath(source_dir)
     made: set[str] = set()
     uploaded: list[str] = []
     patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
+    budgets = transport_timeouts()
+    op_deadline = time.monotonic() + budgets.operation
     for root, dirs, files in os.walk(base):
         dirs[:] = [d for d in sorted(dirs) if d not in _SKIP_DIRS and not _excluded(d, patterns)]
         rel = os.path.relpath(root, base)
@@ -262,8 +339,17 @@ def _ftp_upload_dir(ftp, source_dir: str, remote_path: str, exclude: tuple[str, 
             rel_path = name if rel == "." else f"{rel.replace(os.sep, '/')}/{name}"
             if _excluded(rel_path, patterns):
                 continue
-            with open(os.path.join(root, name), "rb") as handle:
-                ftp.storbinary(f"STOR {remote_dir}/{name}", handle)
+            now = time.monotonic()
+            if (deadline is not None and now > deadline) or now > op_deadline:
+                raise RuntimeError(PARTIAL_UPLOAD if uploaded else "transfer_timeout")
+            try:
+                with open(os.path.join(root, name), "rb") as handle:
+                    ftp.storbinary(f"STOR {remote_dir}/{name}", handle)
+            except Exception as error:
+                code = map_exception(error, phase="transfer")
+                if uploaded:
+                    raise RuntimeError(PARTIAL_UPLOAD) from error
+                raise RuntimeError(code) from error
             uploaded.append(rel_path)
     return uploaded
 
@@ -281,7 +367,8 @@ def _probe_sftp(host: str, port: int, username: str, password: str, host_fingerp
         sftp.close()
         return True, "ok"
     except Exception as error:  # auth/host-key/transport failures are all "unavailable"
-        return False, type(error).__name__
+        detail = str(error) if isinstance(error, RuntimeError) else type(error).__name__
+        return False, detail
     finally:
         if transport is not None:
             transport.close()
@@ -818,12 +905,34 @@ def _apply_permitted(
     return True, None, claims
 
 
-def _publish_over_sftp(source_dir, remote_path, host, port, username, password, host_fingerprint, exclude=()):
+def _publish_over_sftp(
+    source_dir,
+    remote_path,
+    host,
+    port,
+    username,
+    password,
+    host_fingerprint,
+    exclude=(),
+    *,
+    plan: list[dict[str, Any]] | None = None,
+    verify_remote_hash: bool = False,
+):
+    budgets = transport_timeouts()
+    deadline = time.monotonic() + budgets.total
     transport = None
     try:
         transport, sftp, fingerprint = _sftp_connect(host, port, username, password, host_fingerprint)
         try:
-            uploaded = _sftp_upload_dir(sftp, source_dir, remote_path, exclude)
+            uploaded = _sftp_upload_dir(
+                sftp,
+                source_dir,
+                remote_path,
+                exclude,
+                plan=plan,
+                verify_remote_hash=verify_remote_hash,
+                deadline=deadline,
+            )
         finally:
             sftp.close()
     finally:
@@ -833,9 +942,11 @@ def _publish_over_sftp(source_dir, remote_path, host, port, username, password, 
 
 
 def _publish_over_ftp(source_dir, remote_path, host, port, username, password, tls, exclude=()):
+    budgets = transport_timeouts()
+    deadline = time.monotonic() + budgets.total
     ftp = _ftp_connect(host, port, username, password, tls)
     try:
-        uploaded = _ftp_upload_dir(ftp, source_dir, remote_path, exclude)
+        uploaded = _ftp_upload_dir(ftp, source_dir, remote_path, exclude, deadline=deadline)
     finally:
         try:
             ftp.quit()
@@ -996,6 +1107,27 @@ def _site_tree_sync(
 
     chosen = transport
     detection: list[dict[str, Any]] | None = None
+    caps = build_capabilities(paramiko_mod=paramiko)
+
+    # Production publish: missing SFTP blocks readiness even if FTP is available.
+    deny = deny_if_sftp_required(caps, transport=transport)
+    if deny and transport in {"auto", "sftp"}:
+        # Explicit transport=ftp handled below when fallback policy is off.
+        if not caps["sftp"]["available"]:
+            return urirun.fail(
+                CAPABILITY_UNAVAILABLE,
+                capabilities=caps,
+                production_publish_ready=False,
+                note="SFTP/paramiko required for production publish; FTP-only is not sufficient",
+            )
+    if transport == "ftp" and deny:
+        return urirun.fail(
+            CAPABILITY_UNAVAILABLE,
+            capabilities=caps,
+            production_publish_ready=production_publish_ready(caps),
+            note="FTP apply denied unless PLESK_SYNC_ALLOW_FTP_FALLBACK=1",
+        )
+
     if transport == "auto":
         detection = _detect_transports(
             host, sftp_port=int(sftp_port), ftp_port=int(ftp_port), ftp_tls=bool(ftp_tls),
@@ -1004,12 +1136,24 @@ def _site_tree_sync(
         )
         available = [r["transport"] for r in detection if r["available"]]
         if not available:
-            return urirun.fail("plesk_site_no_authorized_transport", methods=detection)
-        chosen = available[0]
+            return urirun.fail("plesk_site_no_authorized_transport", methods=detection, capabilities=caps)
+        if "sftp" in available:
+            chosen = "sftp"
+        elif ftp_fallback_allowed():
+            chosen = available[0]
+        else:
+            return urirun.fail(
+                CAPABILITY_UNAVAILABLE,
+                methods=detection,
+                capabilities=caps,
+                production_publish_ready=False,
+                note="SFTP unavailable; FTP fallback disabled (set PLESK_SYNC_ALLOW_FTP_FALLBACK=1 to allow)",
+            )
 
     if chosen == "sftp" and paramiko is None:
-        return urirun.fail("plesk_sftp_paramiko_missing")
+        return urirun.fail(CAPABILITY_UNAVAILABLE, capabilities=caps)
 
+    verify_remote_hash = os.environ.get("PLESK_SYNC_VERIFY_REMOTE_HASH", "").strip() == "1"
     entry = sftp_vault_entry_id if chosen == "sftp" else ftp_vault_entry_id
     port = int(sftp_port) if chosen == "sftp" else int(ftp_port)
     origin = _transport_origin(chosen, host, credential_origin)
@@ -1020,15 +1164,16 @@ def _site_tree_sync(
         if chosen == "sftp":
             uploaded, extra = _publish_over_sftp(
                 source_dir, remote_path, host, port, username, password, host_fingerprint, exclude_patterns,
+                plan=plan, verify_remote_hash=verify_remote_hash,
             )
         else:
             uploaded, extra = _publish_over_ftp(
                 source_dir, remote_path, host, port, username, password, bool(ftp_tls), exclude_patterns,
             )
     except RuntimeError as error:
-        return urirun.fail(str(error))
+        return urirun.fail(str(error), capabilities=caps, transport=chosen, methods=detection)
     except Exception as error:
-        return urirun.fail(f"plesk_site_sync_failed:{type(error).__name__}")
+        return urirun.fail(map_exception(error, phase="transfer"), capabilities=caps, transport=chosen)
     finally:
         username = password = ""
     return urirun.ok(
@@ -1045,6 +1190,7 @@ def _site_tree_sync(
         preserve_remote=list(_PRESERVE_REMOTE_NAMES),
         exclude=list(exclude_patterns),
         methods=detection,
+        capabilities=caps,
         grant_jti=(grant_claims or {}).get("jti"),
         **extra,
     )
@@ -1161,7 +1307,24 @@ def site_publish(
 
 @conn.handler("plesk://host/doctor/query/report", isolated=True, meta={"label": "Plesk connector readiness report"})
 def doctor() -> dict[str, Any]:
-    return {"ok": True, "connector": CONNECTOR_ID, "version": "0.5.0", "status": "ready"}
+    caps = build_capabilities(paramiko_mod=paramiko)
+    budgets = transport_timeouts()
+    ready = production_publish_ready(caps)
+    return {
+        "ok": True,
+        "connector": CONNECTOR_ID,
+        "version": "0.6.0",
+        "status": "ready" if ready else "degraded",
+        "capabilities": caps,
+        "production_publish_ready": ready,
+        "ftp_fallback_allowed": ftp_fallback_allowed(),
+        "timeouts": {
+            "connect": budgets.connect,
+            "operation": budgets.operation,
+            "total": budgets.total,
+        },
+        "note": None if ready else "SFTP/paramiko missing — blocks production publish readiness",
+    }
 
 
 def urirun_bindings() -> dict[str, Any]:

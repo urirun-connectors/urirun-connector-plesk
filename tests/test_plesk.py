@@ -683,7 +683,218 @@ def test_site_publish_requires_paramiko(monkeypatch, tmp_path):
     assert site_publish(
         source_dir=str(www), sftp_host="h", transport="sftp", apply=True, plan_hash=dry["plan_hash"],
         apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
-    ).get("error") == "plesk_sftp_paramiko_missing"
+    ).get("error") == "capability_unavailable"
+
+
+def test_doctor_reports_sftp_capability_and_timeouts(monkeypatch):
+    from urirun_connector_plesk import doctor
+
+    monkeypatch.delenv("PLESK_SYNC_ALLOW_FTP_FALLBACK", raising=False)
+    monkeypatch.setenv("PLESK_TRANSPORT_CONNECT_TIMEOUT", "15")
+    monkeypatch.setenv("PLESK_TRANSPORT_OPERATION_TIMEOUT", "120")
+    monkeypatch.setenv("PLESK_TRANSPORT_TOTAL_BUDGET", "180")
+    report = doctor()
+    assert report["ok"] is True
+    assert report["capabilities"]["sftp"]["available"] is True
+    assert report["capabilities"]["ftp"]["available"] is True
+    assert report["capabilities"]["release_activation"] is False
+    assert report["production_publish_ready"] is True
+    assert report["timeouts"] == {"connect": 15.0, "operation": 120.0, "total": 180.0}
+
+    monkeypatch.setattr(core, "paramiko", None)
+    degraded = doctor()
+    assert degraded["production_publish_ready"] is False
+    assert degraded["capabilities"]["sftp"]["available"] is False
+    assert degraded["capabilities"]["sftp"]["detail"] == "paramiko_missing"
+    assert degraded["status"] == "degraded"
+
+
+def test_ftp_apply_denied_without_fallback_policy(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+    monkeypatch.delenv("PLESK_SYNC_ALLOW_FTP_FALLBACK", raising=False)
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant = _grant_for(dry)
+    result = site_publish(
+        source_dir=str(www), sftp_host="prototypowanie.pl", transport="ftp", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "capability_unavailable"
+    assert result.get("files_uploaded", 0) == 0 or "files_uploaded" not in result
+
+
+def test_auto_falls_back_to_ftp_when_policy_allows(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+    monkeypatch.setenv("PLESK_SYNC_ALLOW_FTP_FALLBACK", "1")
+
+    class _Ftp:
+        def __init__(self):
+            self.puts = []
+        def mkd(self, path):
+            pass
+        def storbinary(self, cmd, handle):
+            self.puts.append(cmd)
+        def quit(self):
+            pass
+        def prot_p(self):
+            pass
+
+    fake = _Ftp()
+    monkeypatch.setattr(core, "_detect_transports", lambda *a, **k: [
+        {"transport": "sftp", "available": False, "detail": "paramiko_missing"},
+        {"transport": "ftp", "available": True, "detail": "ok"},
+    ])
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
+    monkeypatch.setattr(core, "_ftp_connect", lambda *a, **k: fake)
+    monkeypatch.setattr(core, "_ftp_upload_dir", lambda *a, **k: ["index.html"])
+
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant = _grant_for(dry)
+    result = site_publish(
+        source_dir=str(www), sftp_host="prototypowanie.pl", transport="auto", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
+    )
+    assert result["ok"] and result["transport"] == "ftp"
+
+
+def test_auto_denies_ftp_only_without_fallback(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+    monkeypatch.delenv("PLESK_SYNC_ALLOW_FTP_FALLBACK", raising=False)
+    monkeypatch.setattr(core, "_detect_transports", lambda *a, **k: [
+        {"transport": "sftp", "available": False, "detail": "authentication_failed"},
+        {"transport": "ftp", "available": True, "detail": "ok"},
+    ])
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant = _grant_for(dry)
+    result = site_publish(
+        source_dir=str(www), sftp_host="prototypowanie.pl", transport="auto", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "capability_unavailable"
+    assert result.get("production_publish_ready") is False
+
+
+def test_map_exception_structured_codes():
+    from urirun_connector_plesk.errors import map_exception
+
+    assert map_exception(TimeoutError(), phase="connect") == "transport_connect_timeout"
+    assert map_exception(TimeoutError(), phase="transfer") == "transfer_timeout"
+    assert map_exception(RuntimeError("plesk_sftp_paramiko_missing")) == "capability_unavailable"
+
+    class AuthenticationException(Exception):
+        pass
+
+    assert map_exception(AuthenticationException("bad")) == "authentication_failed"
+
+
+def test_vault_lease_maps_expired_and_rate_limited(monkeypatch):
+    monkeypatch.setattr(core, "_vault_settings", lambda vault_url="": ("http://vault", "tok"))
+
+    def expired(url, **kwargs):
+        return 401, {}
+
+    monkeypatch.setattr(core, "_request_json", expired)
+    with pytest.raises(RuntimeError, match="credential_expired"):
+        core._vault_lease("plesk-sftp", "https://h", "password")
+
+    def limited(url, **kwargs):
+        return 429, {}
+
+    monkeypatch.setattr(core, "_request_json", limited)
+    with pytest.raises(RuntimeError, match="rate_limited"):
+        core._vault_lease("plesk-sftp", "https://h", "password")
+
+
+def test_sftp_partial_upload_structured_error(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    _enable_apply(monkeypatch)
+
+    class _BoomSFTP:
+        def __init__(self):
+            self.puts = []
+            self.made = []
+        def stat(self, path):
+            raise IOError("missing")
+        def mkdir(self, path):
+            self.made.append(path)
+        def put(self, local, remote):
+            if len(self.puts) >= 1:
+                raise PermissionError("permission denied")
+            self.puts.append(remote)
+        def close(self):
+            pass
+
+    fake = _BoomSFTP()
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda *a, **k: (type("T", (), {"close": lambda self: None})(), fake, "fp"),
+    )
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant = _grant_for(dry)
+    result = site_publish(
+        source_dir=str(www), sftp_host="prototypowanie.pl", transport="sftp", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "partial_upload"
+
+
+def test_remote_hash_mismatch(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    (www / "index.html").write_text("hello", encoding="utf-8")
+    _enable_apply(monkeypatch)
+    monkeypatch.setenv("PLESK_SYNC_VERIFY_REMOTE_HASH", "1")
+
+    class _FakeFile:
+        def __init__(self, data: bytes):
+            self._data = data
+            self._pos = 0
+        def read(self, n=-1):
+            if self._pos >= len(self._data):
+                return b""
+            chunk = self._data[self._pos:] if n < 0 else self._data[self._pos:self._pos + n]
+            self._pos += len(chunk)
+            return chunk
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+
+    class _HashSFTP:
+        def stat(self, path):
+            raise IOError("missing")
+        def mkdir(self, path):
+            pass
+        def put(self, local, remote):
+            pass
+        def open(self, path, mode="rb"):
+            return _FakeFile(b"WRONG")
+        def close(self):
+            pass
+
+    monkeypatch.setattr(
+        core, "_sftp_connect",
+        lambda *a, **k: (type("T", (), {"close": lambda self: None})(), _HashSFTP(), "fp"),
+    )
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
+    dry = site_sync(source_dir=str(www), sftp_host="prototypowanie.pl")
+    grant = _grant_for(dry)
+    result = site_publish(
+        source_dir=str(www), sftp_host="prototypowanie.pl", transport="sftp", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=grant, actor="test-actor", pack_id="docs", pack_version="1",
+    )
+    assert result.get("error") == "remote_hash_mismatch"
 
 
 def test_sftp_connect_rejects_host_key_mismatch(monkeypatch):
