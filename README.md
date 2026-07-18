@@ -22,7 +22,41 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/site/command/release-activate` | atomically point `current` at a release (symlink or pointer) |
 | `plesk://host/site/query/release-current` | report `current` / `previous` release ids |
 | `plesk://host/site/command/release-rollback` | activate previous; result `status: rolled_back` |
-| `plesk://host/doctor/query/report` | connector readiness (`publish_verify`, staging note `docs-stage.subactor.com`) |
+| `plesk://host/site/command/subdomain-ensure` | idempotent subdomain create under parent webspace (XML; no DNS) |
+| `plesk://host/site/command/ssl-ensure` | ensure origin TLS covers hostname (probe / assign / panel PEM / SSL It LE) |
+| `plesk://host/doctor/query/report` | connector readiness (`ssl_ensure`, `letsencrypt`, `publish_verify`, staging note) |
+
+### SSL ensure (`site/command/ssl-ensure`)
+
+Fail-closed: default is probe-only. Mutate requires `apply=true`,
+`AUTONOMY_MUTATIONS_ENABLED=1`, and `PLESK_SSL_APPLY=1`.
+
+| provider | Behavior |
+| --- | --- |
+| `auto` (default) | probe → assign known names → panel PEM+SAN → SSL It LE → REST CLI LE |
+| `assign` | XML `certificate_name` assign only |
+| `panel-pem` | customer panel upload of generated self-signed PEM **with SAN** |
+| `panel-selfsigned` | panel “Self-Signed” button (often CN-only, no SAN extension) |
+| `letsencrypt` | SSL It! panel install + REST CLI fallback |
+| `rest-cli` | `/api/v2/cli/extension/call` (needs admin `plesk-runtime` API key) |
+
+Known panel limits: XML `extension/letsencrypt` returns **1013** (ApiRpc not
+implemented); customer REST CLI is **403**. SSL It LE may fail ACME orders that
+include both `mail.*` and `*.` SANs — uncheck Wildcard/Mail in the panel, or use
+`panel-pem` for origin SAN coverage without public LE.
+
+```json
+{
+  "uri": "plesk://host/site/command/ssl-ensure",
+  "payload": {
+    "hostname": "docs.subactor.com",
+    "origin_ip": "217.160.250.222",
+    "base_url": "https://prototypowanie.pl:8443",
+    "provider": "auto",
+    "apply": false
+  }
+}
+```
 
 ### Credentials (`ftpuser/command/ensure`)
 
@@ -110,7 +144,17 @@ Doctor (`plesk://host/doctor/query/report`) returns capability JSON:
     "ftp": { "available": true, "detail": "ok" },
     "release_activation": true,
     "rollback": true,
-    "release_activation_strategies": ["auto", "symlink", "pointer"]
+    "release_activation_strategies": ["auto", "symlink", "pointer"],
+    "ssl_ensure": {
+      "available": true,
+      "detail": "ok",
+      "strategies": ["probe", "assign", "panel_upload_pem", "panel_self_signed", "panel_sslit_le", "rest_cli_le"]
+    },
+    "letsencrypt": {
+      "available": false,
+      "detail": "xml_apirpc_unimplemented; rest_cli_needs_admin; panel_sslit_le_san_flags"
+    },
+    "certificate_assign": true
   },
   "production_publish_ready": true,
   "ftp_fallback_allowed": false,

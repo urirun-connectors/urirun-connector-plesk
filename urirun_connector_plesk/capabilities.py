@@ -43,6 +43,8 @@ def build_capabilities(
     release_activation: bool | None = None,
     rollback: bool | None = None,
     publish_verify: bool | None = None,
+    ssl_ensure: bool | None = None,
+    letsencrypt: bool | None = None,
 ) -> dict[str, Any]:
     sftp_ok = paramiko_available(paramiko_mod)
     # PR7: release activate/rollback available whenever SFTP transport is.
@@ -50,6 +52,10 @@ def build_capabilities(
     rollback_ok = sftp_ok if rollback is None else bool(rollback)
     # PR8: DNS/TLS/fingerprint ladder is stdlib — always available as capability.
     verify_ok = True if publish_verify is None else bool(publish_verify)
+    # SSL ensure: assign + panel PEM paths are customer-capable; LE needs panel/admin.
+    ssl_ok = True if ssl_ensure is None else bool(ssl_ensure)
+    # LE via XML ApiRpc is unimplemented (1013); REST CLI needs admin key; panel SSL It works with caveats.
+    le_ok = False if letsencrypt is None else bool(letsencrypt)
     return {
         "sftp": {
             "available": sftp_ok,
@@ -66,6 +72,27 @@ def build_capabilities(
         "dns_preflight": verify_ok,
         "tls_san_check": verify_ok,
         "content_fingerprint": verify_ok,
+        "ssl_ensure": {
+            "available": ssl_ok,
+            "detail": "ok" if ssl_ok else "unavailable",
+            "strategies": [
+                "probe",
+                "assign",
+                "panel_upload_pem",
+                "panel_self_signed",
+                "panel_sslit_le",
+                "rest_cli_le",
+            ],
+        },
+        "letsencrypt": {
+            "available": le_ok,
+            "detail": (
+                "ok"
+                if le_ok
+                else "xml_apirpc_unimplemented; rest_cli_needs_admin; panel_sslit_le_san_flags"
+            ),
+        },
+        "certificate_assign": True,
     }
 
 

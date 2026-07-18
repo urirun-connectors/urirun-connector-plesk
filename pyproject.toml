@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "urirun-connector-plesk"
-version = "0.8.0"
-description = "Secure Plesk REST API connector for urirun with vault-backed API key, SFTP site sync, release deploy, and ADR-004 publish verify"
+version = "0.9.0"
+description = "Secure Plesk REST API connector for urirun with vault-backed API key, SFTP site sync, release deploy, ADR-004 publish verify, and SSL ensure"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [{name = "if-uri"}]
-dependencies = ["urirun>=0.4.14", "paramiko>=3.4"]
+dependencies = ["urirun>=0.4.14", "paramiko>=3.4", "cryptography>=42"]
 
 [project.optional-dependencies]
 test = ["pytest>=8"]

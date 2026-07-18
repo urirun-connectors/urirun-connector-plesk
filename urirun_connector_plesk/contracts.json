@@ -215,6 +215,47 @@
         }
       ]
     },
+    "site/command/ssl-ensure": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "hostname": "str",
+        "connect_host": "?str",
+        "origin_ip": "?str",
+        "certificate_name": "?str",
+        "provider": "?str",
+        "apply": "?bool",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "runtime_vault_entry_id": "?str",
+        "email": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "hostname": "str",
+        "strategy": "?str",
+        "certificate_name": "?str",
+        "probe": "obj",
+        "dry_run": "bool"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [
+        {
+          "payload": {
+            "hostname": "docs.subactor.com",
+            "origin_ip": "217.160.250.222",
+            "apply": false
+          },
+          "result": {
+            "ok": true,
+            "dry_run": true,
+            "hostname": "docs.subactor.com",
+            "note": "set apply=true, AUTONOMY_MUTATIONS_ENABLED=1, PLESK_SSL_APPLY=1"
+          }
+        }
+      ]
+    },
     "doctor/query/report": {
       "version": "v1",
       "effect": "query",

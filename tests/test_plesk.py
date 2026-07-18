@@ -16,6 +16,7 @@ from urirun_connector_plesk import (
     connector_manifest,
     create_mailbox,
     ensure_ftp_user,
+    ensure_ssl,
     ensure_subdomain,
     site_publish,
     site_sync,
@@ -34,6 +35,7 @@ ROUTES = {
     "plesk://host/mailbox/command/create",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
+    "plesk://host/site/command/ssl-ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
     "plesk://host/site/command/release-upload",
@@ -256,6 +258,127 @@ def test_ensure_subdomain_adds_when_missing(monkeypatch):
     assert result["ok"] and result["created"] is True and result["subdomain_id"] == 310
     assert result["www_root"] == "docs-stage.subactor.com"
     assert any("<parent>subactor.com</parent>" in c for c in calls)
+
+
+def test_ensure_ssl_probe_only_without_apply(monkeypatch):
+    monkeypatch.delenv("AUTONOMY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.delenv("PLESK_SSL_APPLY", raising=False)
+
+    def fake_probe(**kwargs):
+        return {
+            "ok": False,
+            "hostname": "docs.subactor.com",
+            "connect_host": "217.160.250.222",
+            "sans": ["subactor.com"],
+            "error": "tls_san_mismatch",
+        }
+
+    monkeypatch.setattr("urirun_connector_plesk.ssl_ops.origin_tls_probe", fake_probe)
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="217.160.250.222",
+        base_url="https://prototypowanie.pl:8443",
+        apply=False,
+    )
+    assert result["ok"] is True and result["dry_run"] is True
+    assert "PLESK_SSL_APPLY" in (result.get("note") or "")
+    assert result["probe"]["error"] == "tls_san_mismatch"
+
+
+def test_ensure_ssl_apply_denied_without_env(monkeypatch):
+    monkeypatch.delenv("AUTONOMY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.delenv("PLESK_SSL_APPLY", raising=False)
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.origin_tls_probe",
+        lambda **kwargs: {"ok": False, "sans": [], "error": "tls_san_mismatch"},
+    )
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="1.2.3.4",
+        base_url="https://plesk.example.com:8443",
+        apply=True,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "apply_denied_autonomy_mutations"
+
+
+def test_ensure_ssl_assign_when_san_ok(monkeypatch):
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_SSL_APPLY", "1")
+    monkeypatch.setattr(
+        core,
+        "_vault_lease",
+        lambda entry, origin, field, vault_url="": {"username": "cust", "password": "cust-pass"}[field],
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.origin_tls_probe",
+        lambda **kwargs: {
+            "ok": True,
+            "hostname": "docs.subactor.com",
+            "sans": ["docs.subactor.com"],
+            "error": None,
+        },
+    )
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="217.160.250.222",
+        base_url="https://prototypowanie.pl:8443",
+        apply=True,
+        provider="auto",
+    )
+    assert result["ok"] is True and result["strategy"] == "probe"
+    assert result["probe"]["sans"] == ["docs.subactor.com"]
+
+
+def test_ensure_ssl_assign_strategy(monkeypatch):
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_SSL_APPLY", "1")
+    monkeypatch.setattr(
+        core,
+        "_vault_lease",
+        lambda entry, origin, field, vault_url="": {"username": "cust", "password": "cust-pass"}[field],
+    )
+    probes = iter(
+        [
+            {"ok": False, "sans": [], "error": "tls_san_mismatch"},
+            {"ok": True, "sans": ["docs.subactor.com"], "error": None},
+        ]
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.origin_tls_probe",
+        lambda **kwargs: next(probes),
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.resolve_site_id",
+        lambda **kwargs: 308,
+    )
+
+    def fake_assign(**kwargs):
+        assert kwargs["certificate_name"] == "docs.subactor.com-san"
+        return {"ok": True, "strategy": "assign", "certificate_name": kwargs["certificate_name"]}
+
+    monkeypatch.setattr("urirun_connector_plesk.ssl_ops.assign_certificate", fake_assign)
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="217.160.250.222",
+        certificate_name="docs.subactor.com-san",
+        base_url="https://prototypowanie.pl:8443",
+        apply=True,
+        provider="assign",
+    )
+    assert result["ok"] is True and result["strategy"] == "assign"
+    assert result["certificate_name"] == "docs.subactor.com-san"
+
+
+def test_doctor_reports_ssl_capabilities(monkeypatch):
+    from urirun_connector_plesk import doctor
+
+    report = doctor()
+    assert report["capabilities"]["ssl_ensure"]["available"] is True
+    assert "panel_upload_pem" in report["capabilities"]["ssl_ensure"]["strategies"]
+    assert report["capabilities"]["letsencrypt"]["available"] is False
+    assert report["capabilities"]["certificate_assign"] is True
+    assert report["version"] == "0.9.0"
 
 
 def test_transport_origin_defaults_to_https():
