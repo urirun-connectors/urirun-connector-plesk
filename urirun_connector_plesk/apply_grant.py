@@ -299,3 +299,45 @@ def verify_and_consume_apply_grant(
 def autonomy_mutations_enabled(environ: dict[str, str] | None = None) -> bool:
     env = environ if environ is not None else os.environ
     return (env.get("AUTONOMY_MUTATIONS_ENABLED") or "").strip() == "1"
+
+
+DEFAULT_MUTATE_LEASE_PATH = "/tmp/subactor-mutate-lease.json"
+
+
+def mutate_lease_active(
+    environ: dict[str, str] | None = None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Session mutate lease (TTL file) — founder reversible apply without permanent kill switches.
+
+    Lease file schema: {"enabled": true, "expires_at": "<ISO-8601 Z>", "risk_class": "reversible"}
+    Path: MUTATE_LEASE_PATH env or /tmp/subactor-mutate-lease.json.
+    """
+    env = environ if environ is not None else os.environ
+    path = (env.get("MUTATE_LEASE_PATH") or DEFAULT_MUTATE_LEASE_PATH).strip()
+    if not path:
+        return False
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(data, dict) or not data.get("enabled"):
+        return False
+    risk = str(data.get("risk_class") or "reversible").strip()
+    if risk not in ("reversible", "read_only"):
+        return False
+    expires = _parse_expires(str(data.get("expires_at") or ""))
+    if expires is None:
+        return False
+    ts = time.time() if now is None else now
+    return ts <= expires + CLOCK_SKEW_SECONDS
+
+
+def mutations_gates_open(environ: dict[str, str] | None = None) -> bool:
+    """True when master+domain kill switches are on, or a valid session mutate lease is active."""
+    env = environ if environ is not None else os.environ
+    if autonomy_mutations_enabled(env) and (env.get("PLESK_SYNC_APPLY") or "").strip() == "1":
+        return True
+    return mutate_lease_active(env)

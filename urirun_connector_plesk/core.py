@@ -32,7 +32,14 @@ from .errors import (
     map_exception,
 )
 from .immutable_manifest import build_immutable_manifest, verify_plan_hash
-from .apply_grant import autonomy_mutations_enabled, consume_apply_grant_jti, format_intent_pack, verify_apply_grant
+from .apply_grant import (
+    autonomy_mutations_enabled,
+    consume_apply_grant_jti,
+    format_intent_pack,
+    mutate_lease_active,
+    mutations_gates_open,
+    verify_apply_grant,
+)
 from .timeouts import transport_timeouts
 
 try:  # paramiko ships in urirun-node image (PR6); keep importable if extra absent in lab
@@ -1274,12 +1281,12 @@ def _apply_permitted(
     pack_version: str = "",
     artifact_sha256: str = "",
 ) -> tuple[bool, str | None, dict | None]:
-    """Uploads require apply + master + PLESK gate + valid signed grant (ADR-003)."""
+    """Uploads require apply + (kill switches OR session mutate lease) + signed grant (ADR-003)."""
     if not apply:
         return False, None, None
-    if not autonomy_mutations_enabled():
-        return False, "autonomy_mutations_disabled", None
-    if os.environ.get("PLESK_SYNC_APPLY", "").strip() != "1":
+    if not mutations_gates_open():
+        if not autonomy_mutations_enabled() and not mutate_lease_active():
+            return False, "autonomy_mutations_disabled", None
         return False, "plesk_sync_apply_required", None
     ok, error, claims = verify_apply_grant(
         apply_grant,
