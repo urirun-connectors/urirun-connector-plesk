@@ -11,6 +11,8 @@ import urirun
 from urirun_connector_plesk import (
     api_command,
     api_query,
+    auth_acquisition_methods,
+    auth_scopes,
     auth_status,
     bootstrap_api_key,
     connector_manifest,
@@ -34,6 +36,8 @@ ROUTES = {
     "plesk://host/api/command/request",
     "plesk://host/api/query/request",
     "plesk://host/auth/command/bootstrap-api-key",
+    "plesk://host/auth/query/acquisition-methods",
+    "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
@@ -83,8 +87,33 @@ def test_bootstrap_leases_admin_login_and_stores_key_without_returning_it(monkey
     assert "admin-password" not in serialized and "generated-plesk-key" not in serialized
 
 
+def test_auth_conformance_returns_handles_and_never_secret_values(monkeypatch):
+    monkeypatch.setattr(core, "_authorized_request", lambda **kwargs: (200, []))
+    status = auth_status(base_url="https://plesk.example.com:8443")
+    scopes = auth_scopes(base_url="https://plesk.example.com:8443")
+    methods = auth_acquisition_methods()
+
+    assert status["schema"] == "subactor.connector-auth-status/v1"
+    assert status["authenticated"] and status["credential_handle"] == "plesk-runtime"
+    assert status["secret_value_visible"] is False
+    assert status["evidence"] == {"provider_probe": True, "scope_probe": False, "evidence_bundle_id": None}
+    assert scopes["evidence"]["scope_probe"] is True
+    assert methods["methods"][0]["root_credential_handle"] == "plesk-admin-bootstrap"
+    serialized = json.dumps({"status": status, "scopes": scopes, "methods": methods})
+    assert "password" not in serialized and "api_key_value" not in serialized
+
+
 def test_manifest_routes_match_runtime_bindings():
-    assert set(connector_manifest()["routes"]) == ROUTES
+    manifest = connector_manifest()
+    assert set(manifest["routes"]) == ROUTES
+    assert manifest["authConformance"] == {
+        "schema": "subactor.connector-auth-status/v1",
+        "statusRoute": "plesk://host/auth/query/status",
+        "scopesRoute": "plesk://host/auth/query/scopes",
+        "acquisitionMethodsRoute": "plesk://host/auth/query/acquisition-methods",
+        "bootstrapRoute": "plesk://host/auth/command/bootstrap-api-key",
+        "secretValueVisible": False,
+    }
 
 
 def test_query_uses_api_key_and_redacts_sensitive_fields(monkeypatch):

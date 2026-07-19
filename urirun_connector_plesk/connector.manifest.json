@@ -12,6 +12,8 @@
   ],
   "flowExample": [
     "plesk://host/auth/command/bootstrap-api-key",
+    "plesk://host/auth/query/acquisition-methods",
+    "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
@@ -35,10 +37,20 @@
   "docsUrl": "https://github.com/urirun-connectors/urirun-connector-plesk",
   "keywords": ["plesk", "hosting", "domains", "mail", "rest-api", "vault"],
   "uriSchemes": ["plesk"],
+  "authConformance": {
+    "schema": "subactor.connector-auth-status/v1",
+    "statusRoute": "plesk://host/auth/query/status",
+    "scopesRoute": "plesk://host/auth/query/scopes",
+    "acquisitionMethodsRoute": "plesk://host/auth/query/acquisition-methods",
+    "bootstrapRoute": "plesk://host/auth/command/bootstrap-api-key",
+    "secretValueVisible": false
+  },
   "routes": [
     "plesk://host/api/command/request",
     "plesk://host/api/query/request",
     "plesk://host/auth/command/bootstrap-api-key",
+    "plesk://host/auth/query/acquisition-methods",
+    "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",

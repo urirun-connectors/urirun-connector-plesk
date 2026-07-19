@@ -8,6 +8,8 @@ generated API keys never appear in URI payloads, results, or logs.
 | URI | Purpose |
 | --- | --- |
 | `plesk://host/auth/command/bootstrap-api-key` | lease admin login/password from vault, create an API key, store it in vault |
+| `plesk://host/auth/query/acquisition-methods` | describe safe acquisition without returning credentials |
+| `plesk://host/auth/query/scopes` | probe and return credential scope evidence by handle |
 | `plesk://host/auth/query/status` | validate the stored API key |
 | `plesk://host/subscription/query/capabilities` | verify customer authorization and domain capacity before planning a site |
 | `plesk://host/domain/command/ensure` | dry-run or idempotently add a domain under an existing subscription |

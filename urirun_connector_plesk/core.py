@@ -504,7 +504,69 @@ def auth_status(
         )
     except RuntimeError as error:
         return urirun.fail(str(error))
-    return urirun.ok(base_url=_base_url(base_url), authorized=200 <= status < 300, http_status=status)
+    authenticated = 200 <= status < 300
+    return urirun.ok(
+        schema="subactor.connector-auth-status/v1",
+        base_url=_base_url(base_url),
+        authorized=authenticated,
+        authenticated=authenticated,
+        http_status=status,
+        credential_handle=runtime_vault_entry_id if authenticated else None,
+        credential_type="api_key" if authenticated else None,
+        scopes=["plesk.api.v2"] if authenticated else [],
+        expires_at=None,
+        refreshable=False,
+        delegatable=False,
+        interactive_consent_required=False,
+        secret_value_visible=False,
+        principal="organization:plesk-account" if authenticated else None,
+        provider="plesk",
+        evidence={"provider_probe": authenticated, "scope_probe": False, "evidence_bundle_id": None},
+    )
+
+
+@conn.handler("auth/query/acquisition-methods", isolated=True, meta={"label": "Describe safe Plesk credential acquisition methods"})
+def auth_acquisition_methods(
+    admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    runtime_vault_entry_id: str = "plesk-runtime",
+) -> dict[str, Any]:
+    return urirun.ok(
+        methods=[{
+            "type": "api_key",
+            "command_uri": "plesk://host/auth/command/bootstrap-api-key",
+            "root_credential_handle": admin_vault_entry_id,
+            "result_credential_handle": runtime_vault_entry_id,
+            "interactive_consent_required": False,
+            "mfa_required": False,
+            "secret_value_visible": False,
+        }],
+    )
+
+
+@conn.handler("auth/query/scopes", isolated=True, meta={"label": "Report Plesk credential scope evidence"})
+def auth_scopes(
+    base_url: str = "",
+    runtime_vault_entry_id: str = "plesk-runtime",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    status = auth_status(base_url=base_url, runtime_vault_entry_id=runtime_vault_entry_id, vault_url=vault_url)
+    if not status.get("ok") or not status.get("authenticated"):
+        return status
+    return urirun.ok(
+        schema="subactor.connector-auth-status/v1",
+        authenticated=True,
+        credential_handle=runtime_vault_entry_id,
+        credential_type="api_key",
+        scopes=["plesk.api.v2"],
+        expires_at=None,
+        refreshable=False,
+        delegatable=False,
+        interactive_consent_required=False,
+        secret_value_visible=False,
+        principal="organization:plesk-account",
+        provider="plesk",
+        evidence={"provider_probe": True, "scope_probe": True, "evidence_bundle_id": None},
+    )
 
 
 @conn.handler("api/query/request", isolated=True, meta={"label": "Execute a read-only Plesk REST API request"})

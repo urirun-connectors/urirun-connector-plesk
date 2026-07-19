@@ -1,5 +1,5 @@
 from .core import (
-    CONNECTOR_ID, api_command, api_query, auth_status, bootstrap_api_key, create_mailbox,
+    CONNECTOR_ID, api_command, api_query, auth_acquisition_methods, auth_scopes, auth_status, bootstrap_api_key, create_mailbox,
     ensure_ftp_user, ensure_ssl, ensure_subdomain, connector_manifest, doctor, main,
     ensure_domain, subscription_capabilities,
     publish_verify, release_activate, release_current, release_rollback, release_upload,
@@ -7,7 +7,7 @@ from .core import (
 )
 
 __all__ = [
-    "CONNECTOR_ID", "api_command", "api_query", "auth_status",
+    "CONNECTOR_ID", "api_command", "api_query", "auth_acquisition_methods", "auth_scopes", "auth_status",
     "bootstrap_api_key", "create_mailbox", "ensure_ftp_user", "ensure_ssl",
     "ensure_subdomain", "connector_manifest", "doctor", "main", "publish_verify",
     "ensure_domain", "subscription_capabilities",

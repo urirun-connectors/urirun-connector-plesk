@@ -33,6 +33,45 @@
         }
       ]
     },
+    "auth/query/acquisition-methods": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"admin_vault_entry_id": "?str", "runtime_vault_entry_id": "?str"},
+      "out": {"methods": "list"},
+      "errors": [],
+      "examples": [
+        {
+          "payload": {},
+          "result": {
+            "ok": true,
+            "methods": [{
+              "type": "api_key",
+              "command_uri": "plesk://host/auth/command/bootstrap-api-key",
+              "root_credential_handle": "plesk-admin-bootstrap",
+              "result_credential_handle": "plesk-runtime",
+              "interactive_consent_required": false,
+              "mfa_required": false,
+              "secret_value_visible": false
+            }]
+          }
+        }
+      ]
+    },
+    "auth/query/scopes": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"base_url": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {
+        "schema": "str", "authenticated": "bool", "credential_handle": "str",
+        "credential_type": "str", "scopes": "list", "expires_at": "?str",
+        "refreshable": "bool", "delegatable": "bool", "interactive_consent_required": "bool",
+        "secret_value_visible": "bool", "principal": "str", "provider": "str", "evidence": "dict"
+      },
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": []
+    },
     "auth/query/status": {
       "version": "v1",
       "effect": "query",
@@ -43,12 +82,26 @@
         "probe_path": "?str",
         "vault_url": "?str"
       },
-      "out": {"base_url": "str", "authorized": "bool", "http_status": "int"},
+      "out": {
+        "schema": "str", "base_url": "str", "authorized": "bool", "authenticated": "bool",
+        "http_status": "int", "credential_handle": "?str", "credential_type": "?str",
+        "scopes": "list", "expires_at": "?str", "refreshable": "bool", "delegatable": "bool",
+        "interactive_consent_required": "bool", "secret_value_visible": "bool",
+        "principal": "?str", "provider": "str", "evidence": "dict"
+      },
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": [
         {
           "payload": {},
-          "result": {"ok": true, "base_url": "https://plesk.example.com:8443", "authorized": true, "http_status": 200}
+            "result": {
+              "ok": true, "schema": "subactor.connector-auth-status/v1",
+              "base_url": "https://plesk.example.com:8443", "authorized": true,
+              "authenticated": true, "http_status": 200, "credential_handle": "plesk-runtime",
+              "credential_type": "api_key", "scopes": ["plesk.api.v2"], "expires_at": null,
+              "refreshable": false, "delegatable": false, "interactive_consent_required": false,
+              "secret_value_visible": false, "principal": "organization:plesk-account", "provider": "plesk",
+              "evidence": {"provider_probe": true, "scope_probe": false, "evidence_bundle_id": null}
+            }
         }
       ]
     },
