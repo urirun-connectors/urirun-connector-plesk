@@ -33,6 +33,7 @@ from .errors import (
     map_exception,
 )
 from .immutable_manifest import build_immutable_manifest, verify_plan_hash
+from .connector_result import classify_connector_reason, connector_result
 from .apply_grant import (
     autonomy_mutations_enabled,
     consume_apply_grant_jti,
@@ -1617,10 +1618,14 @@ def _site_tree_sync(
         artifact_sha256="",
     )
     if apply_error:
-        return urirun.fail(
-            apply_error,
+        return connector_result(
+            ok=False,
+            reason_code=classify_connector_reason(apply_error),
+            reason=apply_error,
+            error=apply_error,
             dry_run=True,
             files_planned=len(plan),
+            bytes_planned=manifest["bytes_total"],
             plan=plan,
             manifest=manifest,
             plan_hash=manifest["plan_hash"],
@@ -1629,12 +1634,14 @@ def _site_tree_sync(
             grant_claims=grant_claims,
         )
     if not may_write:
-        return urirun.ok(
+        return connector_result(
+            ok=True,
             dry_run=True,
             host=host,
             remote_path=remote_path,
             domain=domain or None,
             files_planned=len(plan),
+            bytes_planned=manifest["bytes_total"],
             plan=plan,
             manifest=manifest,
             plan_hash=manifest["plan_hash"],
@@ -1652,10 +1659,15 @@ def _site_tree_sync(
         remote_path=remote_path,
     )
     if not matched:
-        return urirun.fail(
-            mismatch or "plan_hash_mismatch",
+        error = mismatch or "plan_hash_mismatch"
+        return connector_result(
+            ok=False,
+            reason_code=classify_connector_reason(error),
+            reason=error,
+            error=error,
             dry_run=True,
             files_planned=len(plan),
+            bytes_planned=verified["bytes_total"],
             plan=plan,
             manifest=verified,
             plan_hash=verified["plan_hash"],
@@ -1754,15 +1766,20 @@ def _site_tree_sync(
         return urirun.fail(map_exception(error, phase="transfer"), capabilities=caps, transport=chosen)
     finally:
         username = password = ""
-    return urirun.ok(
+    return connector_result(
+        ok=True,
+        executed=True,
+        mutation_attempted=True,
         dry_run=False,
         host=host,
         transport=chosen,
         remote_path=remote_path,
         domain=domain or None,
         files_uploaded=len(uploaded),
+        bytes_uploaded=manifest["bytes_total"],
         files=uploaded,
         files_planned=len(plan),
+        bytes_planned=manifest["bytes_total"],
         manifest=manifest,
         plan_hash=manifest["plan_hash"],
         preserve_remote=list(_PRESERVE_REMOTE_NAMES),

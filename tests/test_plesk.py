@@ -27,6 +27,7 @@ from urirun_connector_plesk import (
 import urirun_connector_plesk.core as core
 from urirun_connector_plesk.apply_grant import CLOCK_SKEW_SECONDS, issue_apply_grant
 from urirun_connector_plesk.apply_grant_replay import reset_default_jti_replay_store
+from urirun_connector_plesk.connector_result import CONNECTOR_RESULT_SCHEMA
 
 
 ROUTES = {
@@ -785,6 +786,13 @@ def test_site_sync_apply_requires_env(monkeypatch, tmp_path):
     assert result.get("error") == "plesk_sync_apply_required"
     assert result.get("dry_run") is True
     assert result.get("plan_hash")
+    assert result["schema"] == CONNECTOR_RESULT_SCHEMA
+    assert result["reason_code"] == "AUTHORITY_REQUIRED"
+    assert result["executed"] is False
+    assert result["verified"] is False
+    assert result["mutation_attempted"] is False
+    assert result["files_uploaded"] == 0
+    assert result["bytes_uploaded"] == 0
 
 
 def test_site_sync_apply_requires_master_kill_switch(monkeypatch, tmp_path):
