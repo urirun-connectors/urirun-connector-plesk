@@ -215,6 +215,24 @@
         }
       ]
     },
+    "subscription/query/capabilities": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"subscription": "str", "base_url": "?str", "subscription_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"subscription": "str", "authenticated": "bool", "domains_used": "int", "domains_limit": "?int", "limit_known": "bool", "can_create_domain": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"subscription": "prototypowanie.pl"}, "result": {"ok": true, "subscription": "prototypowanie.pl", "authenticated": true, "domains_used": 2, "domains_limit": 10, "limit_known": true, "can_create_domain": true}}]
+    },
+    "domain/command/ensure": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {"domain": "str", "subscription": "str", "document_root": "?str", "apply": "?bool", "base_url": "?str", "subscription_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"domain": "str", "subscription": "str", "document_root": "str", "created": "bool", "existed": "bool", "dry_run": "bool", "site_id": "?int"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"domain": "autonomicznosc.pl", "subscription": "prototypowanie.pl", "apply": false}, "result": {"ok": true, "domain": "autonomicznosc.pl", "subscription": "prototypowanie.pl", "document_root": "httpdocs", "created": false, "existed": false, "dry_run": true, "site_id": null}}]
+    },
     "site/command/ssl-ensure": {
       "version": "v1",
       "effect": "command",

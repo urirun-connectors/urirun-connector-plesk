@@ -18,6 +18,8 @@ from urirun_connector_plesk import (
     ensure_ftp_user,
     ensure_ssl,
     ensure_subdomain,
+    ensure_domain,
+    subscription_capabilities,
     site_publish,
     site_sync,
     urirun_bindings,
@@ -32,6 +34,8 @@ ROUTES = {
     "plesk://host/api/query/request",
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
+    "plesk://host/subscription/query/capabilities",
+    "plesk://host/domain/command/ensure",
     "plesk://host/mailbox/command/create",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
@@ -76,6 +80,10 @@ def test_bootstrap_leases_admin_login_and_stores_key_without_returning_it(monkey
     assert stored == {"entry": "plesk-runtime", "key": "generated-plesk-key"}
     serialized = json.dumps(result)
     assert "admin-password" not in serialized and "generated-plesk-key" not in serialized
+
+
+def test_manifest_routes_match_runtime_bindings():
+    assert set(connector_manifest()["routes"]) == ROUTES
 
 
 def test_query_uses_api_key_and_redacts_sensitive_fields(monkeypatch):
@@ -258,6 +266,81 @@ def test_ensure_subdomain_adds_when_missing(monkeypatch):
     assert result["ok"] and result["created"] is True and result["subdomain_id"] == 310
     assert result["www_root"] == "docs-stage.subactor.com"
     assert any("<parent>subactor.com</parent>" in c for c in calls)
+
+
+def _subscription_xml(limit="10", permission="true"):
+    return (
+        "<packet><webspace><get><result><status>ok</status><id>7</id>"
+        f"<limits><limit><name>dom</name><value>{limit}</value></limit></limits>"
+        f"<permissions><permission><name>manage_domains</name><value>{permission}</value></permission></permissions>"
+        "</result></get></webspace></packet>"
+    )
+
+
+def _sites_xml(count=2):
+    rows="".join(f"<result><status>ok</status><id>{index+10}</id></result>" for index in range(count))
+    return f"<packet><site><get>{rows}</get></site></packet>"
+
+
+def test_subscription_capability_reads_customer_scope_and_domain_limit(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
+    def fake_xml(base_url,username,password,packet):
+        calls.append(packet)
+        return _subscription_xml() if "<webspace>" in packet else _sites_xml(2)
+    monkeypatch.setattr(core,"_xml_agent",fake_xml)
+    result=subscription_capabilities(subscription="prototypowanie.pl",base_url="https://plesk.example.com:8443")
+    assert result["ok"] and result["authenticated"] and result["can_create_domain"]
+    assert result["domains_used"]==2 and result["domains_limit"]==10
+    assert "pw" not in json.dumps(result) and len(calls)==2
+
+
+def test_domain_ensure_dry_run_never_mutates(monkeypatch):
+    calls=[]
+    monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
+    def fake_xml(base_url,username,password,packet):
+        calls.append(packet)
+        if "<webspace>" in packet: return _subscription_xml()
+        if "<webspace-name>" in packet: return _sites_xml(1)
+        return "<packet><site><get><result><status>error</status></result></get></site></packet>"
+    monkeypatch.setattr(core,"_xml_agent",fake_xml)
+    result=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=False,base_url="https://plesk.example.com:8443")
+    assert result["ok"] and result["dry_run"] and result["authorized"] and not result["created"]
+    assert all("<add>" not in packet for packet in calls)
+
+
+def test_domain_ensure_fails_closed_at_capacity_or_apply_gate(monkeypatch):
+    monkeypatch.delenv("AUTONOMY_MUTATIONS_ENABLED",raising=False)
+    monkeypatch.delenv("PLESK_DOMAIN_APPLY",raising=False)
+    monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
+    def at_capacity(base_url,username,password,packet):
+        if "<webspace>" in packet: return _subscription_xml(limit="1")
+        if "<webspace-name>" in packet: return _sites_xml(1)
+        return "<packet><site><get><result><status>error</status></result></get></site></packet>"
+    monkeypatch.setattr(core,"_xml_agent",at_capacity)
+    denied=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=False,base_url="https://plesk.example.com:8443")
+    assert not denied["ok"] and "limit_reached" in denied["error"]
+    def has_capacity(base_url,username,password,packet):
+        if "<webspace>" in packet: return _subscription_xml(limit="2")
+        if "<webspace-name>" in packet: return _sites_xml(1)
+        return "<packet><site><get><result><status>error</status></result></get></site></packet>"
+    monkeypatch.setattr(core,"_xml_agent",has_capacity)
+    gated=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=True,base_url="https://plesk.example.com:8443")
+    assert not gated["ok"] and gated["error"]=="plesk_domain_apply_gate_closed"
+
+
+def test_domain_ensure_apply_creates_site_only_with_both_gates(monkeypatch):
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED","1")
+    monkeypatch.setenv("PLESK_DOMAIN_APPLY","1")
+    monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
+    def fake_xml(base_url,username,password,packet):
+        if "<site><add>" in packet: return "<packet><site><add><result><status>ok</status><id>99</id></result></add></site></packet>"
+        if "<webspace>" in packet: return _subscription_xml(limit="2")
+        if "<webspace-name>" in packet: return _sites_xml(1)
+        return "<packet><site><get><result><status>error</status></result></get></site></packet>"
+    monkeypatch.setattr(core,"_xml_agent",fake_xml)
+    result=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=True,base_url="https://plesk.example.com:8443")
+    assert result["ok"] and result["created"] and result["site_id"]==99 and not result["dry_run"]
 
 
 def test_ensure_ssl_probe_only_without_apply(monkeypatch):

@@ -9,6 +9,8 @@ generated API keys never appear in URI payloads, results, or logs.
 | --- | --- |
 | `plesk://host/auth/command/bootstrap-api-key` | lease admin login/password from vault, create an API key, store it in vault |
 | `plesk://host/auth/query/status` | validate the stored API key |
+| `plesk://host/subscription/query/capabilities` | verify customer authorization and domain capacity before planning a site |
+| `plesk://host/domain/command/ensure` | dry-run or idempotently add a domain under an existing subscription |
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
 | `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
@@ -25,6 +27,11 @@ generated API keys never appear in URI payloads, results, or logs.
 | `plesk://host/site/command/subdomain-ensure` | idempotent subdomain create under parent webspace (XML; no DNS) |
 | `plesk://host/site/command/ssl-ensure` | ensure origin TLS covers hostname (probe / assign / panel PEM / SSL It LE) |
 | `plesk://host/doctor/query/report` | connector readiness (`ssl_ensure`, `letsencrypt`, `publish_verify`, staging note) |
+
+`domain/command/ensure` is dry-run by default. A real add requires
+`apply=true`, `AUTONOMY_MUTATIONS_ENABLED=1`, and `PLESK_DOMAIN_APPLY=1`.
+Unknown subscription limits, exhausted capacity, missing customer authority,
+and explicit permission denial all fail closed before the XML `site.add` call.
 
 ### SSL ensure (`site/command/ssl-ensure`)
 

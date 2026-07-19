@@ -14,6 +14,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from typing import Any
 
 import urirun
@@ -652,6 +653,187 @@ def _xml_ok(raw: str) -> bool:
 
 def _xml_props(raw: str) -> dict[str, str]:
     return dict(re.findall(r"<name>([^<]+)</name>\s*<value>([^<]*)</value>", raw))
+
+
+def _xml_root(raw: str) -> ET.Element:
+    try:
+        return ET.fromstring(raw)
+    except ET.ParseError as error:
+        raise RuntimeError("plesk_xml_response_invalid") from error
+
+
+def _xml_results(raw: str, operation: str) -> list[ET.Element]:
+    root = _xml_root(raw)
+    return list(root.findall(f".//{operation}/result"))
+
+
+def _xml_named_values(root: ET.Element) -> dict[str, str]:
+    values: dict[str, str] = {}
+    for node in root.iter():
+        name = node.find("name")
+        value = node.find("value")
+        if name is not None and value is not None and name.text:
+            values[name.text.strip()] = (value.text or "").strip()
+    return values
+
+
+def _limit_value(values: dict[str, str]) -> tuple[int | None, str | None]:
+    for key in ("dom", "max_dom", "domains", "max_domains"):
+        if key not in values:
+            continue
+        raw = values[key].strip().lower()
+        if raw in {"-1", "unlimited"}:
+            return -1, key
+        try:
+            return int(raw), key
+        except ValueError:
+            return None, key
+    return None, None
+
+
+def _permission_value(values: dict[str, str]) -> bool | None:
+    for key in ("manage_domains", "create_domains", "manage_subdomains"):
+        if key not in values:
+            continue
+        return values[key].strip().lower() in {"1", "true", "on", "yes"}
+    return None
+
+
+def _subscription_capabilities_with_credentials(
+    *, base_url: str, subscription: str, username: str, password: str,
+) -> dict[str, Any]:
+    escaped = _xml_escape(subscription)
+    webspace_packet = f'''<?xml version="1.0" encoding="UTF-8"?>
+<packet><webspace><get><filter><name>{escaped}</name></filter>
+<dataset><gen_info/><limits/><permissions/></dataset></get></webspace></packet>'''
+    webspace_raw = _xml_agent(base_url, username, password, webspace_packet)
+    webspace_results = _xml_results(webspace_raw, "get")
+    if not any((item.findtext("status") or "").strip() == "ok" for item in webspace_results):
+        return {"ok": False, "error": "plesk_subscription_not_authorized_or_missing"}
+    named = _xml_named_values(_xml_root(webspace_raw))
+    domain_limit, limit_key = _limit_value(named)
+    permission = _permission_value(named)
+
+    site_packet = f'''<?xml version="1.0" encoding="UTF-8"?>
+<packet><site><get><filter><webspace-name>{escaped}</webspace-name></filter>
+<dataset><gen_info/></dataset></get></site></packet>'''
+    site_raw = _xml_agent(base_url, username, password, site_packet)
+    sites = [item for item in _xml_results(site_raw, "get") if (item.findtext("status") or "").strip() == "ok"]
+    domains_used = len(sites)
+    limit_known = domain_limit is not None
+    capacity = limit_known and (domain_limit == -1 or domains_used < domain_limit)
+    can_create = capacity and permission is not False
+    reason = None
+    if permission is False:
+        reason = "subscription_domain_permission_denied"
+    elif not limit_known:
+        reason = "subscription_domain_limit_unknown"
+    elif not capacity:
+        reason = "subscription_domain_limit_reached"
+    return {
+        "ok": True,
+        "subscription": subscription,
+        "authenticated": True,
+        "permission": permission,
+        "permission_known": permission is not None,
+        "domains_used": domains_used,
+        "domains_limit": domain_limit,
+        "domains_unlimited": domain_limit == -1,
+        "limit_name": limit_key,
+        "limit_known": limit_known,
+        "can_create_domain": can_create,
+        "reason": reason,
+    }
+
+
+@conn.handler(
+    "subscription/query/capabilities",
+    isolated=True,
+    meta={"label": "Verify subscription authorization and add-on domain capacity"},
+)
+def subscription_capabilities(
+    subscription: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    name = (subscription or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", name):
+        return urirun.fail("plesk_subscription_name_invalid")
+    username = password = ""
+    try:
+        origin = _base_url(base_url)
+        username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(subscription_vault_entry_id, origin, "password", vault_url)
+        result = _subscription_capabilities_with_credentials(
+            base_url=base_url, subscription=name, username=username, password=password,
+        )
+        if not result.get("ok"):
+            return urirun.fail(result.get("error") or "plesk_subscription_capability_failed")
+        return urirun.ok(**{key: value for key, value in result.items() if key != "ok"})
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    finally:
+        username = password = ""
+
+
+@conn.handler(
+    "domain/command/ensure",
+    isolated=True,
+    meta={"label": "Idempotently ensure an add-on domain under an authorized subscription"},
+)
+def ensure_domain(
+    domain: str = "",
+    subscription: str = "",
+    document_root: str = "httpdocs",
+    apply: bool = False,
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    host = (domain or "").strip().lower()
+    webspace = (subscription or "").strip().lower()
+    root = (document_root or "httpdocs").strip().strip("/")
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host):
+        return urirun.fail("plesk_domain_name_invalid")
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", webspace):
+        return urirun.fail("plesk_subscription_name_invalid")
+    if not root or not re.fullmatch(r"[A-Za-z0-9_./-]+", root) or ".." in root:
+        return urirun.fail("plesk_domain_document_root_invalid")
+    username = password = ""
+    try:
+        origin = _base_url(base_url)
+        username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(subscription_vault_entry_id, origin, "password", vault_url)
+        get_packet = f'''<?xml version="1.0" encoding="UTF-8"?>
+<packet><site><get><filter><name>{_xml_escape(host)}</name></filter>
+<dataset><gen_info/></dataset></get></site></packet>'''
+        existing_raw = _xml_agent(base_url, username, password, get_packet)
+        existing = [item for item in _xml_results(existing_raw, "get") if (item.findtext("status") or "").strip() == "ok"]
+        if existing:
+            site_id = existing[0].findtext("id")
+            return urirun.ok(domain=host, subscription=webspace, document_root=root, created=False, existed=True, site_id=int(site_id) if site_id and site_id.isdigit() else None, dry_run=not apply)
+        capabilities = _subscription_capabilities_with_credentials(base_url=base_url, subscription=webspace, username=username, password=password)
+        if not capabilities.get("ok") or not capabilities.get("can_create_domain"):
+            return urirun.fail(capabilities.get("reason") or capabilities.get("error") or "plesk_domain_create_not_authorized", capabilities=capabilities)
+        if not apply:
+            return urirun.ok(domain=host, subscription=webspace, document_root=root, created=False, existed=False, dry_run=True, authorized=True, capabilities=capabilities)
+        if os.environ.get("AUTONOMY_MUTATIONS_ENABLED") != "1" or os.environ.get("PLESK_DOMAIN_APPLY") != "1":
+            return urirun.fail("plesk_domain_apply_gate_closed", dry_run=True, domain=host)
+        add_packet = f'''<?xml version="1.0" encoding="UTF-8"?>
+<packet><site><add><gen_setup><name>{_xml_escape(host)}</name>
+<webspace-name>{_xml_escape(webspace)}</webspace-name><htype>vrt_hst</htype></gen_setup>
+<hosting><vrt_hst><property><name>www_root</name><value>{_xml_escape(root)}</value></property></vrt_hst></hosting>
+</add></site></packet>'''
+        raw = _xml_agent(base_url, username, password, add_packet)
+        if not _xml_ok(raw):
+            return urirun.fail("plesk_domain_add_failed", detail=raw[:400])
+        match = re.search(r"<id>(\d+)</id>", raw)
+        return urirun.ok(domain=host, subscription=webspace, document_root=root, created=True, existed=False, dry_run=False, site_id=int(match.group(1)) if match else None)
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    finally:
+        username = password = ""
 
 
 @conn.handler(

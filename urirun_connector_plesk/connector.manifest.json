@@ -13,6 +13,8 @@
   "flowExample": [
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
+    "plesk://host/subscription/query/capabilities",
+    "plesk://host/domain/command/ensure",
     "plesk://host/api/query/request"
   ],
   "requires": [
@@ -38,6 +40,8 @@
     "plesk://host/api/query/request",
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/status",
+    "plesk://host/subscription/query/capabilities",
+    "plesk://host/domain/command/ensure",
     "plesk://host/mailbox/command/create",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
