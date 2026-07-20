@@ -3,6 +3,23 @@
 Secure Plesk REST API v2 connector for `urirun`. Administrator credentials and
 generated API keys never appear in URI payloads, results, or logs.
 
+## Development
+
+Run the test suite in an isolated environment. In the `if-uri` workspace, use
+the adjacent `urirun` checkout so the connector is tested against the current
+runtime source:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ../urirun/adapters/python
+python -m pip install -e '.[test]'
+python -m pytest tests -q
+```
+
+CI runs the same suite on Python 3.10 and 3.13. Tests use fakes or loopback
+servers and do not contact a real Plesk instance.
+
 ## URI Process
 
 | URI | Purpose |
