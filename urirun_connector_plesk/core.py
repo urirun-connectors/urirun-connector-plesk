@@ -969,13 +969,16 @@ def _dns_site_id(value: Any) -> int:
     return site_id
 
 
-def _dns_hostname(value: str) -> str:
+def _dns_hostname(value: str, *, allow_wildcard: bool = False) -> str:
     host = (value or "").strip().rstrip(".").lower()
+    wildcard = host.startswith("*.")
+    plain_host = host[2:] if wildcard else host
     if (
         len(host) > 253
-        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host)
-        or "." not in host
-        or any(len(label) > 63 or label.startswith("-") or label.endswith("-") for label in host.split("."))
+        or (wildcard and not allow_wildcard)
+        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", plain_host)
+        or "." not in plain_host
+        or any(len(label) > 63 or label.startswith("-") or label.endswith("-") for label in plain_host.split("."))
     ):
         raise RuntimeError("plesk_dns_host_invalid")
     return host
@@ -1095,7 +1098,7 @@ def dns_records(
     username = password = ""
     try:
         resolved_site_id = _dns_site_id(site_id)
-        wanted_host = _dns_hostname(host) if host else ""
+        wanted_host = _dns_hostname(host, allow_wildcard=True) if host else ""
         wanted_type = _dns_type(record_type) if record_type else ""
         origin = _base_url(base_url)
         username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
@@ -1133,7 +1136,7 @@ def dns_replace(
     username = password = ""
     try:
         resolved_site_id = _dns_site_id(site_id)
-        wanted_host = _dns_hostname(host)
+        wanted_host = _dns_hostname(host, allow_wildcard=True)
         wanted_type = _dns_type(record_type)
         wanted_value = _dns_value(wanted_type, value)
         origin = _base_url(base_url)
@@ -1236,7 +1239,7 @@ def dns_propagation(
     host: str = "", record_type: str = "A", expected_value: str = "",
 ) -> dict[str, Any]:
     try:
-        wanted_host = _dns_hostname(host)
+        wanted_host = _dns_hostname(host, allow_wildcard=True)
         wanted_type = _dns_type(record_type)
         wanted_value = _dns_value(wanted_type, expected_value) if expected_value else ""
         propagation = resolve_dns_propagation(wanted_host, wanted_type, wanted_value)
@@ -1275,7 +1278,7 @@ def dns_reconcile(
     token = zone_id = ""
     mutation_attempted = False
     try:
-        wanted_host = _dns_hostname(host)
+        wanted_host = _dns_hostname(host, allow_wildcard=True)
         wanted_zone = _dns_zone(zone, wanted_host)
         wanted_type = _dns_type(record_type)
         wanted_value = _dns_value(wanted_type, value)
@@ -3372,7 +3375,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.12.1",
+        "version": "0.12.2",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,

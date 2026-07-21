@@ -206,6 +206,37 @@ def test_dns_records_filters_exact_host_without_exposing_credentials(monkeypatch
     assert "subscription-user" not in serialized and "subscription-password" not in serialized
 
 
+def test_dns_records_accepts_only_a_leftmost_wildcard(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda *args: "vault-value")
+    monkeypatch.setattr(
+        core, "_xml_agent", lambda *args: _dns_xml([{
+            "id": 12, "type": "CNAME", "host": "*.subactor.com.", "value": "subactor.github.io.",
+        }]),
+    )
+    result = dns_records(
+        site_id=185, host="*.subactor.com", base_url="https://plesk.example.com:8443",
+    )
+    assert result["ok"] and result["records"][0]["host"] == "*.subactor.com"
+    for invalid in ("foo.*.subactor.com", "**.subactor.com", "*", "*.localhost"):
+        denied = dns_records(site_id=185, host=invalid, base_url="https://plesk.example.com:8443")
+        assert denied["ok"] is False and denied["error"] == "plesk_dns_host_invalid"
+
+
+def test_dns_replace_plans_wildcard_cname_to_address_without_expanding_scope(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: "vault-value")
+    monkeypatch.setattr(
+        core, "_xml_agent", lambda *args: _dns_xml([{
+            "id": 12, "type": "CNAME", "host": "*.subactor.com", "value": "subactor.github.io",
+        }]),
+    )
+    result = dns_replace(
+        site_id=185, host="*.subactor.com", record_type="A", value="217.160.250.222",
+        base_url="https://plesk.example.com:8443",
+    )
+    assert result["ok"] and result["plan"]["host"] == "*.subactor.com"
+    assert result["plan"]["delete_record_ids"] == [12] and result["plan"]["add_record"] is True
+
+
 def test_dns_replace_dry_run_builds_stable_conflict_free_plan(monkeypatch):
     monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: "vault-value")
     monkeypatch.setattr(
@@ -336,6 +367,25 @@ def test_dns_reconcile_cloudflare_dry_run_uses_vault_and_returns_provider_receip
     assert result["plan"]["create_record"] is True
     serialized = json.dumps(result)
     assert "top-secret-token" not in serialized and leases["zone_id"] not in serialized
+
+
+def test_dns_reconcile_cloudflare_wildcard_targets_only_the_literal_record(monkeypatch):
+    record_id = "a" * 32
+    leases = {"api_token": "top-secret-token", "zone_id": "b" * 32}
+    monkeypatch.setattr(core, "resolve_dns_authority", lambda zone: _authority())
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url: leases[field])
+    monkeypatch.setattr(core, "cloudflare_records", lambda zone_id, zone, host, token: [{
+        "id": record_id, "host": host, "type": "CNAME",
+        "value": "subactor.github.io", "ttl": 1, "proxied": False,
+    }])
+    result = dns_reconcile(
+        zone="subactor.com", host="*.subactor.com", record_type="A",
+        value="217.160.250.222", expected_provider="cloudflare",
+    )
+    assert result["ok"] and result["dry_run"]
+    assert result["plan"]["host"] == "*.subactor.com"
+    assert result["plan"]["delete_record_ids"] == [record_id]
+    assert result["target"] == "cloudflare://subactor.com/dns:*.subactor.com"
 
 
 def test_dns_reconcile_cloudflare_apply_is_granted_batched_and_verified(monkeypatch):
@@ -991,7 +1041,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.12.1"
+    assert report["version"] == "0.12.2"
 
 
 def test_transport_origin_defaults_to_https():
