@@ -947,6 +947,250 @@ def _xml_results(raw: str, operation: str) -> list[ET.Element]:
     return list(root.findall(f".//{operation}/result"))
 
 
+_DNS_ADDRESS_TYPES = {"A", "AAAA", "CNAME"}
+
+
+def _dns_site_id(value: Any) -> int:
+    try:
+        site_id = int(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("plesk_dns_site_id_invalid") from error
+    if site_id <= 0:
+        raise RuntimeError("plesk_dns_site_id_invalid")
+    return site_id
+
+
+def _dns_hostname(value: str) -> str:
+    host = (value or "").strip().rstrip(".").lower()
+    if (
+        len(host) > 253
+        or not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host)
+        or "." not in host
+        or any(len(label) > 63 or label.startswith("-") or label.endswith("-") for label in host.split("."))
+    ):
+        raise RuntimeError("plesk_dns_host_invalid")
+    return host
+
+
+def _dns_type(value: str) -> str:
+    record_type = (value or "").strip().upper()
+    if record_type not in _DNS_ADDRESS_TYPES:
+        raise RuntimeError("plesk_dns_record_type_not_allowed")
+    return record_type
+
+
+def _dns_value(record_type: str, value: str) -> str:
+    wanted = (value or "").strip().rstrip(".")
+    if record_type == "A":
+        import ipaddress
+        try:
+            if ipaddress.ip_address(wanted).version != 4:
+                raise ValueError
+        except ValueError as error:
+            raise RuntimeError("plesk_dns_value_invalid") from error
+        return wanted
+    if record_type == "AAAA":
+        import ipaddress
+        try:
+            parsed = ipaddress.ip_address(wanted)
+            if parsed.version != 6:
+                raise ValueError
+        except ValueError as error:
+            raise RuntimeError("plesk_dns_value_invalid") from error
+        return parsed.compressed
+    return _dns_hostname(wanted)
+
+
+def _dns_records_packet(site_id: int) -> str:
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<packet><dns><get_rec><filter><site-id>{site_id}</site-id></filter></get_rec></dns></packet>'''
+
+
+def _dns_parse_records(raw: str) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    results = _xml_results(raw, "get_rec")
+    for result in results:
+        if (result.findtext("status") or "").strip() != "ok":
+            continue
+        data_node = result.find("data")
+        data = data_node if data_node is not None else result
+        raw_id = (result.findtext("id") or data.findtext("id") or "").strip()
+        host = (data.findtext("host") or result.findtext("host") or "").strip().rstrip(".").lower()
+        record_type = (data.findtext("type") or result.findtext("type") or "").strip().upper()
+        value = (data.findtext("value") or result.findtext("value") or "").strip().rstrip(".")
+        opt = (data.findtext("opt") or result.findtext("opt") or "").strip()
+        if raw_id.isdigit() and host and record_type:
+            records.append({
+                "id": int(raw_id),
+                "host": host,
+                "type": record_type,
+                "value": value,
+                "opt": opt or None,
+            })
+    if results and not records and any((node.findtext("status") or "").strip() == "error" for node in results):
+        raise RuntimeError("plesk_dns_query_failed")
+    return records
+
+
+def _dns_with_credentials(
+    *, site_id: int, base_url: str, username: str, password: str,
+) -> list[dict[str, Any]]:
+    return _dns_parse_records(_xml_agent(base_url, username, password, _dns_records_packet(site_id)))
+
+
+def _dns_plan(site_id: int, host: str, record_type: str, value: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    address_records = [row for row in records if row["host"] == host and row["type"] in _DNS_ADDRESS_TYPES]
+    exact = [row for row in address_records if row["type"] == record_type and row["value"].rstrip(".").lower() == value.lower()]
+    delete = [row for row in address_records if row not in exact[:1]]
+    add = not exact
+    body = {
+        "schema": "urirun.plesk-dns-replace-plan/v1",
+        "site_id": site_id,
+        "host": host,
+        "record_type": record_type,
+        "value": value,
+        "delete_record_ids": sorted(row["id"] for row in delete),
+        "add_record": add,
+        "risk_class": "boundary",
+    }
+    digest = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return {**body, "changed": bool(delete or add), "plan_hash": digest, "artifact_sha256": digest}
+
+
+@conn.handler("dns/query/records", isolated=True, meta={"label": "List filtered Plesk DNS records through XML API"})
+def dns_records(
+    site_id: int = 0,
+    host: str = "",
+    record_type: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    username = password = ""
+    try:
+        resolved_site_id = _dns_site_id(site_id)
+        wanted_host = _dns_hostname(host) if host else ""
+        wanted_type = _dns_type(record_type) if record_type else ""
+        origin = _base_url(base_url)
+        username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(subscription_vault_entry_id, origin, "password", vault_url)
+        rows = _dns_with_credentials(
+            site_id=resolved_site_id, base_url=base_url, username=username, password=password,
+        )
+        if wanted_host:
+            rows = [row for row in rows if row["host"] == wanted_host]
+        if wanted_type:
+            rows = [row for row in rows if row["type"] == wanted_type]
+        return urirun.ok(site_id=resolved_site_id, records=rows, count=len(rows), mutation_attempted=False)
+    except RuntimeError as error:
+        return urirun.fail(str(error), mutation_attempted=False)
+    finally:
+        username = password = ""
+
+
+@conn.handler("dns/command/replace", isolated=True, meta={"label": "Plan or atomically replace a Plesk address DNS record"})
+def dns_replace(
+    site_id: int = 0,
+    host: str = "",
+    record_type: str = "A",
+    value: str = "",
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    username = password = ""
+    try:
+        resolved_site_id = _dns_site_id(site_id)
+        wanted_host = _dns_hostname(host)
+        wanted_type = _dns_type(record_type)
+        wanted_value = _dns_value(wanted_type, value)
+        origin = _base_url(base_url)
+    except RuntimeError as error:
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
+
+    if apply and not autonomy_mutations_enabled() and not mutate_lease_active():
+        return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+    if apply and os.environ.get("PLESK_DNS_APPLY", "").strip() != "1":
+        return urirun.fail("plesk_dns_apply_required", dry_run=False, mutation_attempted=False)
+
+    try:
+        username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(subscription_vault_entry_id, origin, "password", vault_url)
+        records = _dns_with_credentials(
+            site_id=resolved_site_id, base_url=base_url, username=username, password=password,
+        )
+        plan = _dns_plan(resolved_site_id, wanted_host, wanted_type, wanted_value, records)
+        target = f"{origin}|dns:{resolved_site_id}:{wanted_host}"
+        visible = [row for row in records if row["host"] == wanted_host and row["type"] in _DNS_ADDRESS_TYPES]
+        if not apply:
+            return urirun.ok(
+                dry_run=True, executed=False, mutation_attempted=False, target=target,
+                existing=visible, plan=plan, plan_hash=plan["plan_hash"],
+                artifact_sha256=plan["artifact_sha256"], changed=plan["changed"],
+            )
+        if not plan["changed"]:
+            return urirun.ok(
+                dry_run=False, executed=False, mutation_attempted=False, verified=True,
+                target=target, existing=visible, plan_hash=plan["plan_hash"], changed=False,
+            )
+        if plan_hash.strip().lower() != plan["plan_hash"]:
+            return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+        ok, error, claims = verify_apply_grant(
+            apply_grant,
+            plan_hash=plan["plan_hash"],
+            target=target,
+            actor=actor,
+            intent_pack=format_intent_pack(pack_id, pack_version),
+            artifact_sha256=plan["artifact_sha256"],
+        )
+        if not ok or not claims:
+            return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+        if claims.get("risk_class") != "boundary":
+            return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+        consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+        if not consumed:
+            return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
+
+        operations = "".join(f"<del_rec><filter><id>{record_id}</id></filter></del_rec>" for record_id in plan["delete_record_ids"])
+        if plan["add_record"]:
+            operations += (
+                "<add_rec><site-id>" + str(resolved_site_id) + "</site-id><type>" + wanted_type
+                + "</type><host>" + _xml_escape(wanted_host) + "</host><value>"
+                + _xml_escape(wanted_value) + "</value></add_rec>"
+            )
+        packet = f'''<?xml version="1.0" encoding="UTF-8"?><packet><dns>{operations}</dns></packet>'''
+        raw = _xml_agent(base_url, username, password, packet)
+        if not _xml_ok(raw):
+            return urirun.fail("plesk_dns_replace_failed", dry_run=False, mutation_attempted=True)
+        verified_records = _dns_with_credentials(
+            site_id=resolved_site_id, base_url=base_url, username=username, password=password,
+        )
+        remaining = [row for row in verified_records if row["host"] == wanted_host and row["type"] in _DNS_ADDRESS_TYPES]
+        verified = (
+            len(remaining) == 1
+            and remaining[0]["type"] == wanted_type
+            and remaining[0]["value"].rstrip(".").lower() == wanted_value.lower()
+        )
+        if not verified:
+            return urirun.fail(
+                "plesk_dns_verification_failed", dry_run=False, mutation_attempted=True, records=remaining,
+            )
+        return urirun.ok(
+            dry_run=False, executed=True, mutation_attempted=True, verified=True, changed=True,
+            target=target, record=remaining[0], plan_hash=plan["plan_hash"], grant_jti=claims["jti"],
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
+    finally:
+        username = password = ""
+
+
 def _xml_named_values(root: ET.Element) -> dict[str, str]:
     values: dict[str, str] = {}
     for node in root.iter():
@@ -1701,7 +1945,7 @@ def _source_allowed(source_dir: str) -> bool:
             if abs_path == root or abs_path.startswith(root + os.sep):
                 return True
         return False
-    return os.path.basename(abs_path.rstrip(os.sep)) in {"www", "docs", "logo"}
+    return os.path.basename(abs_path.rstrip(os.sep)) in {"www", "docs", "logo", "public-status"}
 
 
 def _plan_local_tree(source_dir: str, remote_path: str, exclude: tuple[str, ...] = ()) -> list[dict[str, Any]]:
@@ -2777,7 +3021,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.10.0",
+        "version": "0.11.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,

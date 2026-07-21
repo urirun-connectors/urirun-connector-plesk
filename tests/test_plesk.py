@@ -17,6 +17,8 @@ from urirun_connector_plesk import (
     bootstrap_api_key,
     connector_manifest,
     create_mailbox,
+    dns_records,
+    dns_replace,
     ensure_ftp_user,
     ensure_ssl,
     ensure_subdomain,
@@ -49,6 +51,8 @@ ROUTES = {
     "plesk://host/extension/command/call",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
+    "plesk://host/dns/query/records",
+    "plesk://host/dns/command/replace",
     "plesk://host/mailbox/command/create",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
@@ -122,6 +126,106 @@ def test_manifest_routes_match_runtime_bindings():
         "bootstrapRoute": "plesk://host/auth/command/bootstrap-api-key",
         "secretValueVisible": False,
     }
+
+
+def _dns_xml(records):
+    rows = "".join(
+        "<result><status>ok</status><id>{id}</id><data><type>{type}</type><host>{host}</host>"
+        "<value>{value}</value></data></result>".format(**row)
+        for row in records
+    )
+    return f"<packet><dns><get_rec>{rows}</get_rec></dns></packet>"
+
+
+def test_dns_records_filters_exact_host_without_exposing_credentials(monkeypatch):
+    leased = {"username": "subscription-user", "password": "subscription-password"}
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url: leased[field])
+    monkeypatch.setattr(
+        core,
+        "_xml_agent",
+        lambda *args: _dns_xml([
+            {"id": 7, "type": "CNAME", "host": "status.example.com.", "value": "old.example.net."},
+            {"id": 8, "type": "A", "host": "other.example.com", "value": "192.0.2.8"},
+        ]),
+    )
+    result = dns_records(site_id=185, host="status.example.com", base_url="https://plesk.example.com:8443")
+    assert result["ok"] and result["count"] == 1
+    assert result["records"][0] == {
+        "id": 7, "type": "CNAME", "host": "status.example.com", "value": "old.example.net", "opt": None,
+    }
+    serialized = json.dumps(result)
+    assert "subscription-user" not in serialized and "subscription-password" not in serialized
+
+
+def test_dns_replace_dry_run_builds_stable_conflict_free_plan(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: "vault-value")
+    monkeypatch.setattr(
+        core, "_xml_agent", lambda *args: _dns_xml([
+            {"id": 7, "type": "CNAME", "host": "status.example.com", "value": "old.example.net"},
+            {"id": 9, "type": "AAAA", "host": "status.example.com", "value": "2001:db8::1"},
+        ]),
+    )
+    first = dns_replace(
+        site_id=185, host="status.example.com", value="192.0.2.10",
+        base_url="https://plesk.example.com:8443",
+    )
+    second = dns_replace(
+        site_id=185, host="status.example.com", value="192.0.2.10",
+        base_url="https://plesk.example.com:8443",
+    )
+    assert first["ok"] and first["dry_run"] and first["changed"]
+    assert first["plan"]["delete_record_ids"] == [7, 9] and first["plan"]["add_record"] is True
+    assert first["plan_hash"] == second["plan_hash"] and len(first["plan_hash"]) == 64
+
+
+def test_dns_replace_apply_fails_closed_before_credentials(monkeypatch):
+    monkeypatch.delenv("AUTONOMY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.delenv("PLESK_DNS_APPLY", raising=False)
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no lease")))
+    result = dns_replace(
+        site_id=185, host="status.example.com", value="192.0.2.10", apply=True,
+        base_url="https://plesk.example.com:8443",
+    )
+    assert not result["ok"] and result["error"] == "autonomy_mutations_disabled"
+    assert result["mutation_attempted"] is False
+
+
+def test_dns_replace_apply_requires_grant_and_verifies_result(monkeypatch):
+    reset_default_jti_replay_store()
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_DNS_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "dns-test-secret")
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: "vault-value")
+    state = [{"id": 7, "type": "CNAME", "host": "status.example.com", "value": "old.example.net"}]
+    packets = []
+
+    def xml_agent(base_url, username, password, packet):
+        packets.append(packet)
+        if "<get_rec>" in packet:
+            return _dns_xml(state)
+        assert "<del_rec><filter><id>7</id>" in packet
+        assert "<add_rec><site-id>185</site-id><type>A</type>" in packet
+        state[:] = [{"id": 10, "type": "A", "host": "status.example.com", "value": "192.0.2.10"}]
+        return "<packet><dns><del_rec><result><status>ok</status></result></del_rec><add_rec><result><status>ok</status></result></add_rec></dns></packet>"
+
+    monkeypatch.setattr(core, "_xml_agent", xml_agent)
+    dry = dns_replace(
+        site_id=185, host="status.example.com", value="192.0.2.10",
+        base_url="https://plesk.example.com:8443",
+    )
+    issued = issue_apply_grant(
+        run_id="dns-run", actor="test-actor", intent_pack="plesk-dns@1",
+        plan_hash=dry["plan_hash"], artifact_sha256=dry["artifact_sha256"], target=dry["target"],
+        risk_class="boundary", jti="dns-once",
+        environ={"APPLY_GRANT_HMAC_SECRET": "dns-test-secret"},
+    )
+    result = dns_replace(
+        site_id=185, host="status.example.com", value="192.0.2.10", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=issued["grant"], actor="test-actor",
+        pack_id="plesk-dns", pack_version="1", base_url="https://plesk.example.com:8443",
+    )
+    assert result["ok"] and result["executed"] and result["verified"]
+    assert result["record"]["value"] == "192.0.2.10" and len(packets) == 4
 
 
 def _extensions_xml():
@@ -701,7 +805,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.10.0"
+    assert report["version"] == "0.11.0"
 
 
 def test_transport_origin_defaults_to_https():
@@ -1467,3 +1571,12 @@ def test_site_sync_allows_logo_basename(tmp_path):
     assert result["ok"] and result["dry_run"] is True
     assert result["files_planned"] == 1
     assert result.get("domain") == "logo.subactor.com"
+
+
+def test_site_sync_allows_sanitized_public_status_basename(tmp_path):
+    status = tmp_path / "public-status"
+    status.mkdir()
+    (status / "health.php").write_text("<?php echo '{}';", encoding="utf-8")
+    result = site_sync(source_dir=str(status), host="prototypowanie.pl", domain="status.subactor.com")
+    assert result["ok"] and result["dry_run"] is True
+    assert result["files_planned"] == 1

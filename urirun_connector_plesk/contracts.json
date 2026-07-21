@@ -137,6 +137,41 @@
         }
       ]
     },
+    "dns/query/records": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {
+        "site_id": "int", "host": "?str", "record_type": "?str", "base_url": "?str",
+        "subscription_vault_entry_id": "?str", "vault_url": "?str"
+      },
+      "out": {"site_id": "int", "records": "list", "count": "int", "mutation_attempted": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{
+        "payload": {"site_id": 185, "host": "status.example.com"},
+        "result": {"ok": true, "site_id": 185, "records": [], "count": 0, "mutation_attempted": false}
+      }]
+    },
+    "dns/command/replace": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true,
+      "inp": {
+        "site_id": "int", "host": "str", "record_type": "?str", "value": "str",
+        "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str",
+        "pack_id": "?str", "pack_version": "?str", "base_url": "?str",
+        "subscription_vault_entry_id": "?str", "vault_url": "?str"
+      },
+      "out": {
+        "dry_run": "bool", "executed": "bool", "mutation_attempted": "bool", "target": "str",
+        "plan_hash": "str", "changed": "bool", "verified": "?bool"
+      },
+      "errors": ["precondition-unmet", "permission-denied", "conflict", "degraded-backend"],
+      "examples": [{
+        "payload": {"site_id": 185, "host": "status.example.com", "record_type": "A", "value": "192.0.2.10"},
+        "result": {"ok": true, "dry_run": true, "executed": false, "mutation_attempted": false, "target": "https://plesk.example.com:8443|dns:185:status.example.com", "plan_hash": "sha256", "changed": true}
+      }]
+    },
     "mailbox/command/create": {
       "version": "v1",
       "effect": "command",

@@ -53,6 +53,12 @@ servers and do not contact a real Plesk instance.
 
 ## Dynamic extension model
 
+DNS address records use the reviewed XML API routes
+`plesk://host/dns/query/records` and `plesk://host/dns/command/replace`. Replacement is
+dry-run by default and removes conflicting A/AAAA/CNAME records only after an exact
+plan hash, signed boundary-risk grant, the global mutation gate and
+`PLESK_DNS_APPLY=1` have all been verified.
+
 Plesk extensions are runtime objects, not hard-coded connector routes. The connector
 discovers their `id`, name, version, release and active state through the official XML
 `extension.get` operator. Discovery does not grant authority. The checked-in
