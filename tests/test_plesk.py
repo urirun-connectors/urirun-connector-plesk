@@ -283,10 +283,13 @@ def test_dns_replace_apply_requires_grant_and_verifies_result(monkeypatch):
         packets.append(packet)
         if "<get_rec>" in packet:
             return _dns_xml(state)
-        assert "<del_rec><filter><id>7</id>" in packet
+        if "<del_rec>" in packet:
+            assert "<del_rec><filter><id>7</id>" in packet
+            state[:] = []
+            return "<packet><dns><del_rec><result><status>ok</status></result></del_rec></dns></packet>"
         assert "<add_rec><site-id>185</site-id><type>A</type>" in packet
         state[:] = [{"id": 10, "type": "A", "host": "status.example.com", "value": "192.0.2.10"}]
-        return "<packet><dns><del_rec><result><status>ok</status></result></del_rec><add_rec><result><status>ok</status></result></add_rec></dns></packet>"
+        return "<packet><dns><add_rec><result><status>ok</status><id>10</id></result></add_rec></dns></packet>"
 
     monkeypatch.setattr(core, "_xml_agent", xml_agent)
     dry = dns_replace(
@@ -305,7 +308,46 @@ def test_dns_replace_apply_requires_grant_and_verifies_result(monkeypatch):
         pack_id="plesk-dns", pack_version="1", base_url="https://plesk.example.com:8443",
     )
     assert result["ok"] and result["executed"] and result["verified"]
-    assert result["record"]["value"] == "192.0.2.10" and len(packets) == 4
+    assert result["record"]["value"] == "192.0.2.10" and len(packets) == 5
+
+
+def test_dns_replace_compensates_deleted_record_when_add_fails(monkeypatch):
+    reset_default_jti_replay_store()
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_DNS_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "dns-test-secret")
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: "vault-value")
+    state = [{"id": 7, "type": "CNAME", "host": "status.example.com", "value": "old.example.net", "opt": None}]
+
+    def xml_agent(base_url, username, password, packet):
+        if "<get_rec>" in packet:
+            return _dns_xml(state)
+        if "<del_rec>" in packet:
+            state[:] = []
+            return "<packet><dns><del_rec><result><status>ok</status></result></del_rec></dns></packet>"
+        if "<type>A</type>" in packet:
+            return "<packet><dns><add_rec><result><status>error</status><errcode>1019</errcode><errtext>Invalid record</errtext></result></add_rec></dns></packet>"
+        assert "<type>CNAME</type>" in packet and "<value>old.example.net</value>" in packet
+        state[:] = [{"id": 8, "type": "CNAME", "host": "status.example.com", "value": "old.example.net", "opt": None}]
+        return "<packet><dns><add_rec><result><status>ok</status><id>8</id></result></add_rec></dns></packet>"
+
+    monkeypatch.setattr(core, "_xml_agent", xml_agent)
+    dry = dns_replace(site_id=185, host="status.example.com", value="192.0.2.10", base_url="https://plesk.example.com:8443")
+    issued = issue_apply_grant(
+        run_id="dns-rollback", actor="test-actor", intent_pack="plesk-dns@1",
+        plan_hash=dry["plan_hash"], artifact_sha256=dry["artifact_sha256"], target=dry["target"],
+        risk_class="boundary", jti="dns-rollback-once",
+        environ={"APPLY_GRANT_HMAC_SECRET": "dns-test-secret"},
+    )
+    result = dns_replace(
+        site_id=185, host="status.example.com", value="192.0.2.10", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=issued["grant"], actor="test-actor",
+        pack_id="plesk-dns", pack_version="1", base_url="https://plesk.example.com:8443",
+    )
+    assert result["ok"] is False and result["error"] == "plesk_dns_add_failed"
+    assert result["provider_error"] == {"operation": "add_rec", "errcode": "1019", "errtext": "Invalid record"}
+    assert result["rollback_attempted"] is True and result["rollback_ok"] is True
+    assert state[0]["type"] == "CNAME"
 
 
 def _authority(provider="cloudflare", *, consistent=True):
@@ -1041,7 +1083,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.12.2"
+    assert report["version"] == "0.12.3"
 
 
 def test_transport_origin_defaults_to_https():

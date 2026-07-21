@@ -1086,6 +1086,33 @@ def _dns_plan(site_id: int, host: str, record_type: str, value: str, records: li
     return {**body, "changed": bool(delete or add), "plan_hash": digest, "artifact_sha256": digest}
 
 
+def _dns_add_operation(site_id: int, record_type: str, host: str, value: str, opt: str | None = None) -> str:
+    optional = f"<opt>{_xml_escape(opt)}</opt>" if opt else ""
+    return (
+        "<add_rec><site-id>" + str(site_id) + "</site-id><type>" + record_type
+        + "</type><host>" + _xml_escape(host) + "</host><value>"
+        + _xml_escape(value) + "</value>" + optional + "</add_rec>"
+    )
+
+
+def _dns_packet(operations: str) -> str:
+    return f'''<?xml version="1.0" encoding="UTF-8"?><packet><dns>{operations}</dns></packet>'''
+
+
+def _dns_provider_error(raw: str, operation: str) -> dict[str, Any]:
+    """Return bounded Plesk error metadata without reflecting request credentials."""
+    for result in _xml_results(raw, operation):
+        if (result.findtext("status") or "").strip() != "error":
+            continue
+        errtext = re.sub(r"[\x00-\x1f\x7f]+", " ", result.findtext("errtext") or "").strip()
+        return {
+            "operation": operation,
+            "errcode": (result.findtext("errcode") or "").strip() or None,
+            "errtext": errtext[:300] or None,
+        }
+    return {"operation": operation, "errcode": None, "errtext": None}
+
+
 @conn.handler("dns/query/records", isolated=True, meta={"label": "List filtered Plesk DNS records through XML API"})
 def dns_records(
     site_id: int = 0,
@@ -1186,17 +1213,42 @@ def dns_replace(
         if not consumed:
             return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
 
-        operations = "".join(f"<del_rec><filter><id>{record_id}</id></filter></del_rec>" for record_id in plan["delete_record_ids"])
-        if plan["add_record"]:
-            operations += (
-                "<add_rec><site-id>" + str(resolved_site_id) + "</site-id><type>" + wanted_type
-                + "</type><host>" + _xml_escape(wanted_host) + "</host><value>"
-                + _xml_escape(wanted_value) + "</value></add_rec>"
+        deleted_records = [row for row in visible if row["id"] in plan["delete_record_ids"]]
+        if plan["delete_record_ids"]:
+            delete_operations = "".join(
+                f"<del_rec><filter><id>{record_id}</id></filter></del_rec>"
+                for record_id in plan["delete_record_ids"]
             )
-        packet = f'''<?xml version="1.0" encoding="UTF-8"?><packet><dns>{operations}</dns></packet>'''
-        raw = _xml_agent(base_url, username, password, packet)
-        if not _xml_ok(raw):
-            return urirun.fail("plesk_dns_replace_failed", dry_run=False, mutation_attempted=True)
+            raw = _xml_agent(base_url, username, password, _dns_packet(delete_operations))
+            if not _xml_ok(raw):
+                return urirun.fail(
+                    "plesk_dns_delete_failed", dry_run=False, mutation_attempted=True,
+                    provider_error=_dns_provider_error(raw, "del_rec"), rollback_attempted=False,
+                )
+        if plan["add_record"]:
+            raw = _xml_agent(
+                base_url, username, password,
+                _dns_packet(_dns_add_operation(resolved_site_id, wanted_type, wanted_host, wanted_value)),
+            )
+            if not _xml_ok(raw):
+                rollback_attempted = bool(deleted_records)
+                rollback_ok = False
+                if rollback_attempted:
+                    restore_operations = "".join(
+                        _dns_add_operation(
+                            resolved_site_id, row["type"], row["host"], row["value"], row.get("opt"),
+                        )
+                        for row in deleted_records
+                    )
+                    restore_raw = _xml_agent(
+                        base_url, username, password, _dns_packet(restore_operations),
+                    )
+                    rollback_ok = _xml_ok(restore_raw)
+                return urirun.fail(
+                    "plesk_dns_add_failed", dry_run=False, mutation_attempted=True,
+                    provider_error=_dns_provider_error(raw, "add_rec"),
+                    rollback_attempted=rollback_attempted, rollback_ok=rollback_ok,
+                )
         verified_records = _dns_with_credentials(
             site_id=resolved_site_id, base_url=base_url, username=username, password=password,
         )
@@ -3375,7 +3427,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.12.2",
+        "version": "0.12.3",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,

@@ -61,6 +61,10 @@ Local Plesk DNS address records use the reviewed XML API routes
 dry-run by default and removes conflicting A/AAAA/CNAME records only after an exact
 plan hash, signed boundary-risk grant, the global mutation gate and
 `PLESK_DNS_APPLY=1` have all been verified.
+Plesk delete and add calls are executed separately. If the add is rejected after
+deletion, the connector attempts to restore the exact removed records and returns
+bounded provider error metadata plus the rollback outcome; it never reports the
+operation as atomic or verified without the final read-back.
 The `host` boundary accepts either a regular FQDN or one literal leftmost wildcard
 (`*.example.com`). Embedded, bare and multi-label wildcards are rejected; a wildcard
 plan therefore cannot silently expand to or edit sibling DNS objects.
