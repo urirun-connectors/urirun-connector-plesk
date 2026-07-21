@@ -41,6 +41,7 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
 | `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
 | `plesk://host/ftpuser/command/ensure` | rotate system SFTP/FTP password (XML) or ensure additional FTP user; store as `plesk-sftp` / `plesk-ftp` (https origin) |
+| `plesk://host/site/query/remote-inventory` | bounded read-only SFTP listing; ambiguous `/httpdocs` requires a vault `credential_origin` bound to the requested domain |
 | `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |
 | `plesk://host/site/command/sync` | dry-run (default) or apply `www/` → `/httpdocs` tree sync (SFTP preferred, FTP fallback) |
 | `plesk://host/site/command/publish` | alias of `site/command/sync` |

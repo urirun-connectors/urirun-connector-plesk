@@ -103,6 +103,7 @@ def test_remote_inventory_is_bounded_and_does_not_return_credentials(monkeypatch
     monkeypatch.setattr(core, "_sftp_connect", lambda *_args: (Transport(), Sftp(), "sha256:abc"))
     result = site_remote_inventory(
         host="plesk.example.com", domain="example.com", remote_path="/httpdocs", max_entries=1,
+        credential_origin="https://example.com",
     )
     assert result["ok"] and result["entries_total"] == 2 and result["truncated"] is True
     assert result["entries"] == [{"name": "assets", "type": "directory", "bytes": 0, "mode": "755"}]
@@ -117,6 +118,50 @@ def test_remote_inventory_denies_server_root_before_leasing_credentials(monkeypa
     )
     assert result["ok"] is False
     assert result["error"] == "plesk_site_inventory_scope_denied"
+
+
+def test_remote_inventory_denies_ambiguous_httpdocs_before_leasing_credentials(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda *_args: pytest.fail("vault must not be touched"))
+    result = site_remote_inventory(
+        host="plesk.example.com",
+        domain="customer.example.com",
+        remote_path="/httpdocs",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_inventory_scope_unbound"
+    assert result["mutation_attempted"] is False
+
+
+def test_remote_inventory_accepts_domain_bound_chroot_origin(monkeypatch):
+    class Attr:
+        filename = "index.html"
+        st_mode = 0o100644
+        st_size = 10
+
+    class Sftp:
+        def stat(self, _path):
+            return type("Directory", (), {"st_mode": 0o40750})()
+
+        def listdir_attr(self, _path):
+            return [Attr()]
+
+        def close(self):
+            pass
+
+    class Transport:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(core, "_vault_lease", lambda *_args: "leased")
+    monkeypatch.setattr(core, "_sftp_connect", lambda *_args: (Transport(), Sftp(), "sha256:bound"))
+    result = site_remote_inventory(
+        host="plesk.example.com",
+        domain="customer.example.com",
+        remote_path="/httpdocs",
+        credential_origin="https://customer.example.com",
+    )
+    assert result["ok"] is True
+    assert result["entries_total"] == 1
 
 
 def test_bootstrap_leases_admin_login_and_stores_key_without_returning_it(monkeypatch):
@@ -1083,7 +1128,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.12.3"
+    assert report["version"] == "0.12.4"
 
 
 def test_transport_origin_defaults_to_https():

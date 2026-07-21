@@ -427,6 +427,23 @@ def _transport_origin(transport: str, host: str, credential_origin: str = "") ->
     return credential_origin or f"https://{host}"
 
 
+def _inventory_scope_error(host: str, domain: str, remote_path: str, credential_origin: str = "") -> str | None:
+    """Reject an ambiguous chroot root unless the vault origin binds it to the domain.
+
+    ``/httpdocs`` has different meanings for different Plesk subscription users.
+    The SFTP endpoint hostname alone therefore cannot prove which domain the
+    credential opens.  An explicit domain path is self-scoping; the chroot
+    shorthand instead requires the effective vault origin hostname to equal
+    the requested domain.  This check runs before a credential lease.
+    """
+    if remote_path != "/httpdocs":
+        return None
+    origin = urllib.parse.urlparse(_transport_origin("sftp", host, credential_origin))
+    if not origin.hostname or origin.hostname.lower().rstrip(".") != domain.lower().rstrip("."):
+        return "plesk_site_inventory_scope_unbound"
+    return None
+
+
 def _detect_transports(host: str, *, sftp_port: int, ftp_port: int, ftp_tls: bool,
                        sftp_vault_entry_id: str, ftp_vault_entry_id: str,
                        credential_origin: str, host_fingerprint: str, vault_url: str) -> list[dict[str, Any]]:
@@ -2432,6 +2449,16 @@ def site_remote_inventory(
     )
     if not any(remote_path == root or remote_path.startswith(f"{root}/") for root in allowed_roots):
         return urirun.fail("plesk_site_inventory_scope_denied")
+    scope_error = _inventory_scope_error(host, site_domain, remote_path, credential_origin)
+    if scope_error:
+        return urirun.fail(
+            scope_error,
+            host=host,
+            domain=site_domain,
+            remote_path=remote_path,
+            mutation_attempted=False,
+            note="Use an explicit domain path or a vault credential_origin whose hostname equals domain.",
+        )
     bad_port = _validate_port(sftp_port)
     if bad_port:
         return urirun.fail(bad_port)
@@ -3427,7 +3454,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.12.3",
+        "version": "0.12.4",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,
