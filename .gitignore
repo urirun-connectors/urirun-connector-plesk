@@ -5,3 +5,8 @@ dist/
 build/
 .venv/
 .urirun/
+
+# koru runtime artefacts (generated)
+.planfile/.koru/
+.koru/
+.planfile/sprints/*.bak-*
