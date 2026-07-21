@@ -1,6 +1,6 @@
 # urirun-connector-plesk
 
-Secure Plesk REST API v2 connector for `urirun`. Administrator credentials and
+Secure multi-transport Plesk connector for `urirun`. Administrator credentials and
 generated API keys never appear in URI payloads, results, or logs.
 
 ## Development
@@ -28,6 +28,10 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/auth/query/acquisition-methods` | describe safe acquisition without returning credentials |
 | `plesk://host/auth/query/scopes` | probe and return credential scope evidence by handle |
 | `plesk://host/auth/query/status` | validate the stored API key |
+| `plesk://host/extensions/query/catalog` | discover installed extensions with the administrator XML API |
+| `plesk://host/extensions/query/capabilities` | join installed extensions with reviewed executable profiles |
+| `plesk://host/extension/query/call` | invoke a profiled read-only extension XML operation |
+| `plesk://host/extension/command/call` | dry-run or execute a profiled extension mutation with gates and a signed grant |
 | `plesk://host/subscription/query/capabilities` | verify customer authorization and domain capacity before planning a site |
 | `plesk://host/domain/command/ensure` | dry-run or idempotently add a domain under an existing subscription |
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
@@ -46,6 +50,31 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/site/command/subdomain-ensure` | idempotent subdomain create under parent webspace (XML; no DNS) |
 | `plesk://host/site/command/ssl-ensure` | ensure origin TLS covers hostname (probe / assign / panel PEM / SSL It LE) |
 | `plesk://host/doctor/query/report` | connector readiness (`ssl_ensure`, `letsencrypt`, `publish_verify`, staging note) |
+
+## Dynamic extension model
+
+Plesk extensions are runtime objects, not hard-coded connector routes. The connector
+discovers their `id`, name, version, release and active state through the official XML
+`extension.get` operator. Discovery does not grant authority. The checked-in
+`extension_profiles.json` is the policy boundary that maps a known extension operation
+to an effect, risk class and transport.
+
+- Unknown installed extensions are returned as `discovery-only`.
+- XML calls are built from validated identifiers and scalar arguments; callers cannot
+  submit raw XML or shell commands.
+- Mutations are dry-run by default and require `AUTONOMY_MUTATIONS_ENABLED=1` (or a
+  live mutate lease), `PLESK_EXTENSION_APPLY=1`, an exact `plan_hash`, and a signed,
+  single-use apply grant with the profile's risk class.
+- An extension-backed GUI feature can delegate to an existing stable URI process. The
+  `sslit/certificate-ensure` profile delegates to
+  `plesk://host/site/command/ssl-ensure` instead of calling private panel endpoints.
+- Root SSH is a separate future transport. Subscription SFTP credentials are never
+  promoted into Plesk administrator CLI authority.
+
+This separation means installing a new extension immediately changes discovery, while
+making it executable remains an explicit, reviewable profile change.
+The full transport and lifecycle design is in
+[`docs/EXTENSION_CAPABILITY_MODEL.md`](docs/EXTENSION_CAPABILITY_MODEL.md).
 
 `domain/command/ensure` is dry-run by default. A real add requires
 `apply=true`, `AUTONOMY_MUTATIONS_ENABLED=1`, and `PLESK_DOMAIN_APPLY=1`.

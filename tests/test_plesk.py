@@ -21,6 +21,10 @@ from urirun_connector_plesk import (
     ensure_ssl,
     ensure_subdomain,
     ensure_domain,
+    extension_capabilities,
+    extension_catalog,
+    extension_command,
+    extension_query,
     subscription_capabilities,
     site_publish,
     site_sync,
@@ -39,6 +43,10 @@ ROUTES = {
     "plesk://host/auth/query/acquisition-methods",
     "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
+    "plesk://host/extensions/query/catalog",
+    "plesk://host/extensions/query/capabilities",
+    "plesk://host/extension/query/call",
+    "plesk://host/extension/command/call",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
     "plesk://host/mailbox/command/create",
@@ -114,6 +122,145 @@ def test_manifest_routes_match_runtime_bindings():
         "bootstrapRoute": "plesk://host/auth/command/bootstrap-api-key",
         "secretValueVisible": False,
     }
+
+
+def _extensions_xml():
+    return """<packet><extension><get>
+      <result><status>ok</status><details><id>git</id><name>Git Manager</name><version>1.2.3</version><release>42</release><active>true</active></details></result>
+      <result><status>ok</status><details><id>third-party</id><name>Third Party</name><version>2.0</version><release>7</release><active>true</active></details></result>
+      <result><status>ok</status><details><id>sslit</id><name>SSL It!</name><version>1.0</version><release>8</release><active>true</active></details></result>
+    </get></extension></packet>"""
+
+
+def test_extension_catalog_discovers_runtime_objects_without_granting_unknown_operations(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": "vault-value")
+    monkeypatch.setattr(core, "_xml_agent", lambda *args: _extensions_xml())
+
+    inventory = extension_catalog(base_url="https://plesk.example.com:8443")
+    capabilities = extension_capabilities(base_url="https://plesk.example.com:8443")
+
+    assert inventory["ok"] and inventory["installed"] == 3
+    assert capabilities["ok"] and capabilities["profiled"] == 2
+    assert capabilities["unknown"] == ["third-party"]
+    unknown = next(item for item in capabilities["extensions"] if item["id"] == "third-party")
+    assert unknown["execution_policy"] == "discovery-only" and unknown["operations"] == []
+    sslit = next(item for item in capabilities["extensions"] if item["id"] == "sslit")
+    assert sslit["operations"][0]["uri"] == "plesk://host/site/command/ssl-ensure"
+    assert "vault-value" not in json.dumps({"inventory": inventory, "capabilities": capabilities})
+
+
+def test_profiled_extension_query_builds_structured_xml_and_redacts_output(monkeypatch):
+    sent = {}
+    monkeypatch.setattr(core, "_installed_extension", lambda *args, **kwargs: {"id": "git", "active": True})
+
+    def fake_admin_xml(**kwargs):
+        sent["packet"] = kwargs["packet"]
+        return """<packet><extension><call><result><status>ok</status><git><get><repository><name>repo</name><password>nope</password></repository></get></git></result></call></extension></packet>"""
+
+    monkeypatch.setattr(core, "_admin_xml", fake_admin_xml)
+    result = extension_query(
+        extension_id="git",
+        operation="get",
+        arguments={"domain": "example.com<unsafe"},
+        base_url="https://plesk.example.com:8443",
+    )
+    assert result["ok"] and result["executed"] and not result["mutation_attempted"]
+    assert "<domain>example.com&lt;unsafe</domain>" in sent["packet"]
+    assert result["data"]["git"]["get"]["repository"]["password"] == "[REDACTED]"
+    assert "nope" not in json.dumps(result)
+
+
+def test_extension_query_rejects_unprofiled_operation_and_unknown_arguments(monkeypatch):
+    monkeypatch.setattr(core, "_installed_extension", lambda *args, **kwargs: {"id": "git", "active": True})
+    unknown = extension_query(
+        extension_id="git", operation="status", base_url="https://plesk.example.com:8443",
+    )
+    injected = extension_query(
+        extension_id="git", operation="get", arguments={"raw_xml": "<remove/>"},
+        base_url="https://plesk.example.com:8443",
+    )
+    assert not unknown["ok"] and "not_profiled" in unknown["error"]
+    assert not injected["ok"] and "arguments_not_allowed" in injected["error"]
+
+
+def test_extension_command_is_dry_run_and_delegates_sslit_to_canonical_uri():
+    git = extension_command(
+        extension_id="git",
+        operation="remove",
+        arguments={"domain": "example.com", "name": "repo"},
+        base_url="https://plesk.example.com:8443",
+    )
+    sslit = extension_command(
+        extension_id="sslit",
+        operation="certificate-ensure",
+        arguments={"hostname": "founder.subactor.com"},
+        base_url="https://plesk.example.com:8443",
+    )
+    assert git["ok"] and git["dry_run"] and not git["executed"]
+    assert len(git["plan_hash"]) == 64 and git["plan"]["risk_class"] == "boundary"
+    assert sslit["ok"] and sslit["delegated_to"] == "plesk://host/site/command/ssl-ensure"
+
+
+def test_extension_command_apply_fails_closed_before_credentials(monkeypatch):
+    monkeypatch.delenv("AUTONOMY_MUTATIONS_ENABLED", raising=False)
+    monkeypatch.delenv("PLESK_EXTENSION_APPLY", raising=False)
+    dry = extension_command(
+        extension_id="git",
+        operation="remove",
+        arguments={"domain": "example.com", "name": "repo"},
+        base_url="https://plesk.example.com:8443",
+    )
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no lease")))
+    denied = extension_command(
+        extension_id="git",
+        operation="remove",
+        arguments={"domain": "example.com", "name": "repo"},
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        base_url="https://plesk.example.com:8443",
+    )
+    assert not denied["ok"] and denied["error"] == "autonomy_mutations_disabled"
+    assert denied["mutation_attempted"] is False
+
+
+def test_extension_command_requires_exact_boundary_grant_and_consumes_it_once(monkeypatch):
+    reset_default_jti_replay_store()
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_EXTENSION_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "extension-test-secret")
+    arguments = {"domain": "example.com", "name": "repo"}
+    dry = extension_command(
+        extension_id="git", operation="remove", arguments=arguments,
+        base_url="https://plesk.example.com:8443",
+    )
+    issued = issue_apply_grant(
+        run_id="extension-run",
+        actor="test-actor",
+        intent_pack="plesk-extension@1",
+        plan_hash=dry["plan_hash"],
+        artifact_sha256=dry["artifact_sha256"],
+        target=dry["target"],
+        risk_class="boundary",
+        jti="extension-once",
+        environ={"APPLY_GRANT_HMAC_SECRET": "extension-test-secret"},
+    )
+    assert issued["ok"]
+    monkeypatch.setattr(core, "_installed_extension", lambda *args, **kwargs: {"id": "git", "active": True})
+    monkeypatch.setattr(
+        core,
+        "_admin_xml",
+        lambda **kwargs: "<packet><extension><call><result><status>ok</status><git><remove/></git></result></call></extension></packet>",
+    )
+    payload = dict(
+        extension_id="git", operation="remove", arguments=arguments, apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=issued["grant"], actor="test-actor",
+        pack_id="plesk-extension", pack_version="1",
+        base_url="https://plesk.example.com:8443",
+    )
+    first = extension_command(**payload)
+    second = extension_command(**payload)
+    assert first["ok"] and first["executed"] and first["verified"]
+    assert not second["ok"] and second["error"] == "apply_grant_replay"
 
 
 def test_query_uses_api_key_and_redacts_sensitive_fields(monkeypatch):
@@ -552,7 +699,9 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert "panel_upload_pem" in report["capabilities"]["ssl_ensure"]["strategies"]
     assert report["capabilities"]["letsencrypt"]["available"] is False
     assert report["capabilities"]["certificate_assign"] is True
-    assert report["version"] == "0.9.0"
+    assert report["capabilities"]["extensions"]["available"] is True
+    assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
+    assert report["version"] == "0.10.0"
 
 
 def test_transport_origin_defaults_to_https():

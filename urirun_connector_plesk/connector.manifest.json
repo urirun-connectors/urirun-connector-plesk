@@ -1,32 +1,36 @@
 {
   "id": "plesk",
   "name": "Plesk",
+  "version": "0.10.0",
   "status": "available",
   "category": "Infrastructure",
-  "summary": "Manage Plesk through vault-backed REST API v2 URI processes.",
-  "description": "The connector exchanges a vault-held Plesk administrator login for a REST API key, immediately stores the generated key in the vault, and uses X-API-Key for later autonomous operations. Credentials are never accepted in URI payloads or returned in results.",
+  "summary": "Manage Plesk through vault-backed REST, XML, SFTP and profiled extension URI processes.",
+  "description": "The connector discovers installed Plesk extensions through the official XML extension operator and joins them with reviewed operation profiles. Unknown extensions remain visible but non-executable. Credentials are never accepted in URI payloads or returned in results.",
   "useCases": [
     "Bootstrap a Plesk REST API key without exposing administrator credentials.",
     "Read domains, clients, subscriptions, and other Plesk API resources.",
-    "Execute authorized Plesk API changes through auditable URI processes."
+    "Execute authorized Plesk API changes through auditable URI processes.",
+    "Discover installed Plesk extensions and route only reviewed operations."
   ],
   "flowExample": [
     "plesk://host/auth/command/bootstrap-api-key",
     "plesk://host/auth/query/acquisition-methods",
     "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
+    "plesk://host/extensions/query/catalog",
+    "plesk://host/extensions/query/capabilities",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
     "plesk://host/api/query/request"
   ],
   "requires": [
     "python>=3.10",
-    "Plesk Obsidian REST API v2",
+    "Plesk Obsidian REST API v2 and XML API 1.6.8+",
     "urirun credential vault"
   ],
   "install": {
     "mode": "urirun-extra",
-    "pipSpec": "urirun-connector-plesk @ git+https://github.com/urirun-connectors/urirun-connector-plesk.git@v0.4.0"
+    "pipSpec": "urirun-connector-plesk @ git+https://github.com/urirun-connectors/urirun-connector-plesk.git@v0.10.0"
   },
   "provenance": "verified",
   "publisher": {
@@ -35,7 +39,7 @@
     "github": "https://github.com/urirun-connectors"
   },
   "docsUrl": "https://github.com/urirun-connectors/urirun-connector-plesk",
-  "keywords": ["plesk", "hosting", "domains", "mail", "rest-api", "vault"],
+  "keywords": ["plesk", "hosting", "domains", "mail", "rest-api", "xml-api", "extensions", "vault"],
   "uriSchemes": ["plesk"],
   "authConformance": {
     "schema": "subactor.connector-auth-status/v1",
@@ -52,6 +56,10 @@
     "plesk://host/auth/query/acquisition-methods",
     "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
+    "plesk://host/extensions/query/catalog",
+    "plesk://host/extensions/query/capabilities",
+    "plesk://host/extension/query/call",
+    "plesk://host/extension/command/call",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
     "plesk://host/mailbox/command/create",

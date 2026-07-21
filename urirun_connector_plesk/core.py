@@ -43,6 +43,15 @@ from .apply_grant import (
     verify_apply_grant,
 )
 from .timeouts import transport_timeouts
+from .extensions import (
+    extension_call_packet,
+    extension_capability_catalog,
+    extension_inventory_packet,
+    extension_operation_plan,
+    load_extension_profiles,
+    parse_extension_call,
+    parse_extension_inventory,
+)
 
 try:  # paramiko ships in urirun-node image (PR6); keep importable if extra absent in lab
     import paramiko
@@ -708,6 +717,214 @@ def _xml_agent(base_url: str, username: str, password: str, packet: str) -> str:
             return response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError, urllib.error.HTTPError) as error:
         raise RuntimeError("plesk_xml_transport_failed") from error
+
+
+def _admin_xml(
+    *, base_url: str, packet: str, admin_vault_entry_id: str, vault_url: str,
+) -> str:
+    """Run an administrator-only XML API packet with vault-leased credentials."""
+    origin = _base_url(base_url)
+    username = password = ""
+    try:
+        username = _vault_lease(admin_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(admin_vault_entry_id, origin, "password", vault_url)
+        return _xml_agent(base_url, username, password, packet)
+    finally:
+        username = password = ""
+
+
+def _installed_extension(
+    extension_id: str, *, base_url: str, admin_vault_entry_id: str, vault_url: str,
+) -> dict[str, Any]:
+    raw = _admin_xml(
+        base_url=base_url,
+        packet=extension_inventory_packet(extension_id),
+        admin_vault_entry_id=admin_vault_entry_id,
+        vault_url=vault_url,
+    )
+    rows = parse_extension_inventory(raw)
+    if not rows:
+        raise RuntimeError("plesk_extension_not_installed")
+    if not rows[0]["active"]:
+        raise RuntimeError("plesk_extension_inactive")
+    return rows[0]
+
+
+@conn.handler("extensions/query/catalog", isolated=True, meta={"label": "Discover installed Plesk extensions"})
+def extension_catalog(
+    extension_id: str = "",
+    base_url: str = "",
+    admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    try:
+        raw = _admin_xml(
+            base_url=base_url,
+            packet=extension_inventory_packet(extension_id.strip().lower()),
+            admin_vault_entry_id=admin_vault_entry_id,
+            vault_url=vault_url,
+        )
+        extensions = parse_extension_inventory(raw)
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    return urirun.ok(
+        schema="urirun.plesk-extension-inventory/v1",
+        extensions=extensions,
+        installed=len(extensions),
+        authority="plesk-administrator",
+        source="xml-api:extension.get",
+    )
+
+
+@conn.handler("extensions/query/capabilities", isolated=True, meta={"label": "Join installed Plesk extensions with executable profiles"})
+def extension_capabilities(
+    base_url: str = "",
+    admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    inventory = extension_catalog(
+        base_url=base_url,
+        admin_vault_entry_id=admin_vault_entry_id,
+        vault_url=vault_url,
+    )
+    if not inventory.get("ok"):
+        return inventory
+    return urirun.ok(**extension_capability_catalog(inventory["extensions"]))
+
+
+@conn.handler("extension/query/call", isolated=True, meta={"label": "Call a profiled read-only Plesk extension operation"})
+def extension_query(
+    extension_id: str = "",
+    operation: str = "",
+    arguments: Any = None,
+    base_url: str = "",
+    admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    extension_id = extension_id.strip().lower()
+    operation = operation.strip().lower()
+    try:
+        packet, spec = extension_call_packet(extension_id, operation, arguments, effect="query")
+        installed = _installed_extension(
+            extension_id,
+            base_url=base_url,
+            admin_vault_entry_id=admin_vault_entry_id,
+            vault_url=vault_url,
+        )
+        raw = _admin_xml(
+            base_url=base_url,
+            packet=packet,
+            admin_vault_entry_id=admin_vault_entry_id,
+            vault_url=vault_url,
+        )
+        data = parse_extension_call(raw)
+    except RuntimeError as error:
+        return urirun.fail(str(error))
+    return urirun.ok(
+        extension=installed,
+        operation=operation,
+        transport=spec["transport"],
+        data=data,
+        executed=True,
+        mutation_attempted=False,
+    )
+
+
+@conn.handler("extension/command/call", isolated=True, meta={"label": "Plan or execute a profiled Plesk extension mutation"})
+def extension_command(
+    extension_id: str = "",
+    operation: str = "",
+    arguments: Any = None,
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    base_url: str = "",
+    admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    extension_id = extension_id.strip().lower()
+    operation = operation.strip().lower()
+    try:
+        plan, spec = extension_operation_plan(extension_id, operation, arguments)
+        origin = _base_url(base_url)
+    except RuntimeError as error:
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
+    target = f"{origin}|extension:{extension_id}:{operation}"
+    delegated_to = spec.get("uri") if spec.get("transport") == "uri-process" else None
+    if not apply:
+        return urirun.ok(
+            dry_run=True,
+            executed=False,
+            mutation_attempted=False,
+            target=target,
+            plan=plan,
+            plan_hash=plan["plan_hash"],
+            artifact_sha256=plan["artifact_sha256"],
+            delegated_to=delegated_to,
+        )
+    if delegated_to or spec.get("callable") is not True or spec.get("transport") != "xml-extension":
+        return urirun.fail(
+            "plesk_extension_operation_delegated",
+            dry_run=False,
+            mutation_attempted=False,
+            delegated_to=delegated_to,
+        )
+    if plan_hash.strip().lower() != plan["plan_hash"]:
+        return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+    if not autonomy_mutations_enabled() and not mutate_lease_active():
+        return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+    if os.environ.get("PLESK_EXTENSION_APPLY", "").strip() != "1":
+        return urirun.fail("plesk_extension_apply_required", dry_run=False, mutation_attempted=False)
+    ok, error, claims = verify_apply_grant(
+        apply_grant,
+        plan_hash=plan["plan_hash"],
+        target=target,
+        actor=actor,
+        intent_pack=format_intent_pack(pack_id, pack_version),
+        artifact_sha256=plan["artifact_sha256"],
+    )
+    if not ok or not claims:
+        return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+    if claims.get("risk_class") != spec.get("risk_class"):
+        return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+    try:
+        installed = _installed_extension(
+            extension_id,
+            base_url=base_url,
+            admin_vault_entry_id=admin_vault_entry_id,
+            vault_url=vault_url,
+        )
+        packet, _ = extension_call_packet(extension_id, operation, arguments, effect="command")
+    except RuntimeError as preflight_error:
+        return urirun.fail(str(preflight_error), dry_run=False, mutation_attempted=False)
+    consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+    if not consumed:
+        return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
+    try:
+        raw = _admin_xml(
+            base_url=base_url,
+            packet=packet,
+            admin_vault_entry_id=admin_vault_entry_id,
+            vault_url=vault_url,
+        )
+        data = parse_extension_call(raw)
+    except RuntimeError as call_error:
+        return urirun.fail(str(call_error), dry_run=False, mutation_attempted=True)
+    return urirun.ok(
+        extension=installed,
+        operation=operation,
+        transport=spec["transport"],
+        data=data,
+        dry_run=False,
+        executed=True,
+        mutation_attempted=True,
+        verified=True,
+        plan_hash=plan["plan_hash"],
+        grant_jti=claims["jti"],
+    )
 
 
 def _xml_ok(raw: str) -> bool:
@@ -2560,7 +2777,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.9.0",
+        "version": "0.10.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,
@@ -2572,6 +2789,12 @@ def doctor() -> dict[str, Any]:
             "total": budgets.total,
         },
         "staging_domain_recommendation": "docs-stage.subactor.com",
+        "extension_model": {
+            "schema": load_extension_profiles()["schema"],
+            "discovery": "xml-api:extension.get",
+            "execution_policy": "profiled-only",
+            "catalog_uri": "plesk://host/extensions/query/capabilities",
+        },
         "note": None if ready else "SFTP/paramiko missing — blocks production publish readiness",
     }
 

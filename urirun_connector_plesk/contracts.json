@@ -327,6 +327,42 @@
         }
       ]
     },
+    "extensions/query/catalog": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"extension_id": "?str", "base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"schema": "str", "extensions": "list", "installed": "int", "authority": "str", "source": "str"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {}, "result": {"ok": true, "schema": "urirun.plesk-extension-inventory/v1", "extensions": [], "installed": 0, "authority": "plesk-administrator", "source": "xml-api:extension.get"}}]
+    },
+    "extensions/query/capabilities": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"schema": "str", "extensions": "list", "installed": "int", "profiled": "int", "unknown": "list"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": []
+    },
+    "extension/query/call": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"extension_id": "str", "operation": "str", "arguments": "?dict", "base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"extension": "dict", "operation": "str", "transport": "str", "data": "any", "executed": "bool", "mutation_attempted": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"extension_id": "git", "operation": "get", "arguments": {"domain": "example.com"}}, "result": {"ok": true, "extension": {"id": "git", "active": true}, "operation": "get", "transport": "xml-extension", "data": {}, "executed": true, "mutation_attempted": false}}]
+    },
+    "extension/command/call": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false,
+      "inp": {"extension_id": "str", "operation": "str", "arguments": "?dict", "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str", "pack_id": "?str", "pack_version": "?str", "base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
+      "out": {"dry_run": "bool", "executed": "bool", "mutation_attempted": "bool", "target": "?str", "plan": "?dict", "plan_hash": "?str", "artifact_sha256": "?str", "delegated_to": "?str"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": []
+    },
     "doctor/query/report": {
       "version": "v1",
       "effect": "query",
@@ -335,7 +371,7 @@
       "out": {"connector": "str", "version": "str", "status": "str"},
       "errors": [],
       "examples": [
-        {"payload": {}, "result": {"ok": true, "connector": "plesk", "version": "0.2.0", "status": "ready"}}
+        {"payload": {}, "result": {"ok": true, "connector": "plesk", "version": "0.10.0", "status": "ready"}}
       ]
     }
   },

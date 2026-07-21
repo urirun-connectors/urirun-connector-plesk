@@ -96,6 +96,14 @@ def build_capabilities(
             ),
         },
         "certificate_assign": True,
+        "extensions": {
+            "available": True,
+            "detail": "xml_extension_get; profiled_execution_only",
+            "discovery_route": "plesk://host/extensions/query/catalog",
+            "capability_route": "plesk://host/extensions/query/capabilities",
+            "query_route": "plesk://host/extension/query/call",
+            "command_route": "plesk://host/extension/command/call",
+        },
     }
 
 

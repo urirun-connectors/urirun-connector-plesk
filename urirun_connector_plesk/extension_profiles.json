@@ -1,0 +1,40 @@
+{
+  "schema": "urirun.plesk-extension-profiles/v1",
+  "extensions": {
+    "git": {
+      "label": "Git Manager",
+      "operations": {
+        "get": {
+          "effect": "query",
+          "risk_class": "read_only",
+          "transport": "xml-extension",
+          "callable": true,
+          "arguments": ["domain"],
+          "required": []
+        },
+        "remove": {
+          "effect": "command",
+          "risk_class": "boundary",
+          "transport": "xml-extension",
+          "callable": true,
+          "arguments": ["domain", "name"],
+          "required": ["domain", "name"]
+        }
+      }
+    },
+    "sslit": {
+      "label": "SSL It!",
+      "operations": {
+        "certificate-ensure": {
+          "effect": "command",
+          "risk_class": "boundary",
+          "transport": "uri-process",
+          "callable": false,
+          "uri": "plesk://host/site/command/ssl-ensure",
+          "arguments": ["hostname", "origin_ip", "certificate_name", "provider", "apply"],
+          "required": ["hostname"]
+        }
+      }
+    }
+  }
+}
