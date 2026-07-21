@@ -519,7 +519,7 @@ def test_ensure_subdomain_idempotent_when_exists(monkeypatch):
     assert len(calls) == 1
 
 
-def test_ensure_subdomain_adds_when_missing(monkeypatch):
+def test_ensure_subdomain_is_dry_run_when_missing(monkeypatch):
     calls = []
 
     def fake_lease(entry, origin, field, vault_url=""):
@@ -544,9 +544,45 @@ def test_ensure_subdomain_adds_when_missing(monkeypatch):
         subdomain="docs-stage",
         base_url="https://prototypowanie.pl:8443",
     )
-    assert result["ok"] and result["created"] is True and result["subdomain_id"] == 310
+    assert result["ok"] and result["created"] is False and result["dry_run"] is True
     assert result["www_root"] == "docs-stage.subactor.com"
-    assert any("<parent>subactor.com</parent>" in c for c in calls)
+    assert len(calls) == 1 and len(result["plan_hash"]) == 64
+
+
+def test_ensure_subdomain_apply_requires_grant_and_verifies(monkeypatch):
+    reset_default_jti_replay_store()
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_SUBDOMAIN_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "subdomain-test-secret")
+    monkeypatch.setattr(core, "_vault_lease", lambda *args, **kwargs: "vault-value")
+    exists = {"value": False}
+
+    def fake_xml(base_url, username, password, packet):
+        compact = packet.replace("\n", "").replace(" ", "")
+        if "<subdomain><get>" in compact:
+            if exists["value"]:
+                return "<packet><subdomain><get><result><status>ok</status><id>310</id></result></get></subdomain></packet>"
+            return "<packet><subdomain><get><result><status>error</status></result></get></subdomain></packet>"
+        assert "<subdomain><add>" in compact
+        exists["value"] = True
+        return "<packet><subdomain><add><result><status>ok</status><id>310</id></result></add></subdomain></packet>"
+
+    monkeypatch.setattr(core, "_xml_agent", fake_xml)
+    dry = ensure_subdomain(
+        parent_domain="subactor.com", subdomain="docs-stage", base_url="https://prototypowanie.pl:8443",
+    )
+    issued = issue_apply_grant(
+        run_id="subdomain-run", actor="test-actor", intent_pack="plesk-subdomain@1",
+        plan_hash=dry["plan_hash"], artifact_sha256=dry["artifact_sha256"], target=dry["target"],
+        risk_class="boundary", jti="subdomain-once",
+        environ={"APPLY_GRANT_HMAC_SECRET": "subdomain-test-secret"},
+    )
+    result = ensure_subdomain(
+        parent_domain="subactor.com", subdomain="docs-stage", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=issued["grant"], actor="test-actor",
+        pack_id="plesk-subdomain", pack_version="1", base_url="https://prototypowanie.pl:8443",
+    )
+    assert result["ok"] and result["created"] and result["verified"] and result["subdomain_id"] == 310
 
 
 def _subscription_xml(limit="10", permission="true"):
@@ -805,7 +841,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.11.0"
+    assert report["version"] == "0.11.1"
 
 
 def test_transport_origin_defaults_to_https():

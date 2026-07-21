@@ -275,6 +275,12 @@
         "parent_domain": "str",
         "subdomain": "str",
         "www_root": "?str",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
         "base_url": "?str",
         "subscription_vault_entry_id": "?str",
         "vault_url": "?str"

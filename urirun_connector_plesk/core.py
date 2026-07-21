@@ -1829,11 +1829,17 @@ def ensure_subdomain(
     parent_domain: str = "",
     subdomain: str = "",
     www_root: str = "",
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
     base_url: str = "",
     subscription_vault_entry_id: str = "plesk-subscription",
     vault_url: str = "",
 ) -> dict[str, Any]:
-    """Ensure ``subdomain.parent_domain`` exists (XML ``subdomain.add``; ok if already present).
+    """Plan or ensure ``subdomain.parent_domain`` exists through XML ``subdomain.add``.
 
     Does not mutate DNS. Used so docs.subactor.com can be created without ad-hoc scripts.
     """
@@ -1847,9 +1853,26 @@ def ensure_subdomain(
     if not re.fullmatch(r"[A-Za-z0-9_./-]+", root) or ".." in root:
         return urirun.fail("plesk_subdomain_www_root_invalid")
     fqdn = f"{label}.{parent}"
-    cust_user = cust_pass = ""
     try:
         origin_api = _base_url(base_url)
+    except RuntimeError as error:
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
+    plan_body = {
+        "schema": "urirun.plesk-subdomain-ensure-plan/v1",
+        "parent_domain": parent,
+        "subdomain": fqdn,
+        "www_root": root,
+        "risk_class": "boundary",
+    }
+    digest = hashlib.sha256(json.dumps(plan_body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    plan = {**plan_body, "plan_hash": digest, "artifact_sha256": digest}
+    target = f"{origin_api}|subdomain:{fqdn}"
+    if apply and not autonomy_mutations_enabled() and not mutate_lease_active():
+        return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+    if apply and os.environ.get("PLESK_SUBDOMAIN_APPLY", "").strip() != "1":
+        return urirun.fail("plesk_subdomain_apply_required", dry_run=False, mutation_attempted=False)
+    cust_user = cust_pass = ""
+    try:
         cust_user = _vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url)
         cust_pass = _vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url)
         get_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -1868,7 +1891,31 @@ def ensure_subdomain(
                 parent_domain=parent,
                 www_root=root,
                 subdomain_id=int(id_match.group(1)) if id_match else None,
+                dry_run=not apply,
+                executed=False,
+                mutation_attempted=False,
+                target=target,
+                plan_hash=plan["plan_hash"],
             )
+        if not apply:
+            return urirun.ok(
+                created=False, existed=False, subdomain=fqdn, parent_domain=parent, www_root=root,
+                dry_run=True, executed=False, mutation_attempted=False, target=target,
+                plan=plan, plan_hash=plan["plan_hash"], artifact_sha256=plan["artifact_sha256"],
+            )
+        if plan_hash.strip().lower() != plan["plan_hash"]:
+            return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+        ok, error, claims = verify_apply_grant(
+            apply_grant, plan_hash=plan["plan_hash"], target=target, actor=actor,
+            intent_pack=format_intent_pack(pack_id, pack_version), artifact_sha256=plan["artifact_sha256"],
+        )
+        if not ok or not claims:
+            return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+        if claims.get("risk_class") != "boundary":
+            return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+        consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+        if not consumed:
+            return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
         add_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
 <packet>
   <subdomain>
@@ -1893,16 +1940,26 @@ def ensure_subdomain(
                 )
             return urirun.fail("plesk_subdomain_add_failed", detail=raw[:400])
         id_match = re.search(r"<id>(\d+)</id>", raw)
+        verified_raw = _xml_agent(base_url, cust_user, cust_pass, get_packet)
+        verified_match = re.search(r"<id>(\d+)</id>", verified_raw) if _xml_ok(verified_raw) else None
+        if not verified_match:
+            return urirun.fail("plesk_subdomain_verification_failed", dry_run=False, mutation_attempted=True)
         return urirun.ok(
             created=True,
             existed=False,
             subdomain=fqdn,
             parent_domain=parent,
             www_root=root,
-            subdomain_id=int(id_match.group(1)) if id_match else None,
+            subdomain_id=int(verified_match.group(1)),
+            dry_run=False,
+            executed=True,
+            mutation_attempted=True,
+            verified=True,
+            plan_hash=plan["plan_hash"],
+            grant_jti=claims["jti"],
         )
     except RuntimeError as error:
-        return urirun.fail(str(error))
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
     finally:
         cust_user = cust_pass = ""
 
@@ -3021,7 +3078,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.11.0",
+        "version": "0.11.1",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,

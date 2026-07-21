@@ -59,6 +59,10 @@ dry-run by default and removes conflicting A/AAAA/CNAME records only after an ex
 plan hash, signed boundary-risk grant, the global mutation gate and
 `PLESK_DNS_APPLY=1` have all been verified.
 
+Subdomain creation follows the same fail-closed lifecycle through
+`plesk://host/site/command/subdomain-ensure`: default dry-run, exact plan hash,
+single-use boundary grant and `PLESK_SUBDOMAIN_APPLY=1`.
+
 Plesk extensions are runtime objects, not hard-coded connector routes. The connector
 discovers their `id`, name, version, release and active state through the official XML
 `extension.get` operator. Discovery does not grant authority. The checked-in
