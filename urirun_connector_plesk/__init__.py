@@ -4,7 +4,7 @@ from .core import (
     extension_capabilities, extension_catalog, extension_command, extension_query,
     dns_records, dns_replace, ensure_domain, subscription_capabilities,
     publish_verify, release_activate, release_current, release_rollback, release_upload,
-    release_verify, site_methods, site_publish, site_sync, urirun_bindings,
+    release_verify, site_methods, site_publish, site_remote_inventory, site_sync, urirun_bindings,
 )
 
 __all__ = [
@@ -14,5 +14,5 @@ __all__ = [
     "ensure_subdomain", "connector_manifest", "doctor", "main", "publish_verify",
     "dns_records", "dns_replace", "ensure_domain", "subscription_capabilities",
     "release_activate", "release_current", "release_rollback", "release_upload",
-    "release_verify", "site_methods", "site_publish", "site_sync", "urirun_bindings",
+    "release_verify", "site_methods", "site_publish", "site_remote_inventory", "site_sync", "urirun_bindings",
 ]

@@ -29,6 +29,7 @@ from urirun_connector_plesk import (
     extension_query,
     subscription_capabilities,
     site_publish,
+    site_remote_inventory,
     site_sync,
     urirun_bindings,
 )
@@ -66,8 +67,50 @@ ROUTES = {
     "plesk://host/site/command/release-rollback",
     "plesk://host/site/query/release-current",
     "plesk://host/site/query/methods",
+    "plesk://host/site/query/remote-inventory",
     "plesk://host/doctor/query/report",
 }
+
+
+def test_remote_inventory_is_bounded_and_does_not_return_credentials(monkeypatch):
+    class Attr:
+        def __init__(self, filename, mode, size=0):
+            self.filename, self.st_mode, self.st_size = filename, mode, size
+
+    class Sftp:
+        def stat(self, path):
+            assert path == "/httpdocs"
+            return Attr("httpdocs", 0o40755)
+
+        def listdir_attr(self, path):
+            assert path == "/httpdocs"
+            return [Attr("index.html", 0o100644, 123), Attr("assets", 0o40755)]
+
+        def close(self):
+            pass
+
+    class Transport:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(core, "_vault_lease", lambda _entry, _origin, field, _vault: {"username": "u", "password": "p"}[field])
+    monkeypatch.setattr(core, "_sftp_connect", lambda *_args: (Transport(), Sftp(), "sha256:abc"))
+    result = site_remote_inventory(
+        host="plesk.example.com", domain="example.com", remote_path="/httpdocs", max_entries=1,
+    )
+    assert result["ok"] and result["entries_total"] == 2 and result["truncated"] is True
+    assert result["entries"] == [{"name": "assets", "type": "directory", "bytes": 0, "mode": "755"}]
+    serialized = json.dumps(result)
+    assert '"u"' not in serialized and '"p"' not in serialized
+
+
+def test_remote_inventory_denies_server_root_before_leasing_credentials(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda *_args: pytest.fail("vault must not be touched"))
+    result = site_remote_inventory(
+        host="plesk.example.com", domain="example.com", remote_path="/",
+    )
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_inventory_scope_denied"
 
 
 def test_bootstrap_leases_admin_login_and_stores_key_without_returning_it(monkeypatch):

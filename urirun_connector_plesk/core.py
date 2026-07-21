@@ -10,6 +10,7 @@ import os
 import re
 import secrets
 import ssl
+import stat as statmod
 import time
 import urllib.error
 import urllib.parse
@@ -2136,6 +2137,92 @@ def site_methods(
     available = [r["transport"] for r in results if r["available"]]
     return urirun.ok(host=host, methods=results, available=available,
                      recommended=(available[0] if available else None))
+
+
+@conn.handler(
+    "site/query/remote-inventory",
+    isolated=True,
+    meta={"label": "List a bounded SFTP directory without reading file content"},
+)
+def site_remote_inventory(
+    host: str = "",
+    domain: str = "",
+    remote_path: str = "/",
+    sftp_port: int = 22,
+    sftp_vault_entry_id: str = "plesk-sftp",
+    credential_origin: str = "",
+    host_fingerprint: str = "",
+    vault_url: str = "",
+    max_entries: int = 100,
+) -> dict[str, Any]:
+    """Read-only, bounded SFTP topology observation; never returns credentials or content."""
+    if not host or not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        return urirun.fail("plesk_site_host_invalid")
+    site_domain = domain.strip().lower()
+    if not site_domain or not re.fullmatch(r"[A-Za-z0-9.-]+", site_domain):
+        return urirun.fail("plesk_site_domain_invalid")
+    if not _SAFE_REMOTE.fullmatch(remote_path) or ".." in remote_path or "//" in remote_path:
+        return urirun.fail("plesk_site_remote_path_invalid")
+    allowed_roots = (
+        f"/var/www/vhosts/{site_domain}",
+        f"/{site_domain}",
+        "/httpdocs",
+    )
+    if not any(remote_path == root or remote_path.startswith(f"{root}/") for root in allowed_roots):
+        return urirun.fail("plesk_site_inventory_scope_denied")
+    bad_port = _validate_port(sftp_port)
+    if bad_port:
+        return urirun.fail(bad_port)
+    try:
+        limit = max(1, min(int(max_entries), 500))
+    except (TypeError, ValueError):
+        return urirun.fail("plesk_site_inventory_limit_invalid")
+
+    origin = _transport_origin("sftp", host, credential_origin)
+    username = password = ""
+    transport = None
+    try:
+        username = _vault_lease(sftp_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(sftp_vault_entry_id, origin, "password", vault_url)
+        transport, sftp, fingerprint = _sftp_connect(
+            host, int(sftp_port), username, password, host_fingerprint,
+        )
+        try:
+            directory = sftp.stat(remote_path)
+            attrs = sorted(sftp.listdir_attr(remote_path), key=lambda item: item.filename)
+            entries = []
+            for item in attrs[:limit]:
+                mode = int(getattr(item, "st_mode", 0) or 0)
+                entries.append({
+                    "name": str(item.filename),
+                    "type": "directory" if statmod.S_ISDIR(mode) else "file",
+                    "bytes": int(getattr(item, "st_size", 0) or 0),
+                    "mode": format(mode & 0o777, "03o"),
+                })
+        finally:
+            sftp.close()
+        directory_mode = int(getattr(directory, "st_mode", 0) or 0)
+        return urirun.ok(
+            host=host,
+            domain=site_domain,
+            transport="sftp",
+            remote_path=remote_path,
+            exists=True,
+            directory=statmod.S_ISDIR(directory_mode),
+            mode=format(directory_mode & 0o777, "03o"),
+            entries=entries,
+            entries_total=len(attrs),
+            truncated=len(attrs) > limit,
+            host_fingerprint=fingerprint,
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error), host=host, domain=site_domain, remote_path=remote_path, transport="sftp")
+    except Exception as error:
+        return urirun.fail(map_exception(error, phase="transfer"), host=host, domain=site_domain, remote_path=remote_path, transport="sftp")
+    finally:
+        username = password = ""
+        if transport is not None:
+            transport.close()
 
 
 def _site_tree_sync(
