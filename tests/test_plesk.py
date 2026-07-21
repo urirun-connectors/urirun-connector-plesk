@@ -17,6 +17,9 @@ from urirun_connector_plesk import (
     bootstrap_api_key,
     connector_manifest,
     create_mailbox,
+    dns_authority,
+    dns_propagation,
+    dns_reconcile,
     dns_records,
     dns_replace,
     ensure_ftp_user,
@@ -53,7 +56,10 @@ ROUTES = {
     "plesk://host/subscription/query/capabilities",
     "plesk://host/domain/command/ensure",
     "plesk://host/dns/query/records",
+    "plesk://host/dns/query/authority",
+    "plesk://host/dns/query/propagation",
     "plesk://host/dns/command/replace",
+    "plesk://host/dns/command/reconcile",
     "plesk://host/mailbox/command/create",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
@@ -269,6 +275,107 @@ def test_dns_replace_apply_requires_grant_and_verifies_result(monkeypatch):
     )
     assert result["ok"] and result["executed"] and result["verified"]
     assert result["record"]["value"] == "192.0.2.10" and len(packets) == 4
+
+
+def _authority(provider="cloudflare", *, consistent=True):
+    nameservers = ["alice.ns.cloudflare.com", "bob.ns.cloudflare.com"] if provider == "cloudflare" else ["ns1.example.net"]
+    return {
+        "zone": "example.com", "provider": provider, "nameservers": nameservers,
+        "consistent": consistent, "observations": [],
+    }
+
+
+def test_dns_authority_reports_provider_consensus(monkeypatch):
+    monkeypatch.setattr(core, "resolve_dns_authority", lambda zone: _authority())
+    result = dns_authority(zone="example.com")
+    assert result["ok"] and result["provider"] == "cloudflare"
+    assert result["authority"]["consistent"] is True
+
+
+def test_dns_propagation_exposes_resolver_consensus_and_ttl(monkeypatch):
+    observation = {
+        "host": "status.example.com", "record_type": "A", "expected_value": "192.0.2.10",
+        "consensus": True, "propagated": True, "ttl_min": 120, "ttl_max": 300,
+        "observations": [],
+    }
+    monkeypatch.setattr(core, "resolve_dns_propagation", lambda *args: observation)
+    result = dns_propagation(
+        host="status.example.com", record_type="A", expected_value="192.0.2.10",
+    )
+    assert result["ok"] and result["propagated"] and result["consensus"]
+    assert result["propagation"]["ttl_min"] == 120
+
+
+def test_dns_reconcile_fails_closed_on_provider_mismatch_before_vault(monkeypatch):
+    monkeypatch.setattr(core, "resolve_dns_authority", lambda zone: _authority())
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: pytest.fail("vault must not be touched"))
+    result = dns_reconcile(
+        zone="example.com", host="status.example.com", value="192.0.2.10",
+        expected_provider="plesk",
+    )
+    assert not result["ok"] and result["error"] == "dns_authoritative_provider_mismatch"
+    assert result["provider"] == "cloudflare" and result["mutation_attempted"] is False
+
+
+def test_dns_reconcile_cloudflare_dry_run_uses_vault_and_returns_provider_receipt(monkeypatch):
+    record_id = "a" * 32
+    leases = {"api_token": "top-secret-token", "zone_id": "b" * 32}
+    monkeypatch.setattr(core, "resolve_dns_authority", lambda zone: _authority())
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url: leases[field])
+    monkeypatch.setattr(core, "cloudflare_records", lambda *a: [{
+        "id": record_id, "host": "status.example.com", "type": "CNAME",
+        "value": "old.example.net", "ttl": 1, "proxied": False,
+    }])
+    result = dns_reconcile(
+        zone="example.com", host="status.example.com", value="192.0.2.10",
+        expected_provider="cloudflare",
+    )
+    assert result["ok"] and result["dry_run"] and result["changed"]
+    assert result["provider"] == "cloudflare"
+    assert result["plan"]["delete_record_ids"] == [record_id]
+    assert result["plan"]["create_record"] is True
+    serialized = json.dumps(result)
+    assert "top-secret-token" not in serialized and leases["zone_id"] not in serialized
+
+
+def test_dns_reconcile_cloudflare_apply_is_granted_batched_and_verified(monkeypatch):
+    reset_default_jti_replay_store()
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("CLOUDFLARE_DNS_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "dns-provider-secret")
+    leases = {"api_token": "top-secret-token", "zone_id": "b" * 32}
+    state = [{
+        "id": "a" * 32, "host": "status.example.com", "type": "CNAME",
+        "value": "old.example.net", "ttl": 1, "proxied": False,
+    }]
+    applied = []
+    monkeypatch.setattr(core, "resolve_dns_authority", lambda zone: _authority())
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url: leases[field])
+    monkeypatch.setattr(core, "cloudflare_records", lambda *a: list(state))
+
+    def fake_apply(zone_id, token, plan):
+        applied.append(plan)
+        state[:] = [{
+            "id": "c" * 32, "host": plan["host"], "type": plan["record_type"],
+            "value": plan["value"], "ttl": plan["ttl"], "proxied": plan["proxied"],
+        }]
+
+    monkeypatch.setattr(core, "apply_cloudflare_plan", fake_apply)
+    dry = dns_reconcile(zone="example.com", host="status.example.com", value="192.0.2.10")
+    issued = issue_apply_grant(
+        run_id="provider-dns-run", actor="test-actor", intent_pack="provider-dns@1",
+        plan_hash=dry["plan_hash"], artifact_sha256=dry["artifact_sha256"], target=dry["target"],
+        risk_class="boundary", jti="provider-dns-once",
+        environ={"APPLY_GRANT_HMAC_SECRET": "dns-provider-secret"},
+    )
+    result = dns_reconcile(
+        zone="example.com", host="status.example.com", value="192.0.2.10", apply=True,
+        plan_hash=dry["plan_hash"], apply_grant=issued["grant"], actor="test-actor",
+        pack_id="provider-dns", pack_version="1",
+    )
+    assert result["ok"] and result["executed"] and result["verified"]
+    assert result["provider"] == "cloudflare" and len(applied) == 1
+    assert result["record"]["value"] == "192.0.2.10"
 
 
 def _extensions_xml():
@@ -884,7 +991,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.11.1"
+    assert report["version"] == "0.12.0"
 
 
 def test_transport_origin_defaults_to_https():

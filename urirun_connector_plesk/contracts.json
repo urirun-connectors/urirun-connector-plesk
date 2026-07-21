@@ -152,6 +152,30 @@
         "result": {"ok": true, "site_id": 185, "records": [], "count": 0, "mutation_attempted": false}
       }]
     },
+    "dns/query/authority": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"zone": "str"},
+      "out": {"provider": "str", "authority": "object", "mutation_attempted": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{
+        "payload": {"zone": "example.com"},
+        "result": {"ok": true, "provider": "cloudflare", "authority": {"zone": "example.com", "consistent": true}, "mutation_attempted": false}
+      }]
+    },
+    "dns/query/propagation": {
+      "version": "v1",
+      "effect": "query",
+      "reversible": false,
+      "inp": {"host": "str", "record_type": "?str", "expected_value": "?str"},
+      "out": {"propagated": "bool", "consensus": "bool", "propagation": "object", "mutation_attempted": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{
+        "payload": {"host": "status.example.com", "record_type": "A", "expected_value": "192.0.2.10"},
+        "result": {"ok": true, "propagated": true, "consensus": true, "propagation": {"ttl_min": 120, "ttl_max": 300}, "mutation_attempted": false}
+      }]
+    },
     "dns/command/replace": {
       "version": "v1",
       "effect": "command",
@@ -170,6 +194,28 @@
       "examples": [{
         "payload": {"site_id": 185, "host": "status.example.com", "record_type": "A", "value": "192.0.2.10"},
         "result": {"ok": true, "dry_run": true, "executed": false, "mutation_attempted": false, "target": "https://plesk.example.com:8443|dns:185:status.example.com", "plan_hash": "sha256", "changed": true}
+      }]
+    },
+    "dns/command/reconcile": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true,
+      "inp": {
+        "zone": "str", "host": "str", "record_type": "?str", "value": "str",
+        "ttl": "?int", "proxied": "?bool", "expected_provider": "?str", "site_id": "?int",
+        "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str",
+        "pack_id": "?str", "pack_version": "?str", "base_url": "?str",
+        "subscription_vault_entry_id": "?str", "cloudflare_vault_entry_id": "?str", "vault_url": "?str"
+      },
+      "out": {
+        "provider": "str", "authority": "object", "dry_run": "bool", "executed": "bool",
+        "mutation_attempted": "bool", "target": "str", "plan_hash": "str",
+        "changed": "bool", "verified": "?bool"
+      },
+      "errors": ["precondition-unmet", "permission-denied", "conflict", "degraded-backend"],
+      "examples": [{
+        "payload": {"zone": "example.com", "host": "status.example.com", "record_type": "A", "value": "192.0.2.10", "expected_provider": "cloudflare"},
+        "result": {"ok": true, "provider": "cloudflare", "dry_run": true, "executed": false, "mutation_attempted": false, "target": "cloudflare://example.com/dns:status.example.com", "plan_hash": "sha256", "changed": true}
       }]
     },
     "mailbox/command/create": {

@@ -53,6 +53,14 @@ from .extensions import (
     parse_extension_call,
     parse_extension_inventory,
 )
+from .dns_providers import (
+    CLOUDFLARE_CREDENTIAL_ORIGIN,
+    apply_cloudflare_plan,
+    cloudflare_plan,
+    cloudflare_records,
+    resolve_dns_authority,
+    resolve_dns_propagation,
+)
 
 try:  # paramiko ships in urirun-node image (PR6); keep importable if extra absent in lab
     import paramiko
@@ -1002,6 +1010,23 @@ def _dns_value(record_type: str, value: str) -> str:
     return _dns_hostname(wanted)
 
 
+def _dns_zone(value: str, host: str = "") -> str:
+    zone = _dns_hostname(value)
+    if host and host != zone and not host.endswith(f".{zone}"):
+        raise RuntimeError("plesk_dns_host_outside_zone")
+    return zone
+
+
+def _dns_ttl(value: Any) -> int:
+    try:
+        ttl = int(value)
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("plesk_dns_ttl_invalid") from error
+    if ttl != 1 and not 60 <= ttl <= 86400:
+        raise RuntimeError("plesk_dns_ttl_invalid")
+    return ttl
+
+
 def _dns_records_packet(site_id: int) -> str:
     return f'''<?xml version="1.0" encoding="UTF-8"?>
 <packet><dns><get_rec><filter><site-id>{site_id}</site-id></filter></get_rec></dns></packet>'''
@@ -1190,6 +1215,188 @@ def dns_replace(
         return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
     finally:
         username = password = ""
+
+
+@conn.handler("dns/query/authority", isolated=True, meta={"label": "Detect authoritative DNS provider with resolver consensus"})
+def dns_authority(zone: str = "") -> dict[str, Any]:
+    try:
+        wanted_zone = _dns_zone(zone)
+        authority = resolve_dns_authority(wanted_zone)
+        if not authority["consistent"]:
+            return urirun.fail(
+                "dns_authority_inconsistent", authority=authority, mutation_attempted=False,
+            )
+        return urirun.ok(authority=authority, provider=authority["provider"], mutation_attempted=False)
+    except RuntimeError as error:
+        return urirun.fail(str(error), mutation_attempted=False)
+
+
+@conn.handler("dns/query/propagation", isolated=True, meta={"label": "Compare DNS records and TTLs across public resolvers"})
+def dns_propagation(
+    host: str = "", record_type: str = "A", expected_value: str = "",
+) -> dict[str, Any]:
+    try:
+        wanted_host = _dns_hostname(host)
+        wanted_type = _dns_type(record_type)
+        wanted_value = _dns_value(wanted_type, expected_value) if expected_value else ""
+        propagation = resolve_dns_propagation(wanted_host, wanted_type, wanted_value)
+        return urirun.ok(
+            propagation=propagation,
+            propagated=propagation["propagated"],
+            consensus=propagation["consensus"],
+            mutation_attempted=False,
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error), mutation_attempted=False)
+
+
+@conn.handler("dns/command/reconcile", isolated=True, meta={"label": "Reconcile DNS through its authoritative provider"})
+def dns_reconcile(
+    zone: str = "",
+    host: str = "",
+    record_type: str = "A",
+    value: str = "",
+    ttl: int = 1,
+    proxied: bool = False,
+    expected_provider: str = "",
+    site_id: int = 0,
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    cloudflare_vault_entry_id: str = "cloudflare-dns",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    """Expose one DNS control surface without hiding the real authority boundary."""
+    token = zone_id = ""
+    mutation_attempted = False
+    try:
+        wanted_host = _dns_hostname(host)
+        wanted_zone = _dns_zone(zone, wanted_host)
+        wanted_type = _dns_type(record_type)
+        wanted_value = _dns_value(wanted_type, value)
+        wanted_ttl = _dns_ttl(ttl)
+        requested_provider = expected_provider.strip().lower()
+        if requested_provider and requested_provider not in {"cloudflare", "plesk"}:
+            raise RuntimeError("dns_expected_provider_invalid")
+        authority = resolve_dns_authority(wanted_zone)
+        provider = authority["provider"]
+        if not authority["consistent"]:
+            return urirun.fail(
+                "dns_authority_inconsistent", dry_run=not apply, authority=authority,
+                mutation_attempted=False,
+            )
+        if requested_provider and requested_provider != provider:
+            return urirun.fail(
+                "dns_authoritative_provider_mismatch", dry_run=not apply,
+                expected_provider=requested_provider, provider=provider, authority=authority,
+                mutation_attempted=False,
+            )
+
+        if provider == "plesk":
+            result = dns_replace(
+                site_id=site_id,
+                host=wanted_host,
+                record_type=wanted_type,
+                value=wanted_value,
+                apply=apply,
+                plan_hash=plan_hash,
+                apply_grant=apply_grant,
+                actor=actor,
+                pack_id=pack_id,
+                pack_version=pack_version,
+                base_url=base_url,
+                subscription_vault_entry_id=subscription_vault_entry_id,
+                vault_url=vault_url,
+            )
+            return {**result, "provider": "plesk", "authority": authority}
+        if provider != "cloudflare":
+            return urirun.fail(
+                "dns_authoritative_provider_unsupported", dry_run=not apply,
+                provider=provider, authority=authority, mutation_attempted=False,
+            )
+
+        if apply and not autonomy_mutations_enabled() and not mutate_lease_active():
+            return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+        if apply and os.environ.get("CLOUDFLARE_DNS_APPLY", "").strip() != "1":
+            return urirun.fail("cloudflare_dns_apply_required", dry_run=False, mutation_attempted=False)
+
+        token = _vault_lease(
+            cloudflare_vault_entry_id, CLOUDFLARE_CREDENTIAL_ORIGIN, "api_token", vault_url,
+        )
+        zone_id = _vault_lease(
+            cloudflare_vault_entry_id, CLOUDFLARE_CREDENTIAL_ORIGIN, "zone_id", vault_url,
+        )
+        records = cloudflare_records(zone_id, wanted_zone, wanted_host, token)
+        plan = cloudflare_plan(
+            wanted_zone, wanted_host, wanted_type, wanted_value, records,
+            ttl=wanted_ttl, proxied=bool(proxied),
+        )
+        target = f"cloudflare://{wanted_zone}/dns:{wanted_host}"
+        receipt = {
+            "provider": "cloudflare",
+            "authority": authority,
+            "target": target,
+            "existing": records,
+            "plan_hash": plan["plan_hash"],
+            "artifact_sha256": plan["artifact_sha256"],
+            "changed": plan["changed"],
+        }
+        if not apply:
+            return urirun.ok(
+                dry_run=True, executed=False, mutation_attempted=False, plan=plan, **receipt,
+            )
+        if not plan["changed"]:
+            return urirun.ok(
+                dry_run=False, executed=False, mutation_attempted=False, verified=True, **receipt,
+            )
+        if plan_hash.strip().lower() != plan["plan_hash"]:
+            return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False, **receipt)
+        ok, error, claims = verify_apply_grant(
+            apply_grant,
+            plan_hash=plan["plan_hash"],
+            target=target,
+            actor=actor,
+            intent_pack=format_intent_pack(pack_id, pack_version),
+            artifact_sha256=plan["artifact_sha256"],
+        )
+        if not ok or not claims:
+            return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False, **receipt)
+        if claims.get("risk_class") != "boundary":
+            return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False, **receipt)
+        consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+        if not consumed:
+            return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False, **receipt)
+
+        mutation_attempted = True
+        apply_cloudflare_plan(zone_id, token, plan)
+        verified_records = cloudflare_records(zone_id, wanted_zone, wanted_host, token)
+        verified = (
+            len(verified_records) == 1
+            and verified_records[0]["type"] == wanted_type
+            and verified_records[0]["value"].rstrip(".").lower() == wanted_value.lower()
+            and verified_records[0]["ttl"] == wanted_ttl
+            and verified_records[0]["proxied"] is bool(proxied)
+        )
+        if not verified:
+            return urirun.fail(
+                "cloudflare_dns_verification_failed", dry_run=False, mutation_attempted=True,
+                provider="cloudflare", authority=authority, target=target, records=verified_records,
+                plan_hash=plan["plan_hash"], grant_jti=claims["jti"],
+            )
+        return urirun.ok(
+            dry_run=False, executed=True, mutation_attempted=True, verified=True, changed=True,
+            provider="cloudflare", authority=authority, target=target, record=verified_records[0],
+            plan_hash=plan["plan_hash"], grant_jti=claims["jti"],
+        )
+    except RuntimeError as error:
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=mutation_attempted)
+    finally:
+        token = zone_id = ""
 
 
 def _xml_named_values(root: ET.Element) -> dict[str, str]:
@@ -3165,7 +3372,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.11.1",
+        "version": "0.12.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,

@@ -34,6 +34,9 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/extension/command/call` | dry-run or execute a profiled extension mutation with gates and a signed grant |
 | `plesk://host/subscription/query/capabilities` | verify customer authorization and domain capacity before planning a site |
 | `plesk://host/domain/command/ensure` | dry-run or idempotently add a domain under an existing subscription |
+| `plesk://host/dns/query/authority` | detect the authoritative DNS provider using two-resolver NS consensus |
+| `plesk://host/dns/query/propagation` | compare expected records and remaining TTL across two public resolvers |
+| `plesk://host/dns/command/reconcile` | provider-aware DNS dry-run/apply facade for Plesk or Cloudflare |
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
 | `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
@@ -53,11 +56,22 @@ servers and do not contact a real Plesk instance.
 
 ## Dynamic extension model
 
-DNS address records use the reviewed XML API routes
+Local Plesk DNS address records use the reviewed XML API routes
 `plesk://host/dns/query/records` and `plesk://host/dns/command/replace`. Replacement is
 dry-run by default and removes conflicting A/AAAA/CNAME records only after an exact
 plan hash, signed boundary-risk grant, the global mutation gate and
 `PLESK_DNS_APPLY=1` have all been verified.
+
+Delegated zones use `plesk://host/dns/query/authority` and
+`plesk://host/dns/command/reconcile`. The latter is a Plesk-connector facade, not a
+claim that Plesk owns the zone: its receipt always names the detected provider and
+nameservers. Cloudflare credentials (`api_token`, `zone_id`) are leased from the
+`cloudflare-dns` vault entry for `https://api.cloudflare.com`; payloads and receipts
+contain no secret. Cloudflare apply uses the provider batch API and additionally
+requires `CLOUDFLARE_DNS_APPLY=1`.
+Propagation is observed separately through `plesk://host/dns/query/propagation`, so
+an API-verified change is not incorrectly reported as globally propagated while
+recursive resolvers still hold different values or TTLs.
 
 Subdomain creation follows the same fail-closed lifecycle through
 `plesk://host/site/command/subdomain-ensure`: default dry-run, exact plan hash,
