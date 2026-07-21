@@ -10,8 +10,7 @@ import json
 import os
 import threading
 import time
-from datetime import datetime, timezone
-from typing import Any
+from datetime import datetime
 
 APPLY_GRANT_REPLAY_ERROR = "apply_grant_replay"
 CLOCK_SKEW_SECONDS = 60

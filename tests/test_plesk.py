@@ -1021,8 +1021,10 @@ def test_domain_ensure_dry_run_never_mutates(monkeypatch):
     monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
     def fake_xml(base_url,username,password,packet):
         calls.append(packet)
-        if "<webspace>" in packet: return _subscription_xml()
-        if "<webspace-name>" in packet: return _sites_xml(1)
+        if "<webspace>" in packet:
+            return _subscription_xml()
+        if "<webspace-name>" in packet:
+            return _sites_xml(1)
         return "<packet><site><get><result><status>error</status></result></get></site></packet>"
     monkeypatch.setattr(core,"_xml_agent",fake_xml)
     result=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=False,base_url="https://plesk.example.com:8443")
@@ -1035,15 +1037,19 @@ def test_domain_ensure_fails_closed_at_capacity_or_apply_gate(monkeypatch):
     monkeypatch.delenv("PLESK_DOMAIN_APPLY",raising=False)
     monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
     def at_capacity(base_url,username,password,packet):
-        if "<webspace>" in packet: return _subscription_xml(limit="1")
-        if "<webspace-name>" in packet: return _sites_xml(1)
+        if "<webspace>" in packet:
+            return _subscription_xml(limit="1")
+        if "<webspace-name>" in packet:
+            return _sites_xml(1)
         return "<packet><site><get><result><status>error</status></result></get></site></packet>"
     monkeypatch.setattr(core,"_xml_agent",at_capacity)
     denied=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=False,base_url="https://plesk.example.com:8443")
     assert not denied["ok"] and "limit_reached" in denied["error"]
     def has_capacity(base_url,username,password,packet):
-        if "<webspace>" in packet: return _subscription_xml(limit="2")
-        if "<webspace-name>" in packet: return _sites_xml(1)
+        if "<webspace>" in packet:
+            return _subscription_xml(limit="2")
+        if "<webspace-name>" in packet:
+            return _sites_xml(1)
         return "<packet><site><get><result><status>error</status></result></get></site></packet>"
     monkeypatch.setattr(core,"_xml_agent",has_capacity)
     gated=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=True,base_url="https://plesk.example.com:8443")
@@ -1055,9 +1061,12 @@ def test_domain_ensure_apply_creates_site_only_with_both_gates(monkeypatch):
     monkeypatch.setenv("PLESK_DOMAIN_APPLY","1")
     monkeypatch.setattr(core,"_vault_lease",lambda entry,origin,field,vault_url="": {"username":"customer","password":"pw"}[field])
     def fake_xml(base_url,username,password,packet):
-        if "<site><add>" in packet: return "<packet><site><add><result><status>ok</status><id>99</id></result></add></site></packet>"
-        if "<webspace>" in packet: return _subscription_xml(limit="2")
-        if "<webspace-name>" in packet: return _sites_xml(1)
+        if "<site><add>" in packet:
+            return "<packet><site><add><result><status>ok</status><id>99</id></result></add></site></packet>"
+        if "<webspace>" in packet:
+            return _subscription_xml(limit="2")
+        if "<webspace-name>" in packet:
+            return _sites_xml(1)
         return "<packet><site><get><result><status>error</status></result></get></site></packet>"
     monkeypatch.setattr(core,"_xml_agent",fake_xml)
     result=ensure_domain(domain="autonomicznosc.pl",subscription="prototypowanie.pl",apply=True,base_url="https://plesk.example.com:8443")

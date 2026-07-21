@@ -13,7 +13,7 @@ import re
 import socket
 import urllib.parse
 import urllib.request
-from typing import Any, Callable
+from typing import Any
 
 
 _CLOUDFLARE_ORIGIN = "https://api.cloudflare.com"
