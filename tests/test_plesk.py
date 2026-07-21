@@ -991,7 +991,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.12.0"
+    assert report["version"] == "0.12.1"
 
 
 def test_transport_origin_defaults_to_https():

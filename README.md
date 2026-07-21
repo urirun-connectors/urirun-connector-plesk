@@ -69,7 +69,8 @@ nameservers. Cloudflare credentials (`api_token`, `zone_id`) are leased from the
 `cloudflare-dns` vault entry for `https://api.cloudflare.com`; payloads and receipts
 contain no secret. Cloudflare apply uses the provider batch API and additionally
 requires `CLOUDFLARE_DNS_APPLY=1`.
-Propagation is observed separately through `plesk://host/dns/query/propagation`, so
+Propagation is observed separately through `plesk://host/dns/query/propagation`; it
+compares Cloudflare DNS, Google DNS and (for A/AAAA) the runtime system resolver, so
 an API-verified change is not incorrectly reported as globally propagated while
 recursive resolvers still hold different values or TTLs.
 

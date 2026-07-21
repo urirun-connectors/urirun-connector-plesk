@@ -36,9 +36,27 @@ def test_propagation_compares_values_but_reports_ttl_range(monkeypatch):
         "_doh_records",
         lambda name, record_type, endpoint: [{"value": "192.0.2.10", "ttl": next(ttls)}],
     )
+    monkeypatch.setattr(
+        dns_providers, "_system_records",
+        lambda host, record_type: [{"value": "192.0.2.10", "ttl": 0}],
+    )
     result = dns_providers.resolve_dns_propagation("status.example.com", "A", "192.0.2.10")
     assert result["consensus"] and result["propagated"]
     assert result["ttl_min"] == 120 and result["ttl_max"] == 300
+
+
+def test_propagation_detects_runtime_resolver_still_holding_old_target(monkeypatch):
+    monkeypatch.setattr(
+        dns_providers, "_doh_records",
+        lambda name, record_type, endpoint: [{"value": "192.0.2.10", "ttl": 300}],
+    )
+    monkeypatch.setattr(
+        dns_providers, "_system_records",
+        lambda host, record_type: [{"value": "185.199.108.153", "ttl": 0}],
+    )
+    result = dns_providers.resolve_dns_propagation("status.example.com", "A", "192.0.2.10")
+    assert result["consensus"] is False and result["propagated"] is False
+    assert result["observations"][-1]["resolver"] == "runtime-system"
 
 
 def test_cloudflare_record_query_verifies_zone_and_redacts_token(monkeypatch):

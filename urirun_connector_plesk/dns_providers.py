@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import urllib.parse
 import urllib.request
 from typing import Any, Callable
@@ -119,14 +120,20 @@ def resolve_dns_propagation(host: str, record_type: str, expected_value: str = "
             observations.append({"resolver": resolver, "ok": bool(records), "records": records})
         except RuntimeError:
             observations.append({"resolver": resolver, "ok": False, "records": []})
+    if record_type in {"A", "AAAA"}:
+        try:
+            system_records = _system_records(host, record_type)
+            observations.append({"resolver": "runtime-system", "ok": bool(system_records), "records": system_records})
+        except RuntimeError:
+            observations.append({"resolver": "runtime-system", "ok": False, "records": []})
     successful = [row for row in observations if row["ok"]]
     value_sets = {tuple(record["value"] for record in row["records"]) for row in successful}
-    consensus = len(successful) == len(_RESOLVERS) and len(value_sets) == 1
+    consensus = len(successful) == len(observations) and len(value_sets) == 1
     expected = expected_value.rstrip(".").lower()
     propagated = consensus and bool(expected) and all(
         [record["value"] for record in row["records"]] == [expected] for row in successful
     )
-    ttls = [record["ttl"] for row in successful for record in row["records"]]
+    ttls = [record["ttl"] for row in successful for record in row["records"] if record["ttl"] > 0]
     return {
         "host": host,
         "record_type": record_type,
@@ -137,6 +144,15 @@ def resolve_dns_propagation(host: str, record_type: str, expected_value: str = "
         "ttl_max": max(ttls) if ttls else None,
         "observations": observations,
     }
+
+
+def _system_records(host: str, record_type: str) -> list[dict[str, Any]]:
+    family = socket.AF_INET if record_type == "A" else socket.AF_INET6
+    try:
+        rows = socket.getaddrinfo(host, None, family=family, type=socket.SOCK_STREAM)
+    except socket.gaierror as error:
+        raise RuntimeError("dns_system_resolver_failed") from error
+    return [{"value": value, "ttl": 0} for value in sorted({row[4][0].lower() for row in rows})]
 
 
 def _cf_call(

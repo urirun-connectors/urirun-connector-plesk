@@ -140,7 +140,7 @@ def test_doctor_reports_release_capabilities(monkeypatch):
     assert report["capabilities"]["release_activation"] is True
     assert report["capabilities"]["rollback"] is True
     assert "symlink" in report["capabilities"]["release_activation_strategies"]
-    assert report["version"] == "0.12.0"
+    assert report["version"] == "0.12.1"
     assert report["capabilities"]["publish_verify"] is True
     assert report["staging_domain_recommendation"] == "docs-stage.subactor.com"
 
