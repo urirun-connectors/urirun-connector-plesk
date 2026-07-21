@@ -186,6 +186,59 @@ def _credential_origin(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _smtp_credential_origin(value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    if parsed.scheme not in {"smtp", "smtps", "https"} or not parsed.hostname or parsed.username or parsed.password:
+        raise RuntimeError("plesk_mailbox_smtp_credential_origin_invalid")
+    return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def _vault_entry_id(value: str, *, default: str) -> str:
+    entry_id = (value or default).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", entry_id):
+        raise RuntimeError("plesk_mailbox_vault_entry_invalid")
+    return entry_id
+
+
+def _mail_cli_success(status: int, data: Any) -> bool:
+    if not 200 <= status < 300:
+        return False
+    if not isinstance(data, dict):
+        return True
+    code = data.get("code", data.get("exit_code", 0))
+    try:
+        return int(code or 0) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _mailbox_absent(data: Any) -> bool:
+    if not isinstance(data, dict):
+        return False
+    diagnostic = " ".join(str(data.get(key) or "") for key in ("stderr", "error", "message")).lower()
+    return any(marker in diagnostic for marker in (
+        "does not exist", "doesn't exist", "not found", "no such mail", "unable to find", "unknown mail",
+    ))
+
+
+def _mailbox_probe(
+    address: str, *, base_url: str, runtime_vault_entry_id: str, vault_url: str, api_path: str,
+) -> tuple[bool, int, Any]:
+    status, data = _authorized_request(
+        base_url=base_url,
+        path=api_path,
+        method="POST",
+        body={"params": ["--info", address]},
+        runtime_vault_entry_id=runtime_vault_entry_id,
+        vault_url=vault_url,
+    )
+    if _mail_cli_success(status, data):
+        return True, status, data
+    if 200 <= status < 300 and _mailbox_absent(data):
+        return False, status, data
+    raise RuntimeError(f"plesk_mailbox_status_failed:{status}")
+
+
 def _redact(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: "[REDACTED]" if _SENSITIVE.search(str(key)) else _redact(item) for key, item in value.items()}
@@ -640,12 +693,45 @@ def api_command(
     return urirun.ok(http_status=status, data=_redact(data))
 
 
-@conn.handler("mailbox/command/create", isolated=True, meta={"label": "Create a Plesk mailbox and store its generated credential"})
-def create_mailbox(
+@conn.handler("mailbox/query/status", isolated=True, meta={"label": "Inspect a Plesk mailbox without exposing credentials"})
+def mailbox_status(
+    email: str = "",
+    base_url: str = "",
+    runtime_vault_entry_id: str = "plesk-runtime",
+    vault_url: str = "",
+    api_path: str = "/api/v2/cli/mail/call",
+) -> dict[str, Any]:
+    address = email.strip().lower()
+    if not re.fullmatch(r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9.-]+", address):
+        return urirun.fail("plesk_mailbox_email_invalid", mutation_attempted=False)
+    try:
+        exists, status, _ = _mailbox_probe(
+            address,
+            base_url=base_url,
+            runtime_vault_entry_id=runtime_vault_entry_id,
+            vault_url=vault_url,
+            api_path=api_path,
+        )
+        return urirun.ok(email=address, exists=exists, http_status=status, mutation_attempted=False)
+    except RuntimeError as error:
+        return urirun.fail(str(error), email=address, mutation_attempted=False)
+
+
+@conn.handler("mailbox/command/ensure", isolated=True, meta={"label": "Plan or ensure a Plesk mailbox and vault-backed IMAP/SMTP credential"})
+def ensure_mailbox(
     email: str = "",
     display_name: str = "",
     credential_vault_entry_id: str = "",
     credential_origin: str = "",
+    smtp_vault_entry_id: str = "",
+    smtp_credential_origin: str = "",
+    rotate_existing: bool = False,
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
     base_url: str = "",
     runtime_vault_entry_id: str = "plesk-runtime",
     vault_url: str = "",
@@ -656,20 +742,80 @@ def create_mailbox(
         return urirun.fail("plesk_mailbox_email_invalid")
     try:
         origin = _credential_origin(credential_origin)
-        entry_id = credential_vault_entry_id or f"plesk-mailbox-{hashlib.sha256(address.encode()).hexdigest()[:20]}"
-        if not re.fullmatch(r"[A-Za-z0-9_.-]+", entry_id):
-            raise RuntimeError("plesk_mailbox_vault_entry_invalid")
+        entry_id = _vault_entry_id(
+            credential_vault_entry_id,
+            default=f"plesk-mailbox-{hashlib.sha256(address.encode()).hexdigest()[:20]}",
+        )
+        smtp_entry_id = _vault_entry_id(smtp_vault_entry_id, default=entry_id) if smtp_vault_entry_id else ""
+        smtp_origin = _smtp_credential_origin(smtp_credential_origin) if smtp_entry_id else ""
+        api_origin = _base_url(base_url)
+        exists, probe_status, _ = _mailbox_probe(
+            address,
+            base_url=base_url,
+            runtime_vault_entry_id=runtime_vault_entry_id,
+            vault_url=vault_url,
+            api_path=api_path,
+        )
+        action = "rotate" if exists and rotate_existing else "keep" if exists else "create"
+        plan_body = {
+            "schema": "urirun.plesk-mailbox-ensure-plan/v1",
+            "email": address,
+            "action": action,
+            "credential_vault_entry_id": entry_id,
+            "credential_origin": origin,
+            "smtp_vault_entry_id": smtp_entry_id or None,
+            "smtp_credential_origin": smtp_origin or None,
+            "risk_class": "governance",
+        }
+        digest = hashlib.sha256(json.dumps(plan_body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        plan = {**plan_body, "plan_hash": digest, "artifact_sha256": digest}
+        target = f"{api_origin}|mailbox:{address}"
+        if action == "keep":
+            return urirun.ok(
+                email=address, exists=True, created=False, rotated=False, credential_stored=False,
+                dry_run=not apply, executed=False, mutation_attempted=False, target=target,
+                plan_hash=digest, http_status=probe_status,
+            )
+        if not apply:
+            return urirun.ok(
+                email=address, exists=exists, created=False, rotated=False, credential_stored=False,
+                dry_run=True, executed=False, mutation_attempted=False, target=target,
+                plan=plan, plan_hash=digest, artifact_sha256=digest, http_status=probe_status,
+            )
+        if not autonomy_mutations_enabled() and not mutate_lease_active():
+            return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+        if os.environ.get("PLESK_MAILBOX_APPLY", "").strip() != "1":
+            return urirun.fail("plesk_mailbox_apply_required", dry_run=False, mutation_attempted=False)
+        if plan_hash.strip().lower() != digest:
+            return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+        ok, error, claims = verify_apply_grant(
+            apply_grant,
+            plan_hash=digest,
+            target=target,
+            actor=actor,
+            intent_pack=format_intent_pack(pack_id, pack_version),
+            artifact_sha256=digest,
+        )
+        if not ok or not claims:
+            return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+        if claims.get("risk_class") != "governance":
+            return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+        consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+        if not consumed:
+            return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
+
         password = f"{secrets.token_urlsafe(24)}!aA9"
+        operation = "--update" if action == "rotate" else "--create"
         status, data = _authorized_request(
             base_url=base_url,
             path=api_path,
             method="POST",
-            body={"params": ["--create", address, "-passwd", password, "-mailbox", "true"]},
+            body={"params": [operation, address, "-passwd", password, "-mailbox", "true"]},
             runtime_vault_entry_id=runtime_vault_entry_id,
             vault_url=vault_url,
         )
-        if not 200 <= status < 300:
-            raise RuntimeError(f"plesk_mailbox_create_failed:{status}")
+        if not _mail_cli_success(status, data):
+            raise RuntimeError(f"plesk_mailbox_{action}_failed:{status}")
         stored_id = _vault_store_secrets(
             entry_id,
             origin,
@@ -677,18 +823,55 @@ def create_mailbox(
             {"username": address, "password": password},
             vault_url,
         )
+        stored_smtp_id = ""
+        if smtp_entry_id:
+            stored_smtp_id = _vault_store_secrets(
+                smtp_entry_id,
+                smtp_origin,
+                f"Plesk SMTP mailbox {address}",
+                {"username": address, "password": password},
+                vault_url,
+            )
+        verified, _, _ = _mailbox_probe(
+            address,
+            base_url=base_url,
+            runtime_vault_entry_id=runtime_vault_entry_id,
+            vault_url=vault_url,
+            api_path=api_path,
+        )
+        if not verified:
+            raise RuntimeError("plesk_mailbox_verification_failed")
     except RuntimeError as error:
-        return urirun.fail(str(error))
+        return urirun.fail(str(error), email=address, dry_run=not apply, mutation_attempted=bool(apply))
     finally:
         password = ""
     return urirun.ok(
         email=address,
         display_name=display_name[:160],
-        created=True,
+        exists=True,
+        created=action == "create",
+        rotated=action == "rotate",
+        credential_stored=True,
         credential_vault_entry_id=stored_id,
         credential_origin=origin,
+        smtp_vault_entry_id=stored_smtp_id or None,
+        smtp_credential_origin=smtp_origin or None,
+        dry_run=False,
+        executed=True,
+        mutation_attempted=True,
+        verified=True,
+        target=target,
+        plan_hash=digest,
+        grant_jti=claims["jti"],
         api_result=_redact(data),
     )
+
+
+@conn.handler("mailbox/command/create", isolated=True, meta={"label": "Deprecated alias: plan or create a Plesk mailbox"})
+def create_mailbox(**kwargs: Any) -> dict[str, Any]:
+    """Backward-compatible URI alias. It is now fail-closed unless apply + grant are supplied."""
+    kwargs["rotate_existing"] = False
+    return ensure_mailbox(**kwargs)
 
 
 def _subscription_request(
@@ -3454,7 +3637,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.12.4",
+        "version": "0.13.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,

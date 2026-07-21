@@ -17,6 +17,8 @@ from urirun_connector_plesk import (
     bootstrap_api_key,
     connector_manifest,
     create_mailbox,
+    ensure_mailbox,
+    mailbox_status,
     dns_authority,
     dns_propagation,
     dns_reconcile,
@@ -61,6 +63,8 @@ ROUTES = {
     "plesk://host/dns/command/replace",
     "plesk://host/dns/command/reconcile",
     "plesk://host/mailbox/command/create",
+    "plesk://host/mailbox/command/ensure",
+    "plesk://host/mailbox/query/status",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
     "plesk://host/site/command/ssl-ensure",
@@ -699,34 +703,76 @@ def test_bindings_contract_and_manifest():
     assert manifest["id"] == "plesk" and set(manifest["routes"]) == ROUTES
 
 
-def test_mailbox_create_generates_password_and_stores_it_without_returning_it(monkeypatch):
+def test_mailbox_status_uses_read_only_info_call(monkeypatch):
+    request = {}
+    monkeypatch.setattr(
+        core,
+        "_authorized_request",
+        lambda **kwargs: request.update(kwargs) or (200, {"code": 0, "stdout": "Mailbox: true"}),
+    )
+    result = mailbox_status(email="hello@subactor.com", base_url="https://plesk.example.com:8443")
+    assert result["ok"] and result["exists"] and result["mutation_attempted"] is False
+    assert request["body"] == {"params": ["--info", "hello@subactor.com"]}
+
+
+def test_mailbox_ensure_generates_password_and_stores_imap_and_smtp_without_returning_it(monkeypatch):
     request = {}
     stored = {}
+    probes = iter([(False, 200, {}), (False, 200, {}), (True, 200, {})])
 
     def fake_authorized_request(**kwargs):
         request.update(kwargs)
-        return 200, {"status": "created"}
+        return 200, {"code": 0, "stdout": "created"}
 
     monkeypatch.setattr(core, "_authorized_request", fake_authorized_request)
-    monkeypatch.setattr(
-        core,
-        "_vault_store_secrets",
-        lambda entry, origin, label, values, vault_url: stored.update(
-            entry=entry, origin=origin, label=label, values=values,
-        ) or entry,
-    )
-    result = create_mailbox(
-        email="agent@prototypowanie.pl",
+    def fake_store(entry, origin, label, values, vault_url):
+        stored[entry] = {"origin": origin, "label": label, "values": dict(values)}
+        return entry
+
+    monkeypatch.setattr(core, "_vault_store_secrets", fake_store)
+    monkeypatch.setattr(core, "_mailbox_probe", lambda *_args, **_kwargs: next(probes))
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_MAILBOX_APPLY", "1")
+    monkeypatch.setenv("TOKEN_PEPPER", "mailbox-test-secret")
+    dry_run = ensure_mailbox(
+        email="hello@subactor.com",
         credential_vault_entry_id="agent-mailbox-runtime",
         credential_origin="imap://mail.prototypowanie.pl",
+        smtp_vault_entry_id="smtp-system-email",
+        smtp_credential_origin="https://prototypowanie.pl",
         base_url="https://plesk.example.com:8443",
+    )
+    issued = issue_apply_grant(
+        run_id="PLF-345",
+        actor="authority:founder",
+        intent_pack="mailbox.customer-intake@1",
+        plan_hash=dry_run["plan_hash"],
+        artifact_sha256=dry_run["artifact_sha256"],
+        target=dry_run["target"],
+        risk_class="governance",
+    )
+    result = ensure_mailbox(
+        email="hello@subactor.com",
+        credential_vault_entry_id="agent-mailbox-runtime",
+        credential_origin="imap://mail.prototypowanie.pl",
+        smtp_vault_entry_id="smtp-system-email",
+        smtp_credential_origin="https://prototypowanie.pl",
+        base_url="https://plesk.example.com:8443",
+        apply=True,
+        plan_hash=dry_run["plan_hash"],
+        apply_grant=issued["grant"],
+        actor="authority:founder",
+        pack_id="mailbox.customer-intake",
+        pack_version="1",
     )
     assert result["ok"] and result["created"]
     assert request["path"] == "/api/v2/cli/mail/call"
-    assert request["body"]["params"][:2] == ["--create", "agent@prototypowanie.pl"]
+    assert request["body"]["params"][:2] == ["--create", "hello@subactor.com"]
     generated = request["body"]["params"][3]
-    assert len(generated) >= 24 and stored["values"] == {"username": "agent@prototypowanie.pl", "password": generated}
-    assert stored["entry"] == "agent-mailbox-runtime" and stored["origin"] == "imap://mail.prototypowanie.pl"
+    assert len(generated) >= 24
+    assert stored["smtp-system-email"]["values"] == {"username": "hello@subactor.com", "password": generated}
+    assert stored["agent-mailbox-runtime"]["origin"] == "imap://mail.prototypowanie.pl"
+    assert stored["smtp-system-email"]["origin"] == "https://prototypowanie.pl"
     assert generated not in json.dumps(result)
 
 
@@ -1128,7 +1174,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.12.4"
+    assert report["version"] == "0.13.0"
 
 
 def test_transport_origin_defaults_to_https():

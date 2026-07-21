@@ -39,7 +39,9 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/dns/command/reconcile` | provider-aware DNS dry-run/apply facade for Plesk or Cloudflare |
 | `plesk://host/api/query/request` | execute a GET request under `/api/v2/` |
 | `plesk://host/api/command/request` | execute POST/PUT/PATCH/DELETE under `/api/v2/` |
-| `plesk://host/mailbox/command/create` | create a mailbox with a generated password stored directly in the vault |
+| `plesk://host/mailbox/query/status` | inspect mailbox existence through Plesk API without returning account details |
+| `plesk://host/mailbox/command/ensure` | plan/create/rotate a mailbox and provision both IMAP/SMTP vault entries; apply grant required |
+| `plesk://host/mailbox/command/create` | compatibility alias for ensure in create-only mode; fail-closed without apply grant |
 | `plesk://host/ftpuser/command/ensure` | rotate system SFTP/FTP password (XML) or ensure additional FTP user; store as `plesk-sftp` / `plesk-ftp` (https origin) |
 | `plesk://host/site/query/remote-inventory` | bounded read-only SFTP listing; ambiguous `/httpdocs` requires a vault `credential_origin` bound to the requested domain |
 | `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |

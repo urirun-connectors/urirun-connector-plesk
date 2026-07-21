@@ -218,8 +218,23 @@
         "result": {"ok": true, "provider": "cloudflare", "dry_run": true, "executed": false, "mutation_attempted": false, "target": "cloudflare://example.com/dns:status.example.com", "plan_hash": "sha256", "changed": true}
       }]
     },
-    "mailbox/command/create": {
+    "mailbox/query/status": {
       "version": "v1",
+      "effect": "query",
+      "reversible": true,
+      "inp": {
+        "email": "str",
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str",
+        "api_path": "?str"
+      },
+      "out": {"email": "str", "exists": "bool", "http_status": "int", "mutation_attempted": "bool"},
+      "errors": ["precondition-unmet", "degraded-backend"],
+      "examples": [{"payload": {"email": "hello@example.com"}, "result": {"ok": true, "email": "hello@example.com", "exists": true, "http_status": 200, "mutation_attempted": false}}]
+    },
+    "mailbox/command/ensure": {
+      "version": "v2",
       "effect": "command",
       "reversible": false,
       "inp": {
@@ -227,6 +242,15 @@
         "display_name": "?str",
         "credential_vault_entry_id": "?str",
         "credential_origin": "str",
+        "smtp_vault_entry_id": "?str",
+        "smtp_credential_origin": "?str",
+        "rotate_existing": "?bool",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
         "base_url": "?str",
         "runtime_vault_entry_id": "?str",
         "vault_url": "?str",
@@ -235,30 +259,63 @@
       "out": {
         "email": "str",
         "display_name": "str",
+        "exists": "bool",
         "created": "bool",
+        "rotated": "bool",
+        "credential_stored": "bool",
         "credential_vault_entry_id": "str",
         "credential_origin": "str",
+        "smtp_vault_entry_id": "?str",
+        "smtp_credential_origin": "?str",
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "verified": "?bool",
+        "target": "str",
+        "plan_hash": "str",
         "api_result": "any"
       },
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": [
         {
           "payload": {
-            "email": "agent@example.com",
+            "email": "hello@example.com",
             "credential_vault_entry_id": "agent-mailbox-runtime",
-            "credential_origin": "imap://mail.example.com"
+            "credential_origin": "imap://mail.example.com",
+            "smtp_vault_entry_id": "smtp-system-email",
+            "smtp_credential_origin": "https://mail.example.com"
           },
           "result": {
             "ok": true,
-            "email": "agent@example.com",
+            "email": "hello@example.com",
             "display_name": "",
-            "created": true,
-            "credential_vault_entry_id": "agent-mailbox-runtime",
-            "credential_origin": "imap://mail.example.com",
-            "api_result": {}
+            "exists": false,
+            "created": false,
+            "rotated": false,
+            "credential_stored": false,
+            "dry_run": true,
+            "executed": false,
+            "mutation_attempted": false,
+            "target": "https://plesk.example.com:8443|mailbox:hello@example.com",
+            "plan_hash": "sha256"
           }
         }
       ]
+    },
+    "mailbox/command/create": {
+      "version": "v2",
+      "effect": "command",
+      "reversible": false,
+      "inp": {
+        "email": "str", "display_name": "?str", "credential_vault_entry_id": "?str",
+        "credential_origin": "str", "smtp_vault_entry_id": "?str", "smtp_credential_origin": "?str",
+        "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str",
+        "pack_id": "?str", "pack_version": "?str", "base_url": "?str",
+        "runtime_vault_entry_id": "?str", "vault_url": "?str", "api_path": "?str"
+      },
+      "out": {"email": "str", "created": "bool", "dry_run": "bool", "executed": "bool", "mutation_attempted": "bool", "target": "str", "plan_hash": "str"},
+      "errors": ["precondition-unmet", "permission-denied", "degraded-backend"],
+      "examples": [{"payload": {"email": "hello@example.com", "credential_origin": "imap://mail.example.com"}, "result": {"ok": true, "email": "hello@example.com", "created": false, "dry_run": true, "executed": false, "mutation_attempted": false, "target": "https://plesk.example.com:8443|mailbox:hello@example.com", "plan_hash": "sha256"}}]
     },
     "ftpuser/command/ensure": {
       "version": "v1",

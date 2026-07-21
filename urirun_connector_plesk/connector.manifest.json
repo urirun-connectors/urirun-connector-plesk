@@ -1,7 +1,7 @@
 {
   "id": "plesk",
   "name": "Plesk",
-  "version": "0.12.4",
+  "version": "0.13.0",
   "status": "available",
   "category": "Infrastructure",
   "summary": "Manage Plesk through vault-backed REST, XML, SFTP and profiled extension URI processes.",
@@ -35,7 +35,7 @@
   ],
   "install": {
     "mode": "urirun-extra",
-    "pipSpec": "urirun-connector-plesk @ git+https://github.com/urirun-connectors/urirun-connector-plesk.git@v0.12.4"
+    "pipSpec": "urirun-connector-plesk @ git+https://github.com/urirun-connectors/urirun-connector-plesk.git@v0.13.0"
   },
   "provenance": "verified",
   "publisher": {
@@ -73,6 +73,8 @@
     "plesk://host/dns/command/replace",
     "plesk://host/dns/command/reconcile",
     "plesk://host/mailbox/command/create",
+    "plesk://host/mailbox/command/ensure",
+    "plesk://host/mailbox/query/status",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
     "plesk://host/site/command/ssl-ensure",
