@@ -18,6 +18,7 @@ from urirun_connector_plesk import (
     connector_manifest,
     create_mailbox,
     ensure_mailbox,
+    ensure_reverse_proxy,
     mailbox_status,
     dns_authority,
     dns_propagation,
@@ -42,6 +43,13 @@ import urirun_connector_plesk.core as core
 from urirun_connector_plesk.apply_grant import CLOCK_SKEW_SECONDS, issue_apply_grant
 from urirun_connector_plesk.apply_grant_replay import reset_default_jti_replay_store
 from urirun_connector_plesk.connector_result import CONNECTOR_RESULT_SCHEMA
+from urirun_connector_plesk.reverse_proxy import (
+    BEGIN_MARKER,
+    END_MARKER,
+    managed_directives,
+    merge_managed_directives,
+    normalize_upstream,
+)
 
 
 ROUTES = {
@@ -67,6 +75,7 @@ ROUTES = {
     "plesk://host/mailbox/query/status",
     "plesk://host/ftpuser/command/ensure",
     "plesk://host/site/command/subdomain-ensure",
+    "plesk://host/site/command/reverse-proxy-ensure",
     "plesk://host/site/command/ssl-ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
@@ -80,6 +89,68 @@ ROUTES = {
     "plesk://host/site/query/remote-inventory",
     "plesk://host/doctor/query/report",
 }
+
+
+def test_reverse_proxy_dry_run_requires_reachable_authenticated_https_upstream(monkeypatch):
+    monkeypatch.setattr(core, "assert_public_upstream", lambda _url: ["203.0.113.10"])
+    monkeypatch.setattr(core, "probe_upstream", lambda _url, path="/": {
+        "url": f"https://founder-origin.example.net{path}",
+        "status": 401,
+        "reachable": True,
+        "authentication_challenge": True,
+    })
+    result = ensure_reverse_proxy(
+        hostname="founder.subactor.com",
+        upstream="https://founder-origin.example.net",
+        base_url="https://plesk.example.test:8443",
+        apply=False,
+    )
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+    assert result["executed"] is False
+    assert result["required_capability"] == "plesk.root_ssh_cli"
+    assert result["plan"]["transport"] == "plesk-root-ssh-cli"
+    assert "directives" not in result["plan"]
+
+
+def test_reverse_proxy_rejects_placeholder_loop_and_missing_authentication(monkeypatch):
+    assert ensure_reverse_proxy(
+        hostname="founder.subactor.com", upstream="pending:reachable-subactor-control",
+    )["ok"] is False
+    assert ensure_reverse_proxy(
+        hostname="founder.subactor.com", upstream="https://founder.subactor.com",
+    )["error"] == "plesk_reverse_proxy_upstream_loop"
+    monkeypatch.setattr(core, "assert_public_upstream", lambda _url: ["203.0.113.10"])
+    monkeypatch.setattr(core, "probe_upstream", lambda _url, path="/": {
+        "url": "https://open.example.net/", "status": 200, "reachable": True,
+        "authentication_challenge": False,
+    })
+    result = ensure_reverse_proxy(
+        hostname="founder.subactor.com", upstream="https://open.example.net",
+        base_url="https://plesk.example.test:8443",
+    )
+    assert result["error"] == "plesk_reverse_proxy_authentication_not_observed"
+
+
+def test_reverse_proxy_managed_block_preserves_other_plesk_directives():
+    first = managed_directives("founder.subactor.com", "https://origin-one.example.net")
+    merged = merge_managed_directives("client_max_body_size 2m;\n", first)
+    assert merged.startswith("client_max_body_size 2m;")
+    assert merged.count(BEGIN_MARKER) == 1
+    replacement = managed_directives("founder.subactor.com", "https://origin-two.example.net")
+    updated = merge_managed_directives(merged, replacement)
+    assert "origin-one.example.net" not in updated
+    assert "origin-two.example.net" in updated
+    assert updated.count(END_MARKER) == 1
+    with pytest.raises(RuntimeError, match="managed_block_corrupt"):
+        merge_managed_directives(BEGIN_MARKER, replacement)
+
+
+def test_reverse_proxy_upstream_must_be_an_external_https_origin():
+    with pytest.raises(RuntimeError, match="https_required"):
+        normalize_upstream("http://origin.example.net", hostname="founder.subactor.com")
+    with pytest.raises(RuntimeError, match="origin_required"):
+        normalize_upstream("https://origin.example.net/path", hostname="founder.subactor.com")
 
 
 def test_remote_inventory_is_bounded_and_does_not_return_credentials(monkeypatch):
@@ -1174,7 +1245,7 @@ def test_doctor_reports_ssl_capabilities(monkeypatch):
     assert report["capabilities"]["certificate_assign"] is True
     assert report["capabilities"]["extensions"]["available"] is True
     assert report["capabilities"]["extensions"]["detail"] == "xml_extension_get; profiled_execution_only"
-    assert report["version"] == "0.13.0"
+    assert report["version"] == "0.14.0"
 
 
 def test_transport_origin_defaults_to_https():

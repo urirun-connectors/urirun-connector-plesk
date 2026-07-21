@@ -412,6 +412,57 @@
         }
       ]
     },
+    "site/command/reverse-proxy-ensure": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true,
+      "inp": {
+        "hostname": "str",
+        "upstream": "str",
+        "authentication_required": "?bool",
+        "authentication_probe_path": "?str",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
+        "base_url": "?str",
+        "root_ssh_host": "?str",
+        "root_ssh_port": "?int",
+        "root_ssh_vault_entry_id": "?str",
+        "root_ssh_host_fingerprint": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "target": "str",
+        "plan_hash": "str",
+        "verified": "?bool",
+        "changed": "?bool",
+        "probe": "obj"
+      },
+      "errors": ["precondition-unmet", "degraded-backend", "permission-denied", "verification-failed"],
+      "examples": [{
+        "payload": {
+          "hostname": "founder.subactor.com",
+          "upstream": "https://founder-origin.example.net",
+          "authentication_required": true,
+          "apply": false
+        },
+        "result": {
+          "ok": true,
+          "dry_run": true,
+          "executed": false,
+          "mutation_attempted": false,
+          "target": "https://plesk.example.com:8443|reverse-proxy:founder.subactor.com",
+          "plan_hash": "sha256",
+          "probe": {"reachable": true, "authentication_challenge": true}
+        }
+      }]
+    },
     "subscription/query/capabilities": {
       "version": "v1",
       "effect": "query",

@@ -54,6 +54,7 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/site/query/release-current` | report `current` / `previous` release ids |
 | `plesk://host/site/command/release-rollback` | activate previous; result `status: rolled_back` |
 | `plesk://host/site/command/subdomain-ensure` | idempotent subdomain create under parent webspace (XML; no DNS) |
+| `plesk://host/site/command/reverse-proxy-ensure` | preflight/apply a marked nginx reverse-proxy block through pinned root SSH, Plesk CLI, config test and rollback |
 | `plesk://host/site/command/ssl-ensure` | ensure origin TLS covers hostname (probe / assign / panel PEM / SSL It LE) |
 | `plesk://host/doctor/query/report` | connector readiness (`ssl_ensure`, `letsencrypt`, `publish_verify`, staging note) |
 
@@ -88,6 +89,15 @@ Subdomain creation follows the same fail-closed lifecycle through
 `plesk://host/site/command/subdomain-ensure`: default dry-run, exact plan hash,
 single-use boundary grant and `PLESK_SUBDOMAIN_APPLY=1`.
 
+Existing-domain additional nginx directives have no stable Plesk REST/XML write
+operation. `site/command/reverse-proxy-ensure` therefore exposes the operation as one
+URI while truthfully using the documented root CLI boundary internally. It requires a
+public HTTPS upstream that demonstrates an authentication challenge, a separately
+scoped `plesk-root-ssh` vault entry, a pinned SHA-256 host key, the master mutation
+gate, `PLESK_REVERSE_PROXY_APPLY=1`, an exact plan hash and a single-use boundary
+grant. The connector preserves non-managed directives, runs `httpdmng` and `nginx -t`,
+reloads only after validation, and restores the previous file when apply fails.
+
 Plesk extensions are runtime objects, not hard-coded connector routes. The connector
 discovers their `id`, name, version, release and active state through the official XML
 `extension.get` operator. Discovery does not grant authority. The checked-in
@@ -103,7 +113,7 @@ to an effect, risk class and transport.
 - An extension-backed GUI feature can delegate to an existing stable URI process. The
   `sslit/certificate-ensure` profile delegates to
   `plesk://host/site/command/ssl-ensure` instead of calling private panel endpoints.
-- Root SSH is a separate future transport. Subscription SFTP credentials are never
+- Root SSH is a separate explicit transport. Subscription SFTP credentials are never
   promoted into Plesk administrator CLI authority.
 
 This separation means installing a new extension immediately changes discovery, while

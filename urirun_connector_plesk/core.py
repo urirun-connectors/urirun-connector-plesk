@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import ssl
 import stat as statmod
 import time
@@ -60,6 +61,14 @@ from .dns_providers import (
     cloudflare_records,
     resolve_dns_authority,
     resolve_dns_propagation,
+)
+from .reverse_proxy import (
+    assert_public_upstream,
+    build_plan as build_reverse_proxy_plan,
+    merge_managed_directives,
+    normalize_hostname as normalize_reverse_proxy_hostname,
+    normalize_upstream,
+    probe_upstream,
 )
 
 try:  # paramiko ships in urirun-node image (PR6); keep importable if extra absent in lab
@@ -2427,6 +2436,190 @@ def ensure_subdomain(
         cust_user = cust_pass = ""
 
 
+def _ssh_command(transport, command: str) -> tuple[int, str]:
+    channel = transport.open_session(timeout=transport_timeouts().connect)
+    try:
+        channel.exec_command(command)
+        output = channel.makefile("rb", -1).read(4096).decode("utf-8", errors="replace")
+        error = channel.makefile_stderr("rb", -1).read(4096).decode("utf-8", errors="replace")
+        code = int(channel.recv_exit_status())
+        return code, (output + "\n" + error).strip()[:1000]
+    finally:
+        channel.close()
+
+
+@conn.handler(
+    "site/command/reverse-proxy-ensure",
+    isolated=True,
+    meta={"label": "Plan or ensure a Plesk vhost reverse proxy through pinned root SSH/CLI"},
+)
+def ensure_reverse_proxy(
+    hostname: str = "",
+    upstream: str = "",
+    authentication_required: bool = True,
+    authentication_probe_path: str = "/",
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    base_url: str = "",
+    root_ssh_host: str = "",
+    root_ssh_port: int = 22,
+    root_ssh_vault_entry_id: str = "plesk-root-ssh",
+    root_ssh_host_fingerprint: str = "",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    """Manage one marked nginx block without pretending Plesk REST/XML can edit it.
+
+    Plesk exposes existing-domain ``vhost_nginx.conf`` changes through the panel
+    and root CLI.  Apply therefore requires a separate, origin-bound root SSH
+    credential and a pinned host key; subscription SFTP is never elevated.
+    """
+    try:
+        host = normalize_reverse_proxy_hostname(hostname)
+        wanted_upstream = normalize_upstream(upstream, hostname=host)
+        addresses = assert_public_upstream(wanted_upstream)
+        probe = probe_upstream(wanted_upstream, path=authentication_probe_path)
+        if not authentication_required:
+            return urirun.fail(
+                "plesk_reverse_proxy_authentication_required",
+                dry_run=not apply, mutation_attempted=False,
+            )
+        if not probe["authentication_challenge"]:
+            return urirun.fail(
+                "plesk_reverse_proxy_authentication_not_observed",
+                dry_run=not apply, mutation_attempted=False, probe=probe,
+            )
+        origin = _base_url(base_url)
+        plan = build_reverse_proxy_plan(
+            host, wanted_upstream, authentication_required=authentication_required,
+        )
+        target = f"{origin}|reverse-proxy:{host}"
+    except RuntimeError as error:
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=False)
+
+    safe_plan = {key: value for key, value in plan.items() if key != "directives"}
+    if not apply:
+        return urirun.ok(
+            dry_run=True, executed=False, mutation_attempted=False, target=target,
+            plan=safe_plan, plan_hash=plan["plan_hash"], artifact_sha256=plan["artifact_sha256"],
+            upstream_addresses=addresses, probe=probe,
+            required_capability="plesk.root_ssh_cli",
+        )
+    if not autonomy_mutations_enabled() and not mutate_lease_active():
+        return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+    if os.environ.get("PLESK_REVERSE_PROXY_APPLY", "").strip() != "1":
+        return urirun.fail("plesk_reverse_proxy_apply_required", dry_run=False, mutation_attempted=False)
+    if plan_hash.strip().lower() != plan["plan_hash"]:
+        return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+    ok, error, claims = verify_apply_grant(
+        apply_grant, plan_hash=plan["plan_hash"], target=target, actor=actor,
+        intent_pack=format_intent_pack(pack_id, pack_version),
+        artifact_sha256=plan["artifact_sha256"],
+    )
+    if not ok or not claims:
+        return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+    if claims.get("risk_class") != "boundary":
+        return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+    fingerprint = root_ssh_host_fingerprint.replace(":", "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        return urirun.fail("plesk_root_ssh_host_key_required", dry_run=False, mutation_attempted=False)
+    ssh_host = (root_ssh_host or urllib.parse.urlparse(origin).hostname or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9.-]+", ssh_host):
+        return urirun.fail("plesk_root_ssh_host_invalid", dry_run=False, mutation_attempted=False)
+    if not 1 <= int(root_ssh_port) <= 65535:
+        return urirun.fail("plesk_root_ssh_port_invalid", dry_run=False, mutation_attempted=False)
+
+    username = password = ""
+    transport = sftp = None
+    mutation_attempted = False
+    config_path = f"/var/www/vhosts/system/{host}/conf/vhost_nginx.conf"
+    old_content: bytes | None = None
+    temp_path = f"{config_path}.subactor-{secrets.token_hex(6)}"
+    try:
+        username = _vault_lease(root_ssh_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(root_ssh_vault_entry_id, origin, "password", vault_url)
+        if username != "root":
+            raise RuntimeError("plesk_root_ssh_principal_required")
+        transport, sftp, observed_fingerprint = _sftp_connect(
+            ssh_host, int(root_ssh_port), username, password, fingerprint,
+        )
+        try:
+            with sftp.open(config_path, "rb") as handle:
+                old_content = handle.read()
+        except IOError:
+            old_content = None
+        current = old_content.decode("utf-8") if old_content is not None else ""
+        merged = merge_managed_directives(current, plan["directives"]).encode("utf-8")
+        if old_content == merged:
+            return urirun.ok(
+                dry_run=False, executed=False, mutation_attempted=False, verified=True,
+                changed=False, target=target, plan_hash=plan["plan_hash"],
+                host_fingerprint=observed_fingerprint,
+            )
+        consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+        if not consumed:
+            return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
+        with sftp.open(temp_path, "wb") as handle:
+            handle.write(merged)
+        sftp.chmod(temp_path, 0o600)
+        sftp.posix_rename(temp_path, config_path)
+        mutation_attempted = True
+        quoted_host = shlex.quote(host)
+        commands = [
+            f"plesk sbin httpdmng --reconfigure-domain {quoted_host} -no-restart",
+            "nginx -t",
+            "systemctl reload nginx",
+        ]
+        evidence = []
+        for command in commands:
+            code, detail = _ssh_command(transport, command)
+            evidence.append({"command": command.split()[0:3], "exit_code": code, "detail": detail})
+            if code != 0:
+                raise RuntimeError("plesk_reverse_proxy_cli_failed")
+        with sftp.open(config_path, "rb") as handle:
+            verified_content = handle.read()
+        if verified_content != merged:
+            raise RuntimeError("plesk_reverse_proxy_verification_failed")
+        return urirun.ok(
+            dry_run=False, executed=True, mutation_attempted=True, verified=True, changed=True,
+            target=target, plan_hash=plan["plan_hash"], grant_jti=claims["jti"],
+            host_fingerprint=observed_fingerprint, evidence=evidence, probe=probe,
+        )
+    except RuntimeError as apply_error:
+        rollback_attempted = mutation_attempted and sftp is not None
+        rollback_ok = False
+        if rollback_attempted:
+            try:
+                if old_content is None:
+                    sftp.remove(config_path)
+                else:
+                    rollback_path = f"{config_path}.rollback-{secrets.token_hex(6)}"
+                    with sftp.open(rollback_path, "wb") as handle:
+                        handle.write(old_content)
+                    sftp.chmod(rollback_path, 0o600)
+                    sftp.posix_rename(rollback_path, config_path)
+                code, _detail = _ssh_command(
+                    transport,
+                    f"plesk sbin httpdmng --reconfigure-domain {shlex.quote(host)} -no-restart",
+                )
+                rollback_ok = code == 0
+            except Exception:
+                rollback_ok = False
+        return urirun.fail(
+            str(apply_error), dry_run=False, mutation_attempted=mutation_attempted,
+            rollback_attempted=rollback_attempted, rollback_ok=rollback_ok,
+        )
+    finally:
+        username = password = ""
+        if sftp is not None:
+            sftp.close()
+        if transport is not None:
+            transport.close()
+
+
 def _validate_publish_inputs(source_dir: str, remote_path: str, host: str) -> str:
     if not source_dir or not os.path.isdir(source_dir):
         return "plesk_site_source_dir_invalid"
@@ -3637,7 +3830,7 @@ def doctor() -> dict[str, Any]:
     return {
         "ok": True,
         "connector": CONNECTOR_ID,
-        "version": "0.13.0",
+        "version": "0.14.0",
         "status": "ready" if ready else "degraded",
         "capabilities": caps,
         "production_publish_ready": ready,
