@@ -3581,6 +3581,91 @@ def release_upload(
     return result
 
 
+def _meta_field(meta: Any, override: str, *keys: str) -> str:
+    """An explicit expectation wins; otherwise take the first key present in meta."""
+    if override:
+        return override
+    if not isinstance(meta, dict):
+        return ""
+    for key in keys:
+        value = meta.get(key)
+        if value:
+            return str(value)
+    return ""
+
+
+def _read_release_meta(*, host: str, release_root: str, release_id: str, plan_hash: str,
+                       sftp_port: int, sftp_vault_entry_id: str, credential_origin: str,
+                       host_fingerprint: str, vault_url: str,
+                       ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    """Read the remote release meta over SFTP; returns (meta, verified, failure-or-None)."""
+    from .release_ops import RELEASE_META_NAME, release_dir, verify_release_local
+
+    try:
+        transport_obj, fs, _fp = _open_sftp_release_fs(
+            host=host,
+            sftp_port=int(sftp_port),
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            credential_origin=credential_origin,
+            host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        try:
+            raw = fs.read_bytes(f"{release_dir(release_root, release_id)}/{RELEASE_META_NAME}")
+            meta = json.loads(raw.decode("utf-8")) if raw else {}
+            verified = verify_release_local(
+                plan=[],
+                release_id=release_id,
+                expected_plan_hash=plan_hash,
+                meta=meta if isinstance(meta, dict) else None,
+            )
+        finally:
+            transport_obj.close()
+    except RuntimeError as error:
+        return {}, {}, urirun.fail(str(error))
+    except (ValueError, UnicodeDecodeError):
+        return {}, {}, urirun.fail(REMOTE_HASH_MISMATCH)
+    return meta, verified, None
+
+
+def _release_expectation(*, meta: Any, hostname: str, release_id: str,
+                         expected_artifact_sha256: str, expected_source_commit: str,
+                         expected_pack_version: str,
+                         dns_targets: list[str] | None) -> dict[str, Any]:
+    """What the published site must prove, merging caller input with the release meta."""
+    return {
+        "release_id": release_id,
+        "artifact_sha256": _meta_field(meta, expected_artifact_sha256,
+                                       "artifact_sha256", "content_sha256"),
+        "source_commit": _meta_field(meta, expected_source_commit,
+                                     "source_commit", "git_commit"),
+        "pack_version": _meta_field(meta, expected_pack_version, "pack_version"),
+        "dns_targets": list(dns_targets or []),
+        "tls_hostname": hostname,
+    }
+
+
+def _release_verdict(ladder: dict[str, Any], *, host: str, domain: str, release_id: str,
+                     release_root: str, verified: dict[str, Any]) -> dict[str, Any]:
+    """Turn the ladder outcome into the handler's answer (unverified is a failure)."""
+    if not ladder.get("ok"):
+        extra = {k: v for k, v in ladder.items() if k not in {"ok", "error"}}
+        return urirun.fail(
+            ladder.get("error") or "applied_unverified",
+            host=host,
+            domain=domain or None,
+            release_id=release_id,
+            **extra,
+        )
+    return urirun.ok(
+        host=host,
+        domain=domain or None,
+        release_root=release_root,
+        **verified,
+        publish_verify=ladder,
+    )
+
+
 @conn.handler(
     "site/command/release-verify",
     isolated=True,
@@ -3606,13 +3691,7 @@ def release_verify(
     expected_source_commit: str = "",
     expected_pack_version: str = "",
 ) -> dict[str, Any]:
-    from .release_ops import (
-        RELEASE_META_NAME,
-        release_dir,
-        validate_release_id,
-        validate_release_root,
-        verify_release_local,
-    )
+    from .release_ops import validate_release_id, validate_release_root
     from .verify_ladder import run_publish_verify_ladder
 
     host = host or sftp_host
@@ -3621,54 +3700,29 @@ def release_verify(
     bad = validate_release_root(release_root) or validate_release_id(release_id)
     if bad:
         return urirun.fail(bad)
-    try:
-        transport_obj, fs, _fp = _open_sftp_release_fs(
-            host=host,
-            sftp_port=int(sftp_port),
-            sftp_vault_entry_id=sftp_vault_entry_id,
-            credential_origin=credential_origin,
-            host_fingerprint=host_fingerprint,
-            vault_url=vault_url,
-        )
-        try:
-            raw = fs.read_bytes(f"{release_dir(release_root, release_id)}/{RELEASE_META_NAME}")
-            meta = json.loads(raw.decode("utf-8")) if raw else {}
-            verified = verify_release_local(
-                plan=[],
-                release_id=release_id,
-                expected_plan_hash=plan_hash,
-                meta=meta if isinstance(meta, dict) else None,
-            )
-        finally:
-            transport_obj.close()
-    except RuntimeError as error:
-        return urirun.fail(str(error))
-    except (ValueError, UnicodeDecodeError):
-        return urirun.fail(REMOTE_HASH_MISMATCH)
+
+    meta, verified, failure = _read_release_meta(
+        host=host, release_root=release_root, release_id=release_id, plan_hash=plan_hash,
+        sftp_port=sftp_port, sftp_vault_entry_id=sftp_vault_entry_id,
+        credential_origin=credential_origin, host_fingerprint=host_fingerprint,
+        vault_url=vault_url,
+    )
+    if failure is not None:
+        return failure
 
     if not (verify_origin or verify_public):
         return urirun.ok(host=host, domain=domain or None, release_root=release_root, **verified)
 
     hostname = domain or host
-    expected = {
-        "release_id": release_id,
-        "artifact_sha256": expected_artifact_sha256
-        or (meta.get("artifact_sha256") if isinstance(meta, dict) else None)
-        or (meta.get("content_sha256") if isinstance(meta, dict) else None)
-        or "",
-        "source_commit": expected_source_commit
-        or (meta.get("source_commit") if isinstance(meta, dict) else None)
-        or (meta.get("git_commit") if isinstance(meta, dict) else None)
-        or "",
-        "pack_version": expected_pack_version
-        or (meta.get("pack_version") if isinstance(meta, dict) else None)
-        or "",
-        "dns_targets": list(dns_targets or []),
-        "tls_hostname": hostname,
-    }
     ladder = run_publish_verify_ladder(
         hostname=hostname,
-        expected=expected,
+        expected=_release_expectation(
+            meta=meta, hostname=hostname, release_id=release_id,
+            expected_artifact_sha256=expected_artifact_sha256,
+            expected_source_commit=expected_source_commit,
+            expected_pack_version=expected_pack_version,
+            dns_targets=dns_targets,
+        ),
         origin_ip=origin_ip,
         check_dns_step=bool(dns_targets),
         check_tls_step=True,
@@ -3676,22 +3730,8 @@ def release_verify(
         check_public=bool(verify_public),
         release_files_ok=True,
     )
-    if not ladder.get("ok"):
-        extra = {k: v for k, v in ladder.items() if k not in {"ok", "error"}}
-        return urirun.fail(
-            ladder.get("error") or "applied_unverified",
-            host=host,
-            domain=domain or None,
-            release_id=release_id,
-            **extra,
-        )
-    return urirun.ok(
-        host=host,
-        domain=domain or None,
-        release_root=release_root,
-        **verified,
-        publish_verify=ladder,
-    )
+    return _release_verdict(ladder, host=host, domain=domain, release_id=release_id,
+                            release_root=release_root, verified=verified)
 
 
 @conn.handler(
