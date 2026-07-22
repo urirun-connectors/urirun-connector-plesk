@@ -402,6 +402,152 @@ def marker_url(hostname: str, *, path: str = RELEASE_MARKER_PATH, scheme: str = 
     return f"{scheme}://{host}{p}"
 
 
+def _coerce_expectation(expected: VerifyExpectation | dict[str, Any],
+                        hostname: str) -> VerifyExpectation:
+    """Accept either a typed expectation or the loose dict a caller may pass."""
+    if not isinstance(expected, dict):
+        if not expected.tls_hostname:
+            expected.tls_hostname = hostname
+        return expected
+    return VerifyExpectation(
+        release_id=str(expected.get("release_id") or ""),
+        artifact_sha256=str(
+            expected.get("artifact_sha256")
+            or expected.get("content_sha256")
+            or ""
+        ),
+        source_commit=str(expected.get("source_commit") or expected.get("git_commit") or ""),
+        pack_version=str(expected.get("pack_version") or ""),
+        dns_targets=list(expected.get("dns_targets") or []),
+        tls_hostname=str(expected.get("tls_hostname") or hostname),
+    )
+
+
+def _verified_flags(steps: dict[str, Any]) -> dict[str, bool]:
+    """Which rungs are already proven — carried into a failure report."""
+    return {
+        "origin_verified": bool((steps.get("origin") or {}).get("ok")),
+        "dns_verified": bool((steps.get("dns") or {}).get("ok")),
+        "tls_verified": bool((steps.get("tls") or {}).get("ok")),
+    }
+
+
+def _rung_origin(steps: dict[str, Any], *, hostname: str, exp: VerifyExpectation,
+                 origin_ip: str, fetch: HttpFetcher) -> dict[str, Any] | None:
+    """Rung 2: verify the origin directly (Host / --resolve), no public DNS needed."""
+    if not origin_ip:
+        steps["origin"] = {"ok": True, "skipped": True, "reason": "no_origin_ip"}
+        return None
+    origin_fetch = fetch(marker_url(hostname), host_header=hostname, resolve_ip=origin_ip)
+    origin_fp = check_fingerprint_response(origin_fetch, exp)
+    steps["origin"] = origin_fp
+    if origin_fp.get("ok"):
+        return None
+    return _fail_ladder(
+        str(origin_fp.get("error") or ORIGIN_UNREACHABLE),
+        steps=steps,
+        hostname=hostname,
+        expected=exp,
+        origin_verified=False,
+    )
+
+
+def _rung_dns(steps: dict[str, Any], *, hostname: str, exp: VerifyExpectation,
+              public_resolver: DnsResolver | None,
+              authoritative_resolver: DnsResolver | None) -> dict[str, Any] | None:
+    """Rung 3: authoritative + public DNS agree on the expected targets."""
+    dns = check_dns(
+        hostname,
+        expected_targets=exp.dns_targets,
+        public_resolver=public_resolver,
+        authoritative_resolver=authoritative_resolver,
+    )
+    steps["dns"] = dns
+    if dns.get("ok"):
+        return None
+    return _fail_ladder(
+        str(dns.get("error") or DNS_MISMATCH),
+        steps=steps,
+        hostname=hostname,
+        expected=exp,
+        origin_verified=bool((steps.get("origin") or {}).get("ok")),
+    )
+
+
+def _rung_tls(steps: dict[str, Any], *, hostname: str, exp: VerifyExpectation, origin_ip: str,
+              tls_inspector: TlsInspector | None) -> dict[str, Any] | None:
+    """Rung 4: the served certificate covers the hostname (connect via origin_ip when given)."""
+    tls = check_tls_san(
+        connect_host=origin_ip or hostname,
+        hostname=exp.tls_hostname or hostname,
+        inspector=tls_inspector,
+    )
+    steps["tls"] = tls
+    if tls.get("ok"):
+        return None
+    return _fail_ladder(
+        str(tls.get("error") or TLS_SAN_MISMATCH),
+        steps=steps,
+        hostname=hostname,
+        expected=exp,
+        **_verified_flags(steps),
+    )
+
+
+def _rung_public(steps: dict[str, Any], *, hostname: str, exp: VerifyExpectation,
+                 fetch: HttpFetcher, expect_https_status: int) -> dict[str, Any] | None:
+    """Rung 5: public HTTPS status plus the release fingerprint marker."""
+    public_fetch = fetch(marker_url(hostname), host_header=hostname)
+    status = check_https_status(public_fetch, expect_status=expect_https_status)
+    steps["https"] = status
+    if not status.get("ok"):
+        return _fail_ladder(
+            str(status.get("error") or HTTPS_STATUS_UNEXPECTED),
+            steps=steps,
+            hostname=hostname,
+            expected=exp,
+            **_verified_flags(steps),
+        )
+    fp = check_fingerprint_response(public_fetch, exp)
+    steps["fingerprint"] = fp
+    if fp.get("ok"):
+        return None
+    return _fail_ladder(
+        str(fp.get("error") or FINGERPRINT_MISMATCH),
+        steps=steps,
+        hostname=hostname,
+        expected=exp,
+        https_ok=True,
+        **_verified_flags(steps),
+    )
+
+
+def _ladder_verified(steps: dict[str, Any], *, hostname: str, exp: VerifyExpectation,
+                     check_public: bool) -> dict[str, Any]:
+    """Every requested rung passed — report what was actually proven."""
+    return {
+        "ok": True,
+        "status": "publicly_verified" if check_public else "origin_verified",
+        "hostname": hostname,
+        "dns_target_verified": bool((steps.get("dns") or {}).get("ok")),
+        "tls_verified": bool((steps.get("tls") or {}).get("ok")),
+        "content_verified": bool(
+            (steps.get("fingerprint") or {}).get("ok")
+            or (steps.get("origin") or {}).get("ok")
+        ),
+        "origin_verified": bool((steps.get("origin") or {}).get("ok")),
+        "steps": steps,
+        "expected": normalize_fingerprint(
+            {
+                "release_id": exp.release_id,
+                "artifact_sha256": exp.artifact_sha256,
+                "source_commit": exp.source_commit,
+                "pack_version": exp.pack_version,
+            }
+        ),
+    }
+
+
 def run_publish_verify_ladder(
     *,
     hostname: str,
@@ -427,24 +573,7 @@ def run_publish_verify_ladder(
       4. TLS SAN
       5. HTTPS status + fingerprint via ``/__subactor_release.json``
     """
-    if isinstance(expected, dict):
-        exp = VerifyExpectation(
-            release_id=str(expected.get("release_id") or ""),
-            artifact_sha256=str(
-                expected.get("artifact_sha256")
-                or expected.get("content_sha256")
-                or ""
-            ),
-            source_commit=str(expected.get("source_commit") or expected.get("git_commit") or ""),
-            pack_version=str(expected.get("pack_version") or ""),
-            dns_targets=list(expected.get("dns_targets") or []),
-            tls_hostname=str(expected.get("tls_hostname") or hostname),
-        )
-    else:
-        exp = expected
-        if not exp.tls_hostname:
-            exp.tls_hostname = hostname
-
+    exp = _coerce_expectation(expected, hostname)
     steps: dict[str, Any] = {}
     fetch = http_fetcher or default_http_fetcher
 
@@ -452,132 +581,45 @@ def run_publish_verify_ladder(
     if release_files_ok is False:
         return _fail_ladder(
             RELEASE_FILES_MISMATCH,
-            steps={
-                "release_files": {"ok": False, "error": RELEASE_FILES_MISMATCH},
-            },
+            steps={"release_files": {"ok": False, "error": RELEASE_FILES_MISMATCH}},
             hostname=hostname,
             expected=exp,
         )
-    steps["release_files"] = {
-        "ok": True if release_files_ok is not False else False,
-        "skipped": release_files_ok is None,
-    }
+    steps["release_files"] = {"ok": True, "skipped": release_files_ok is None}
 
-    # 2. Origin verify without public DNS.
     if check_origin:
-        if not origin_ip:
-            steps["origin"] = {"ok": True, "skipped": True, "reason": "no_origin_ip"}
-        else:
-            origin_fetch = fetch(
-                marker_url(hostname),
-                host_header=hostname,
-                resolve_ip=origin_ip,
-            )
-            origin_fp = check_fingerprint_response(origin_fetch, exp)
-            steps["origin"] = origin_fp
-            if not origin_fp.get("ok"):
-                return _fail_ladder(
-                    str(origin_fp.get("error") or ORIGIN_UNREACHABLE),
-                    steps=steps,
-                    hostname=hostname,
-                    expected=exp,
-                    origin_verified=False,
-                )
+        failed = _rung_origin(steps, hostname=hostname, exp=exp, origin_ip=origin_ip, fetch=fetch)
+        if failed:
+            return failed
 
-    # 3. DNS (skip when no targets — common pre-cutover / staging).
+    # DNS is skipped when there are no targets — common pre-cutover / staging.
     if check_dns_step and exp.dns_targets:
-        dns = check_dns(
-            hostname,
-            expected_targets=exp.dns_targets,
-            public_resolver=public_resolver,
-            authoritative_resolver=authoritative_resolver,
-        )
-        steps["dns"] = dns
-        if not dns.get("ok"):
-            return _fail_ladder(
-                str(dns.get("error") or DNS_MISMATCH),
-                steps=steps,
-                hostname=hostname,
-                expected=exp,
-                origin_verified=bool((steps.get("origin") or {}).get("ok")),
-            )
+        failed = _rung_dns(steps, hostname=hostname, exp=exp, public_resolver=public_resolver,
+                           authoritative_resolver=authoritative_resolver)
+        if failed:
+            return failed
     else:
         steps["dns"] = {"ok": True, "skipped": True, "reason": "dns_check_disabled_or_no_targets"}
 
-    # 4. TLS SAN (connect via origin_ip when provided).
     if check_tls_step:
-        connect_host = origin_ip or hostname
-        tls = check_tls_san(
-            connect_host=connect_host,
-            hostname=exp.tls_hostname or hostname,
-            inspector=tls_inspector,
-        )
-        steps["tls"] = tls
-        if not tls.get("ok"):
-            return _fail_ladder(
-                str(tls.get("error") or TLS_SAN_MISMATCH),
-                steps=steps,
-                hostname=hostname,
-                expected=exp,
-                origin_verified=bool((steps.get("origin") or {}).get("ok")),
-                dns_verified=bool((steps.get("dns") or {}).get("ok")),
-            )
+        failed = _rung_tls(steps, hostname=hostname, exp=exp, origin_ip=origin_ip,
+                           tls_inspector=tls_inspector)
+        if failed:
+            return failed
     else:
         steps["tls"] = {"ok": True, "skipped": True}
 
-    # 5. Public HTTPS + fingerprint (optional; skip when still on Pages / pre-cutover).
+    # Public verify is optional — skip while still on Pages / pre-cutover.
     if check_public:
-        public_fetch = fetch(marker_url(hostname), host_header=hostname)
-        status = check_https_status(public_fetch, expect_status=expect_https_status)
-        steps["https"] = status
-        if not status.get("ok"):
-            return _fail_ladder(
-                str(status.get("error") or HTTPS_STATUS_UNEXPECTED),
-                steps=steps,
-                hostname=hostname,
-                expected=exp,
-                origin_verified=bool((steps.get("origin") or {}).get("ok")),
-                dns_verified=bool((steps.get("dns") or {}).get("ok")),
-                tls_verified=bool((steps.get("tls") or {}).get("ok")),
-            )
-        fp = check_fingerprint_response(public_fetch, exp)
-        steps["fingerprint"] = fp
-        if not fp.get("ok"):
-            return _fail_ladder(
-                str(fp.get("error") or FINGERPRINT_MISMATCH),
-                steps=steps,
-                hostname=hostname,
-                expected=exp,
-                origin_verified=bool((steps.get("origin") or {}).get("ok")),
-                dns_verified=bool((steps.get("dns") or {}).get("ok")),
-                tls_verified=bool((steps.get("tls") or {}).get("ok")),
-                https_ok=True,
-            )
+        failed = _rung_public(steps, hostname=hostname, exp=exp, fetch=fetch,
+                              expect_https_status=expect_https_status)
+        if failed:
+            return failed
     else:
         steps["https"] = {"ok": True, "skipped": True}
         steps["fingerprint"] = {"ok": True, "skipped": True, "reason": "public_verify_disabled"}
 
-    return {
-        "ok": True,
-        "status": "publicly_verified" if check_public else "origin_verified",
-        "hostname": hostname,
-        "dns_target_verified": bool((steps.get("dns") or {}).get("ok")),
-        "tls_verified": bool((steps.get("tls") or {}).get("ok")),
-        "content_verified": bool(
-            (steps.get("fingerprint") or {}).get("ok")
-            or (steps.get("origin") or {}).get("ok")
-        ),
-        "origin_verified": bool((steps.get("origin") or {}).get("ok")),
-        "steps": steps,
-        "expected": normalize_fingerprint(
-            {
-                "release_id": exp.release_id,
-                "artifact_sha256": exp.artifact_sha256,
-                "source_commit": exp.source_commit,
-                "pack_version": exp.pack_version,
-            }
-        ),
-    }
+    return _ladder_verified(steps, hostname=hostname, exp=exp, check_public=check_public)
 
 
 def _fail_ladder(

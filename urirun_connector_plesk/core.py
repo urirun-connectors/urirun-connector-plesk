@@ -17,6 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass
 from typing import Any
 
 import urirun
@@ -1999,6 +2000,317 @@ def _xml_escape(value: str) -> str:
     )
 
 
+@dataclass
+class _SslCtx:
+    """Everything a TLS strategy needs, plus the shared attempt log.
+
+    Credentials live here for the duration of one ``ensure_ssl`` call and are
+    wiped in its ``finally``.
+    """
+
+    host: str
+    peer: str
+    mode: str
+    caps: dict[str, Any]
+    probe: dict[str, Any]
+    attempts: list[dict[str, Any]]
+    base_url: str          # as passed in (the XML agent resolves it itself)
+    origin_api: str        # resolved REST/panel base
+    user: str
+    password: str
+    site_id: Any
+    cert_name: str
+    mail: str
+    runtime_vault_entry_id: str
+    vault_url: str
+    api_key: str = ""
+
+    def wipe(self) -> None:
+        self.user = self.password = self.api_key = ""
+
+    def finish(self, result: dict[str, Any]) -> dict[str, Any]:
+        """Log the attempt and, on success, re-probe and report the new state."""
+        from . import ssl_ops
+
+        self.attempts.append({k: result.get(k) for k in ("strategy", "ok", "error", "detail") if k in result})
+        if not result.get("ok"):
+            return result
+        after = ssl_ops.origin_tls_probe(connect_host=self.peer, hostname=self.host)
+        return urirun.ok(
+            dry_run=False,
+            hostname=self.host,
+            connect_host=self.peer,
+            site_id=self.site_id,
+            certificate_name=result.get("certificate_name") or self.cert_name or None,
+            strategy=result.get("strategy"),
+            created=result.get("strategy") not in {"assign", "probe"},
+            probe=after,
+            attempts=self.attempts,
+            capabilities=self.caps,
+            panel_action=result.get("panel_action"),
+            san_note=result.get("san_note"),
+        )
+
+
+def _ssl_target(hostname: str, provider: str, origin_ip: str, connect_host: str,
+                base_url: str) -> tuple[str, str, str, dict[str, Any] | None]:
+    """Validate the request; returns (host, mode, peer, failure-or-None)."""
+    host = (hostname or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host):
+        return "", "", "", urirun.fail("plesk_ssl_hostname_invalid")
+    mode = (provider or "auto").strip().lower().replace("_", "-")
+    if mode not in {"auto", "assign", "panel-pem", "panel-selfsigned", "letsencrypt", "rest-cli"}:
+        return host, "", "", urirun.fail("plesk_ssl_provider_invalid")
+    peer = (origin_ip or connect_host or "").strip() or urllib.parse.urlparse(_base_url(base_url)).hostname or ""
+    if not peer or not re.fullmatch(r"[A-Za-z0-9.:-]+", peer):
+        return host, mode, "", urirun.fail("plesk_ssl_connect_host_invalid")
+    return host, mode, peer, None
+
+
+def _ssl_gate(host: str, peer: str, mode: str, apply: bool, probe: dict[str, Any],
+              caps: dict[str, Any]) -> dict[str, Any] | None:
+    """Fail-closed gate: probe-only, permission and already-covered outcomes.
+
+    Returns the response to send back, or None when a mutation may proceed.
+    """
+    from . import ssl_ops
+
+    if probe.get("ok") and mode == "auto" and not apply:
+        return urirun.ok(
+            dry_run=True,
+            hostname=host,
+            connect_host=peer,
+            strategy="probe",
+            certificate_name=None,
+            probe=probe,
+            capabilities=caps,
+            note="SAN/CN already covers hostname",
+        )
+    may_write, apply_error = ssl_ops.ssl_apply_permitted(apply=bool(apply))
+    if apply_error:
+        return urirun.fail(
+            apply_error,
+            dry_run=True,
+            hostname=host,
+            connect_host=peer,
+            probe=probe,
+            capabilities=caps,
+        )
+    if not may_write:
+        return urirun.ok(
+            dry_run=True,
+            hostname=host,
+            connect_host=peer,
+            probe=probe,
+            capabilities=caps,
+            strategies=caps.get("ssl_ensure", {}).get("strategies"),
+            note="set apply=true, AUTONOMY_MUTATIONS_ENABLED=1, PLESK_SSL_APPLY=1",
+            panel_action=ssl_ops.PANEL_ACTION_LE if mode in {"auto", "letsencrypt"} else None,
+        )
+    if probe.get("ok") and mode == "auto":
+        return urirun.ok(
+            dry_run=False,
+            hostname=host,
+            connect_host=peer,
+            strategy="probe",
+            created=False,
+            probe=probe,
+            capabilities=caps,
+        )
+    return None
+
+
+def _ssl_stage_assign(ctx: _SslCtx) -> dict[str, Any] | None:
+    """Assign an existing certificate by conventional name (no mutation of certs)."""
+    from . import ssl_ops
+
+    names = [ctx.cert_name] if ctx.cert_name else []
+    names.extend([f"Lets Encrypt {ctx.host}", f"{ctx.host}-san", f"{ctx.host}-ss"])
+    for name in names:
+        assigned = ssl_ops.assign_certificate(
+            base_url=ctx.base_url,
+            username=ctx.user,
+            password=ctx.password,
+            site_id=ctx.site_id,
+            certificate_name=name,
+            xml_agent=_xml_agent,
+        )
+        ctx.attempts.append({k: assigned.get(k) for k in ("strategy", "ok", "error", "detail", "certificate_name")})
+        if not assigned.get("ok"):
+            continue
+        after = ssl_ops.origin_tls_probe(connect_host=ctx.peer, hostname=ctx.host)
+        if after.get("ok") or ctx.mode == "assign":
+            return urirun.ok(
+                dry_run=False,
+                hostname=ctx.host,
+                connect_host=ctx.peer,
+                site_id=ctx.site_id,
+                certificate_name=name,
+                strategy="assign",
+                created=False,
+                probe=after,
+                attempts=ctx.attempts,
+                capabilities=ctx.caps,
+                warning=None if after.get("ok") else "assigned_but_san_mismatch",
+            )
+    if ctx.mode == "assign":
+        return urirun.fail(
+            "plesk_ssl_assign_failed",
+            hostname=ctx.host,
+            attempts=ctx.attempts,
+            capabilities=ctx.caps,
+        )
+    return None
+
+
+def _ssl_stage_panel_pem(ctx: _SslCtx) -> dict[str, Any] | None:
+    """Upload a SAN PEM through the panel — preferred autonomous path (no admin)."""
+    from . import ssl_ops
+
+    try:
+        opener = ssl_ops.panel_login(base_url=ctx.origin_api, username=ctx.user, password=ctx.password)
+        pem_name = ctx.cert_name or f"{ctx.host}-san"
+        cert_pem, key_pem = ssl_ops.generate_self_signed_pem(ctx.host)
+        uploaded = ssl_ops.panel_upload_pem(
+            opener=opener,
+            base_url=ctx.origin_api,
+            site_id=ctx.site_id,
+            cert_name=pem_name,
+            cert_pem=cert_pem,
+            key_pem=key_pem,
+        )
+        cert_pem = key_pem = ""
+        if uploaded.get("ok"):
+            assigned = ssl_ops.assign_certificate(
+                base_url=ctx.base_url,
+                username=ctx.user,
+                password=ctx.password,
+                site_id=ctx.site_id,
+                certificate_name=pem_name,
+                xml_agent=_xml_agent,
+            )
+            if assigned.get("ok"):
+                return ctx.finish({**uploaded, "certificate_name": pem_name})
+        ctx.attempts.append({k: uploaded.get(k) for k in ("strategy", "ok", "error", "detail")})
+    except RuntimeError as error:
+        ctx.attempts.append({"strategy": "panel_upload_pem", "ok": False, "error": str(error)})
+    if ctx.mode == "panel-pem":
+        return urirun.fail(
+            "plesk_ssl_panel_upload_failed",
+            hostname=ctx.host,
+            attempts=ctx.attempts,
+            capabilities=ctx.caps,
+        )
+    return None
+
+
+def _ssl_stage_panel_selfsigned(ctx: _SslCtx) -> dict[str, Any] | None:
+    """Panel self-signed certificate (CN often only — weaker); explicit mode only."""
+    from . import ssl_ops
+
+    opener = ssl_ops.panel_login(base_url=ctx.origin_api, username=ctx.user, password=ctx.password)
+    ss_name = ctx.cert_name or f"{ctx.host}-ss"
+    created = ssl_ops.panel_create_self_signed(
+        opener=opener,
+        base_url=ctx.origin_api,
+        site_id=ctx.site_id,
+        hostname=ctx.host,
+        cert_name=ss_name,
+        email=ctx.mail,
+    )
+    if created.get("ok"):
+        assigned = ssl_ops.assign_certificate(
+            base_url=ctx.base_url,
+            username=ctx.user,
+            password=ctx.password,
+            site_id=ctx.site_id,
+            certificate_name=ss_name,
+            xml_agent=_xml_agent,
+        )
+        if assigned.get("ok"):
+            return ctx.finish({**created, "certificate_name": ss_name})
+    return urirun.fail(
+        created.get("error") or "plesk_ssl_panel_self_signed_failed",
+        hostname=ctx.host,
+        detail=created.get("detail"),
+        capabilities=ctx.caps,
+    )
+
+
+def _ssl_stage_letsencrypt(ctx: _SslCtx) -> dict[str, Any] | None:
+    """Let's Encrypt through the SSL It panel extension."""
+    from . import ssl_ops
+
+    try:
+        opener = ssl_ops.panel_login(base_url=ctx.origin_api, username=ctx.user, password=ctx.password)
+        le = ssl_ops.panel_sslit_letsencrypt(
+            opener=opener,
+            base_url=ctx.origin_api,
+            site_id=ctx.site_id,
+            hostname=ctx.host,
+        )
+        ctx.attempts.append(
+            {k: le.get(k) for k in ("strategy", "ok", "error", "detail", "san_mode", "hitl") if k in le}
+        )
+        if le.get("ok"):
+            return ctx.finish(le)
+    except RuntimeError as error:
+        ctx.attempts.append({"strategy": "panel_sslit_le", "ok": False, "error": str(error)})
+    return None
+
+
+def _ssl_stage_rest_cli(ctx: _SslCtx) -> dict[str, Any] | None:
+    """REST CLI with an admin API key — domain-only (-d hostname, no wildcard/mail)."""
+    from . import ssl_ops
+
+    try:
+        ctx.api_key = _vault_lease(ctx.runtime_vault_entry_id, ctx.origin_api, "api_key", ctx.vault_url)
+        le = ssl_ops.rest_cli_letsencrypt(
+            base_url=ctx.origin_api,
+            api_key=ctx.api_key,
+            hostname=ctx.host,
+            email=ctx.mail,
+            request_json=_request_json,
+        )
+        ctx.attempts.append({k: le.get(k) for k in ("strategy", "ok", "error", "detail")})
+        if le.get("ok"):
+            return ctx.finish(le)
+    except RuntimeError as error:
+        ctx.attempts.append({"strategy": "rest_cli_le", "ok": False, "error": str(error)})
+    return None
+
+
+# TLS strategies in ladder order: which provider modes run them, and the stage.
+_SSL_STAGES: list[tuple[set[str], Any]] = [
+    ({"auto", "assign"}, _ssl_stage_assign),
+    ({"auto", "panel-pem"}, _ssl_stage_panel_pem),
+    ({"panel-selfsigned"}, _ssl_stage_panel_selfsigned),
+    ({"auto", "letsencrypt"}, _ssl_stage_letsencrypt),
+    ({"auto", "rest-cli", "letsencrypt"}, _ssl_stage_rest_cli),
+]
+
+
+def _ssl_exhausted(ctx: _SslCtx) -> dict[str, Any]:
+    """No strategy covered the hostname — report the last attempt and the HITL step."""
+    from . import ssl_ops
+
+    last = ctx.attempts[-1] if ctx.attempts else {}
+    hitl = last.get("hitl") or {**ssl_ops.HITL_LE_DOMAIN_ONLY, "detail": last.get("detail")}
+    return urirun.fail(
+        last.get("error") or "plesk_ssl_ensure_failed",
+        hostname=ctx.host,
+        connect_host=ctx.peer,
+        site_id=ctx.site_id,
+        probe=ctx.probe,
+        attempts=ctx.attempts,
+        capabilities=ctx.caps,
+        panel_action=ssl_ops.PANEL_ACTION_LE,
+        detail=last.get("detail"),
+        hitl=hitl,
+        san_mode="domain_only",
+    )
+
+
 @conn.handler(
     "site/command/ssl-ensure",
     isolated=True,
@@ -2024,272 +2336,58 @@ def ensure_ssl(
     """
     from . import ssl_ops
 
-    host = (hostname or "").strip().lower()
-    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host):
-        return urirun.fail("plesk_ssl_hostname_invalid")
-    mode = (provider or "auto").strip().lower().replace("_", "-")
-    if mode not in {"auto", "assign", "panel-pem", "panel-selfsigned", "letsencrypt", "rest-cli"}:
-        return urirun.fail("plesk_ssl_provider_invalid")
-    peer = (origin_ip or connect_host or "").strip() or urllib.parse.urlparse(_base_url(base_url)).hostname or ""
-    if not peer or not re.fullmatch(r"[A-Za-z0-9.:-]+", peer):
-        return urirun.fail("plesk_ssl_connect_host_invalid")
+    host, mode, peer, invalid = _ssl_target(hostname, provider, origin_ip, connect_host, base_url)
+    if invalid:
+        return invalid
 
     caps = build_capabilities(paramiko_mod=paramiko)
     probe = ssl_ops.origin_tls_probe(connect_host=peer, hostname=host)
-    if probe.get("ok") and mode == "auto" and not apply:
-        return urirun.ok(
-            dry_run=True,
-            hostname=host,
-            connect_host=peer,
-            strategy="probe",
-            certificate_name=None,
-            probe=probe,
-            capabilities=caps,
-            note="SAN/CN already covers hostname",
-        )
+    gated = _ssl_gate(host, peer, mode, bool(apply), probe, caps)
+    if gated:
+        return gated
 
-    may_write, apply_error = ssl_ops.ssl_apply_permitted(apply=bool(apply))
-    if apply_error:
-        return urirun.fail(
-            apply_error,
-            dry_run=True,
-            hostname=host,
-            connect_host=peer,
-            probe=probe,
-            capabilities=caps,
-        )
-    if not may_write:
-        return urirun.ok(
-            dry_run=True,
-            hostname=host,
-            connect_host=peer,
-            probe=probe,
-            capabilities=caps,
-            strategies=caps.get("ssl_ensure", {}).get("strategies"),
-            note="set apply=true, AUTONOMY_MUTATIONS_ENABLED=1, PLESK_SSL_APPLY=1",
-            panel_action=ssl_ops.PANEL_ACTION_LE if mode in {"auto", "letsencrypt"} else None,
-        )
-
-    if probe.get("ok") and mode == "auto":
-        return urirun.ok(
-            dry_run=False,
-            hostname=host,
-            connect_host=peer,
-            strategy="probe",
-            created=False,
-            probe=probe,
-            capabilities=caps,
-        )
-
-    cust_user = cust_pass = api_key = ""
     attempts: list[dict[str, Any]] = []
+    ctx: _SslCtx | None = None
     try:
         origin_api = _base_url(base_url)
-        cust_user = _vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url)
-        cust_pass = _vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url)
-        site_id = ssl_ops.resolve_site_id(
+        ctx = _SslCtx(
+            host=host,
+            peer=peer,
+            mode=mode,
+            caps=caps,
+            probe=probe,
+            attempts=attempts,
             base_url=base_url,
-            username=cust_user,
-            password=cust_pass,
+            origin_api=origin_api,
+            user=_vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url),
+            password=_vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url),
+            site_id=None,
+            cert_name=(certificate_name or "").strip(),
+            mail=(email or os.environ.get("PLESK_CUSTOMER_EMAIL") or "agent@subactor.com").strip(),
+            runtime_vault_entry_id=runtime_vault_entry_id,
+            vault_url=vault_url,
+        )
+        ctx.site_id = ssl_ops.resolve_site_id(
+            base_url=base_url,
+            username=ctx.user,
+            password=ctx.password,
             hostname=host,
             xml_agent=_xml_agent,
         )
-        if site_id is None:
+        if ctx.site_id is None:
             return urirun.fail("plesk_ssl_site_not_found", hostname=host, capabilities=caps)
 
-        cert_name = (certificate_name or "").strip()
-        mail = (email or os.environ.get("PLESK_CUSTOMER_EMAIL") or "agent@subactor.com").strip()
-
-        def _finish(result: dict[str, Any]) -> dict[str, Any]:
-            attempts.append({k: result.get(k) for k in ("strategy", "ok", "error", "detail") if k in result})
-            if not result.get("ok"):
-                return result
-            # Re-probe after mutate
-            after = ssl_ops.origin_tls_probe(connect_host=peer, hostname=host)
-            return urirun.ok(
-                dry_run=False,
-                hostname=host,
-                connect_host=peer,
-                site_id=site_id,
-                certificate_name=result.get("certificate_name") or cert_name or None,
-                strategy=result.get("strategy"),
-                created=result.get("strategy") not in {"assign", "probe"},
-                probe=after,
-                attempts=attempts,
-                capabilities=caps,
-                panel_action=result.get("panel_action"),
-                san_note=result.get("san_note"),
-            )
-
-        # 1) assign named / conventional LE name
-        if mode in {"auto", "assign"}:
-            names = []
-            if cert_name:
-                names.append(cert_name)
-            names.extend([f"Lets Encrypt {host}", f"{host}-san", f"{host}-ss"])
-            for name in names:
-                assigned = ssl_ops.assign_certificate(
-                    base_url=base_url,
-                    username=cust_user,
-                    password=cust_pass,
-                    site_id=site_id,
-                    certificate_name=name,
-                    xml_agent=_xml_agent,
-                )
-                attempts.append({k: assigned.get(k) for k in ("strategy", "ok", "error", "detail", "certificate_name")})
-                if assigned.get("ok"):
-                    after = ssl_ops.origin_tls_probe(connect_host=peer, hostname=host)
-                    if after.get("ok") or mode == "assign":
-                        return urirun.ok(
-                            dry_run=False,
-                            hostname=host,
-                            connect_host=peer,
-                            site_id=site_id,
-                            certificate_name=name,
-                            strategy="assign",
-                            created=False,
-                            probe=after,
-                            attempts=attempts,
-                            capabilities=caps,
-                            warning=None if after.get("ok") else "assigned_but_san_mismatch",
-                        )
-            if mode == "assign":
-                return urirun.fail(
-                    "plesk_ssl_assign_failed",
-                    hostname=host,
-                    attempts=attempts,
-                    capabilities=caps,
-                )
-
-        # 2) panel PEM with SAN (preferred autonomous path without admin)
-        if mode in {"auto", "panel-pem"}:
-            try:
-                opener = ssl_ops.panel_login(
-                    base_url=origin_api, username=cust_user, password=cust_pass,
-                )
-                pem_name = cert_name or f"{host}-san"
-                cert_pem, key_pem = ssl_ops.generate_self_signed_pem(host)
-                uploaded = ssl_ops.panel_upload_pem(
-                    opener=opener,
-                    base_url=origin_api,
-                    site_id=site_id,
-                    cert_name=pem_name,
-                    cert_pem=cert_pem,
-                    key_pem=key_pem,
-                )
-                cert_pem = key_pem = ""
-                if uploaded.get("ok"):
-                    assigned = ssl_ops.assign_certificate(
-                        base_url=base_url,
-                        username=cust_user,
-                        password=cust_pass,
-                        site_id=site_id,
-                        certificate_name=pem_name,
-                        xml_agent=_xml_agent,
-                    )
-                    if assigned.get("ok"):
-                        return _finish({**uploaded, "certificate_name": pem_name})
-                attempts.append({k: uploaded.get(k) for k in ("strategy", "ok", "error", "detail")})
-            except RuntimeError as error:
-                attempts.append({"strategy": "panel_upload_pem", "ok": False, "error": str(error)})
-            if mode == "panel-pem":
-                return urirun.fail(
-                    "plesk_ssl_panel_upload_failed",
-                    hostname=host,
-                    attempts=attempts,
-                    capabilities=caps,
-                )
-
-        # 3) panel self-signed (CN often only — weaker)
-        if mode == "panel-selfsigned":
-            opener = ssl_ops.panel_login(base_url=origin_api, username=cust_user, password=cust_pass)
-            ss_name = cert_name or f"{host}-ss"
-            created = ssl_ops.panel_create_self_signed(
-                opener=opener,
-                base_url=origin_api,
-                site_id=site_id,
-                hostname=host,
-                cert_name=ss_name,
-                email=mail,
-            )
-            if created.get("ok"):
-                assigned = ssl_ops.assign_certificate(
-                    base_url=base_url,
-                    username=cust_user,
-                    password=cust_pass,
-                    site_id=site_id,
-                    certificate_name=ss_name,
-                    xml_agent=_xml_agent,
-                )
-                if assigned.get("ok"):
-                    return _finish({**created, "certificate_name": ss_name})
-            return urirun.fail(
-                created.get("error") or "plesk_ssl_panel_self_signed_failed",
-                hostname=host,
-                detail=created.get("detail"),
-                capabilities=caps,
-            )
-
-        # 4) Let's Encrypt via SSL It panel
-        if mode in {"auto", "letsencrypt"}:
-            try:
-                opener = ssl_ops.panel_login(
-                    base_url=origin_api, username=cust_user, password=cust_pass,
-                )
-                le = ssl_ops.panel_sslit_letsencrypt(
-                    opener=opener,
-                    base_url=origin_api,
-                    site_id=site_id,
-                    hostname=host,
-                )
-                attempts.append(
-                    {
-                        k: le.get(k)
-                        for k in ("strategy", "ok", "error", "detail", "san_mode", "hitl")
-                        if k in le
-                    }
-                )
-                if le.get("ok"):
-                    return _finish(le)
-            except RuntimeError as error:
-                attempts.append({"strategy": "panel_sslit_le", "ok": False, "error": str(error)})
-
-        # 5) REST CLI (admin API key) — domain-only (-d hostname, no wildcard/mail)
-        if mode in {"auto", "rest-cli", "letsencrypt"}:
-            try:
-                api_key = _vault_lease(runtime_vault_entry_id, origin_api, "api_key", vault_url)
-                le = ssl_ops.rest_cli_letsencrypt(
-                    base_url=origin_api,
-                    api_key=api_key,
-                    hostname=host,
-                    email=mail,
-                    request_json=_request_json,
-                )
-                attempts.append({k: le.get(k) for k in ("strategy", "ok", "error", "detail")})
-                if le.get("ok"):
-                    return _finish(le)
-            except RuntimeError as error:
-                attempts.append({"strategy": "rest_cli_le", "ok": False, "error": str(error)})
-
-        last = attempts[-1] if attempts else {}
-        hitl = last.get("hitl") or {**ssl_ops.HITL_LE_DOMAIN_ONLY, "detail": last.get("detail")}
-        return urirun.fail(
-            last.get("error") or "plesk_ssl_ensure_failed",
-            hostname=host,
-            connect_host=peer,
-            site_id=site_id,
-            probe=probe,
-            attempts=attempts,
-            capabilities=caps,
-            panel_action=ssl_ops.PANEL_ACTION_LE,
-            detail=last.get("detail"),
-            hitl=hitl,
-            san_mode="domain_only",
-        )
+        for modes, stage in _SSL_STAGES:
+            if mode in modes:
+                outcome = stage(ctx)
+                if outcome is not None:
+                    return outcome
+        return _ssl_exhausted(ctx)
     except RuntimeError as error:
         return urirun.fail(str(error), hostname=host, capabilities=caps, attempts=attempts)
     finally:
-        cust_user = cust_pass = api_key = ""
+        if ctx is not None:
+            ctx.wipe()
 
 
 @conn.handler(
@@ -2890,65 +2988,28 @@ def site_remote_inventory(
             transport.close()
 
 
-def _site_tree_sync(
-    *,
-    source_dir: str,
-    remote_path: str,
-    host: str,
-    transport: str,
-    sftp_port: int,
-    ftp_port: int,
-    ftp_tls: bool,
-    sftp_vault_entry_id: str,
-    ftp_vault_entry_id: str,
-    credential_origin: str,
-    host_fingerprint: str,
-    vault_url: str,
-    apply: bool,
-    domain: str = "",
-    exclude: list[str] | None = None,
-    plan_hash: str = "",
-    apply_grant: str = "",
-    actor: str = "",
-    pack_id: str = "",
-    pack_version: str = "",
-    recipe_ref: str = "",
-) -> dict[str, Any]:
+def _sync_validate(*, source_dir: str, remote_path: str, host: str, transport: str,
+                   sftp_port: int, ftp_port: int) -> str:
+    """Return the first input error code, or "" when the request is well-formed."""
     invalid = _validate_publish_inputs(source_dir, remote_path, host)
     if invalid:
-        return urirun.fail(invalid)
+        return invalid
     for port in (sftp_port, ftp_port):
         bad = _validate_port(port)
         if bad:
-            return urirun.fail(bad)
+            return bad
     if transport not in {"auto", "sftp", "ftp"}:
-        return urirun.fail("plesk_site_transport_invalid")
+        return "plesk_site_transport_invalid"
     if not _source_allowed(source_dir):
-        return urirun.fail("plesk_site_source_not_allowlisted")
+        return "plesk_site_source_not_allowlisted"
+    return ""
 
-    exclude_patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
-    plan = _plan_local_tree(source_dir, remote_path, exclude_patterns)
-    manifest = build_immutable_manifest(
-        plan=plan,
-        host=host,
-        domain=domain,
-        remote_path=remote_path,
-        pack_id=pack_id,
-        pack_version=pack_version,
-        recipe_ref=recipe_ref,
-    )
-    may_write, apply_error, grant_claims = _apply_permitted(
-        bool(apply),
-        apply_grant=apply_grant,
-        plan_hash=plan_hash,
-        target=host or "",
-        actor=actor,
-        pack_id=pack_id,
-        pack_version=pack_version,
-        # Do not bind grant artifact to recomputed tree here — PR5a plan_hash
-        # mismatch is the content gate; optional artifact check is request-driven.
-        artifact_sha256="",
-    )
+
+def _sync_apply_gate(*, apply_error: str, may_write: bool, plan: list[dict[str, Any]],
+                     manifest: dict[str, Any], host: str, remote_path: str, domain: str,
+                     exclude_patterns: tuple[str, ...],
+                     grant_claims: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Autonomy gate: report the refusal or the dry-run plan; None means proceed."""
     if apply_error:
         return connector_result(
             ok=False,
@@ -2981,8 +3042,16 @@ def _site_tree_sync(
             exclude=list(exclude_patterns),
             note="set apply=true, AUTONOMY_MUTATIONS_ENABLED=1, PLESK_SYNC_APPLY=1, plan_hash, and signed apply_grant",
         )
+    return None
 
-    # PR5a: apply must bind to dry-run plan_hash — no free re-scan divergence / zero upload on mismatch.
+
+def _sync_plan_hash_gate(*, plan: list[dict[str, Any]], plan_hash: str, host: str, domain: str,
+                         remote_path: str) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    """PR5a: apply must bind to the dry-run plan_hash.
+
+    No free re-scan divergence — a mismatch uploads zero files. Returns
+    (failure-or-None, verified manifest).
+    """
     matched, verified, mismatch = verify_plan_hash(
         plan=plan,
         expected_plan_hash=plan_hash,
@@ -2990,58 +3059,58 @@ def _site_tree_sync(
         domain=domain,
         remote_path=remote_path,
     )
-    if not matched:
-        error = mismatch or "plan_hash_mismatch"
-        return connector_result(
-            ok=False,
-            reason_code=classify_connector_reason(error),
-            reason=error,
-            error=error,
-            dry_run=True,
-            files_planned=len(plan),
-            bytes_planned=verified["bytes_total"],
-            plan=plan,
-            manifest=verified,
-            plan_hash=verified["plan_hash"],
-            files_uploaded=0,
-            preserve_remote=list(_PRESERVE_REMOTE_NAMES),
-            domain=domain or None,
-        )
-    manifest = verified
+    if matched:
+        return None, verified
+    error = mismatch or "plan_hash_mismatch"
+    return connector_result(
+        ok=False,
+        reason_code=classify_connector_reason(error),
+        reason=error,
+        error=error,
+        dry_run=True,
+        files_planned=len(plan),
+        bytes_planned=verified["bytes_total"],
+        plan=plan,
+        manifest=verified,
+        plan_hash=verified["plan_hash"],
+        files_uploaded=0,
+        preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+        domain=domain or None,
+    ), verified
 
-    # PR5c: consume jti after gates pass, before any network mutation.
-    jti = (grant_claims or {}).get("jti") or ""
-    expires_at = (grant_claims or {}).get("expires_at") or ""
-    replay_ok, replay_error = consume_apply_grant_jti(jti, expires_at)
-    if not replay_ok:
-        return urirun.fail(
-            replay_error or "apply_grant_replay",
-            dry_run=True,
-            files_planned=len(plan),
-            plan=plan,
-            manifest=manifest,
-            plan_hash=manifest["plan_hash"],
-            files_uploaded=0,
-            preserve_remote=list(_PRESERVE_REMOTE_NAMES),
-            domain=domain or None,
-            grant_claims=grant_claims,
-        )
 
-    chosen = transport
-    detection: list[dict[str, Any]] | None = None
-    caps = build_capabilities(paramiko_mod=paramiko)
+def _sync_replay_gate(*, grant_claims: dict[str, Any] | None, plan: list[dict[str, Any]],
+                      manifest: dict[str, Any], domain: str) -> dict[str, Any] | None:
+    """PR5c: consume the grant jti after the gates pass, before any network mutation."""
+    claims = grant_claims or {}
+    replay_ok, replay_error = consume_apply_grant_jti(claims.get("jti") or "",
+                                                     claims.get("expires_at") or "")
+    if replay_ok:
+        return None
+    return urirun.fail(
+        replay_error or "apply_grant_replay",
+        dry_run=True,
+        files_planned=len(plan),
+        plan=plan,
+        manifest=manifest,
+        plan_hash=manifest["plan_hash"],
+        files_uploaded=0,
+        preserve_remote=list(_PRESERVE_REMOTE_NAMES),
+        domain=domain or None,
+        grant_claims=grant_claims,
+    )
 
-    # Production publish: missing SFTP blocks readiness even if FTP is available.
+
+def _sync_capability_denial(caps: dict[str, Any], transport: str) -> dict[str, Any] | None:
+    """Production publish: missing SFTP blocks readiness even when FTP is available."""
     deny = deny_if_sftp_required(caps, transport=transport)
-    if deny and transport in {"auto", "sftp"}:
-        # Explicit transport=ftp handled below when fallback policy is off.
-        if not caps["sftp"]["available"]:
-            return urirun.fail(
-                CAPABILITY_UNAVAILABLE,
-                capabilities=caps,
-                production_publish_ready=False,
-                note="SFTP/paramiko required for production publish; FTP-only is not sufficient",
-            )
+    if deny and transport in {"auto", "sftp"} and not caps["sftp"]["available"]:
+        return urirun.fail(
+            CAPABILITY_UNAVAILABLE,
+            capabilities=caps,
+            production_publish_ready=False,
+            note="SFTP/paramiko required for production publish; FTP-only is not sufficient",
+        )
     if transport == "ftp" and deny:
         return urirun.fail(
             CAPABILITY_UNAVAILABLE,
@@ -3049,36 +3118,43 @@ def _site_tree_sync(
             production_publish_ready=production_publish_ready(caps),
             note="FTP apply denied unless PLESK_SYNC_ALLOW_FTP_FALLBACK=1",
         )
+    return None
 
-    if transport == "auto":
-        detection = _detect_transports(
-            host, sftp_port=int(sftp_port), ftp_port=int(ftp_port), ftp_tls=bool(ftp_tls),
-            sftp_vault_entry_id=sftp_vault_entry_id, ftp_vault_entry_id=ftp_vault_entry_id,
-            credential_origin=credential_origin, host_fingerprint=host_fingerprint, vault_url=vault_url,
-        )
-        available = [r["transport"] for r in detection if r["available"]]
-        if not available:
-            return urirun.fail("plesk_site_no_authorized_transport", methods=detection, capabilities=caps)
-        if "sftp" in available:
-            chosen = "sftp"
-        elif ftp_fallback_allowed():
-            chosen = available[0]
-        else:
-            return urirun.fail(
-                CAPABILITY_UNAVAILABLE,
-                methods=detection,
-                capabilities=caps,
-                production_publish_ready=False,
-                note="SFTP unavailable; FTP fallback disabled (set PLESK_SYNC_ALLOW_FTP_FALLBACK=1 to allow)",
-            )
 
-    if chosen == "sftp" and paramiko is None:
-        return urirun.fail(CAPABILITY_UNAVAILABLE, capabilities=caps)
+def _sync_autodetect(*, host: str, caps: dict[str, Any], sftp_port: int, ftp_port: int,
+                     ftp_tls: bool, sftp_vault_entry_id: str, ftp_vault_entry_id: str,
+                     credential_origin: str, host_fingerprint: str,
+                     vault_url: str) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+    """Probe both transports; returns (chosen, detection, failure-or-None)."""
+    detection = _detect_transports(
+        host, sftp_port=int(sftp_port), ftp_port=int(ftp_port), ftp_tls=bool(ftp_tls),
+        sftp_vault_entry_id=sftp_vault_entry_id, ftp_vault_entry_id=ftp_vault_entry_id,
+        credential_origin=credential_origin, host_fingerprint=host_fingerprint, vault_url=vault_url,
+    )
+    available = [r["transport"] for r in detection if r["available"]]
+    if not available:
+        return "", detection, urirun.fail(
+            "plesk_site_no_authorized_transport", methods=detection, capabilities=caps)
+    if "sftp" in available:
+        return "sftp", detection, None
+    if ftp_fallback_allowed():
+        return available[0], detection, None
+    return "", detection, urirun.fail(
+        CAPABILITY_UNAVAILABLE,
+        methods=detection,
+        capabilities=caps,
+        production_publish_ready=False,
+        note="SFTP unavailable; FTP fallback disabled (set PLESK_SYNC_ALLOW_FTP_FALLBACK=1 to allow)",
+    )
 
+
+def _sync_transfer(*, chosen: str, source_dir: str, remote_path: str, host: str, port: int,
+                   entry: str, origin: str, vault_url: str, host_fingerprint: str,
+                   ftp_tls: bool, exclude_patterns: tuple[str, ...], plan: list[dict[str, Any]],
+                   caps: dict[str, Any], detection: list[dict[str, Any]] | None,
+                   ) -> tuple[list[Any], dict[str, Any], dict[str, Any] | None]:
+    """Lease credentials and upload; returns (uploaded, extra, failure-or-None)."""
     verify_remote_hash = os.environ.get("PLESK_SYNC_VERIFY_REMOTE_HASH", "").strip() == "1"
-    entry = sftp_vault_entry_id if chosen == "sftp" else ftp_vault_entry_id
-    port = int(sftp_port) if chosen == "sftp" else int(ftp_port)
-    origin = _transport_origin(chosen, host, credential_origin)
     username = password = ""
     try:
         username = _vault_lease(entry, origin, "username", vault_url)
@@ -3093,11 +3169,112 @@ def _site_tree_sync(
                 source_dir, remote_path, host, port, username, password, bool(ftp_tls), exclude_patterns,
             )
     except RuntimeError as error:
-        return urirun.fail(str(error), capabilities=caps, transport=chosen, methods=detection)
+        return [], {}, urirun.fail(str(error), capabilities=caps, transport=chosen, methods=detection)
     except Exception as error:
-        return urirun.fail(map_exception(error, phase="transfer"), capabilities=caps, transport=chosen)
+        return [], {}, urirun.fail(map_exception(error, phase="transfer"), capabilities=caps, transport=chosen)
     finally:
         username = password = ""
+    return uploaded, extra, None
+
+
+def _site_tree_sync(
+    *,
+    source_dir: str,
+    remote_path: str,
+    host: str,
+    transport: str,
+    sftp_port: int,
+    ftp_port: int,
+    ftp_tls: bool,
+    sftp_vault_entry_id: str,
+    ftp_vault_entry_id: str,
+    credential_origin: str,
+    host_fingerprint: str,
+    vault_url: str,
+    apply: bool,
+    domain: str = "",
+    exclude: list[str] | None = None,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
+    recipe_ref: str = "",
+) -> dict[str, Any]:
+    """Plan, gate and (when permitted) apply the local tree onto the remote path."""
+    invalid = _sync_validate(source_dir=source_dir, remote_path=remote_path, host=host,
+                             transport=transport, sftp_port=sftp_port, ftp_port=ftp_port)
+    if invalid:
+        return urirun.fail(invalid)
+
+    exclude_patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
+    plan = _plan_local_tree(source_dir, remote_path, exclude_patterns)
+    manifest = build_immutable_manifest(
+        plan=plan,
+        host=host,
+        domain=domain,
+        remote_path=remote_path,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        recipe_ref=recipe_ref,
+    )
+    may_write, apply_error, grant_claims = _apply_permitted(
+        bool(apply),
+        apply_grant=apply_grant,
+        plan_hash=plan_hash,
+        target=host or "",
+        actor=actor,
+        pack_id=pack_id,
+        pack_version=pack_version,
+        # Do not bind grant artifact to recomputed tree here — PR5a plan_hash
+        # mismatch is the content gate; optional artifact check is request-driven.
+        artifact_sha256="",
+    )
+    gated = _sync_apply_gate(
+        apply_error=apply_error, may_write=may_write, plan=plan, manifest=manifest,
+        host=host, remote_path=remote_path, domain=domain,
+        exclude_patterns=exclude_patterns, grant_claims=grant_claims,
+    )
+    if gated is not None:
+        return gated
+
+    mismatch, manifest = _sync_plan_hash_gate(
+        plan=plan, plan_hash=plan_hash, host=host, domain=domain, remote_path=remote_path)
+    if mismatch is not None:
+        return mismatch
+
+    replayed = _sync_replay_gate(grant_claims=grant_claims, plan=plan, manifest=manifest, domain=domain)
+    if replayed is not None:
+        return replayed
+
+    chosen = transport
+    detection: list[dict[str, Any]] | None = None
+    caps = build_capabilities(paramiko_mod=paramiko)
+    denied = _sync_capability_denial(caps, transport)
+    if denied is not None:
+        return denied
+    if transport == "auto":
+        chosen, detection, unavailable = _sync_autodetect(
+            host=host, caps=caps, sftp_port=sftp_port, ftp_port=ftp_port, ftp_tls=ftp_tls,
+            sftp_vault_entry_id=sftp_vault_entry_id, ftp_vault_entry_id=ftp_vault_entry_id,
+            credential_origin=credential_origin, host_fingerprint=host_fingerprint,
+            vault_url=vault_url,
+        )
+        if unavailable is not None:
+            return unavailable
+    if chosen == "sftp" and paramiko is None:
+        return urirun.fail(CAPABILITY_UNAVAILABLE, capabilities=caps)
+
+    uploaded, extra, failure = _sync_transfer(
+        chosen=chosen, source_dir=source_dir, remote_path=remote_path, host=host,
+        port=int(sftp_port) if chosen == "sftp" else int(ftp_port),
+        entry=sftp_vault_entry_id if chosen == "sftp" else ftp_vault_entry_id,
+        origin=_transport_origin(chosen, host, credential_origin), vault_url=vault_url,
+        host_fingerprint=host_fingerprint, ftp_tls=ftp_tls, exclude_patterns=exclude_patterns,
+        plan=plan, caps=caps, detection=detection,
+    )
+    if failure is not None:
+        return failure
     return connector_result(
         ok=True,
         executed=True,

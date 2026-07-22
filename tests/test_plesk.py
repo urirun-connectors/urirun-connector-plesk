@@ -2029,3 +2029,112 @@ def test_site_sync_allows_sanitized_public_status_basename(tmp_path):
     result = site_sync(source_dir=str(status), host="prototypowanie.pl", domain="status.subactor.com")
     assert result["ok"] and result["dry_run"] is True
     assert result["files_planned"] == 1
+
+
+def _ssl_apply_env(monkeypatch, probe_results):
+    """Common wiring for a full ssl-ensure ladder run under apply."""
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_SSL_APPLY", "1")
+    monkeypatch.setattr(
+        core,
+        "_vault_lease",
+        lambda entry, origin, field, vault_url="": {
+            "username": "cust", "password": "cust-pass", "api_key": "admin-key"
+        }[field],
+    )
+    probes = iter(probe_results)
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.origin_tls_probe", lambda **kwargs: next(probes)
+    )
+    monkeypatch.setattr("urirun_connector_plesk.ssl_ops.resolve_site_id", lambda **kwargs: 308)
+
+
+def test_ensure_ssl_auto_walks_ladder_until_a_strategy_covers_the_host(monkeypatch):
+    """auto: assign → panel PEM → SSL It LE; the first success wins and is re-probed."""
+    mismatch = {"ok": False, "sans": [], "error": "tls_san_mismatch"}
+    covered = {"ok": True, "sans": ["docs.subactor.com"], "error": None}
+    # initial probe, per-assign-attempt probes are not reached (assign fails), final re-probe
+    _ssl_apply_env(monkeypatch, [mismatch, covered])
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.assign_certificate",
+        lambda **kwargs: {"ok": False, "strategy": "assign", "error": "certificate_not_found"},
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.panel_login",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("panel_login_failed")),
+    )
+    called = {}
+
+    def fake_rest_cli(**kwargs):
+        called["api_key"] = kwargs["api_key"]
+        return {"ok": True, "strategy": "rest_cli_le", "certificate_name": "Lets Encrypt docs.subactor.com"}
+
+    monkeypatch.setattr("urirun_connector_plesk.ssl_ops.rest_cli_letsencrypt", fake_rest_cli)
+
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="217.160.250.222",
+        base_url="https://prototypowanie.pl:8443",
+        apply=True,
+    )
+    assert result["ok"] is True and result["strategy"] == "rest_cli_le"
+    assert result["created"] is True and result["probe"] == covered
+    assert called["api_key"] == "admin-key"
+    # every rung that ran is logged in order, panel failures included
+    strategies = [a.get("strategy") for a in result["attempts"]]
+    assert strategies[:3] == ["assign", "assign", "assign"]      # cert-name candidates
+    assert "panel_upload_pem" in strategies and "rest_cli_le" in strategies
+
+
+def test_ensure_ssl_auto_reports_hitl_when_every_strategy_fails(monkeypatch):
+    """Exhausted ladder fails closed with the panel action a human has to take."""
+    mismatch = {"ok": False, "sans": [], "error": "tls_san_mismatch"}
+    _ssl_apply_env(monkeypatch, [mismatch])
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.assign_certificate",
+        lambda **kwargs: {"ok": False, "strategy": "assign", "error": "certificate_not_found"},
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.panel_login",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("panel_login_failed")),
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.rest_cli_letsencrypt",
+        lambda **kwargs: {"ok": False, "strategy": "rest_cli_le", "error": "le_domain_only",
+                          "detail": "wildcard not allowed"},
+    )
+
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="217.160.250.222",
+        base_url="https://prototypowanie.pl:8443",
+        apply=True,
+    )
+    assert result["ok"] is False and result["error"] == "le_domain_only"
+    assert result["san_mode"] == "domain_only" and result["hitl"]
+    assert result["site_id"] == 308
+
+
+def test_ensure_ssl_explicit_provider_does_not_fall_through(monkeypatch):
+    """provider=panel-pem stops at its own rung instead of trying Let's Encrypt."""
+    mismatch = {"ok": False, "sans": [], "error": "tls_san_mismatch"}
+    _ssl_apply_env(monkeypatch, [mismatch])
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.panel_login",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("panel_login_failed")),
+    )
+
+    def unreachable(**kwargs):  # pragma: no cover - must not run
+        raise AssertionError("letsencrypt attempted for provider=panel-pem")
+
+    monkeypatch.setattr("urirun_connector_plesk.ssl_ops.panel_sslit_letsencrypt", unreachable)
+    monkeypatch.setattr("urirun_connector_plesk.ssl_ops.rest_cli_letsencrypt", unreachable)
+
+    result = ensure_ssl(
+        hostname="docs.subactor.com",
+        origin_ip="217.160.250.222",
+        base_url="https://prototypowanie.pl:8443",
+        apply=True,
+        provider="panel-pem",
+    )
+    assert result["ok"] is False and result["error"] == "plesk_ssl_panel_upload_failed"
