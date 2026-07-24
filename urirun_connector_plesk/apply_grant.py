@@ -302,6 +302,50 @@ def autonomy_mutations_enabled(environ: dict[str, str] | None = None) -> bool:
 
 
 DEFAULT_MUTATE_LEASE_PATH = "/tmp/subactor-mutate-lease.json"
+DEFAULT_HANDOFF_APPLIES = (
+    "PLESK_SUBDOMAIN_APPLY",
+    "PLESK_SSL_APPLY",
+    "PLESK_SYNC_APPLY",
+    "PLESK_DNS_APPLY",
+    "CLOUDFLARE_DNS_APPLY",
+    "PLESK_MAILBOX_APPLY",
+    "PLESK_REVERSE_PROXY_APPLY",
+    "DEPLOY_SYNC_APPLY",
+)
+MAX_LEASE_TTL_SECONDS = 4 * 60 * 60
+
+
+def _lease_path(environ: dict[str, str] | None = None) -> str:
+    env = environ if environ is not None else os.environ
+    return (env.get("MUTATE_LEASE_PATH") or DEFAULT_MUTATE_LEASE_PATH).strip()
+
+
+def load_mutate_lease(
+    environ: dict[str, str] | None = None,
+    *,
+    now: float | None = None,
+) -> dict[str, Any] | None:
+    """Return active lease dict or None."""
+    path = _lease_path(environ)
+    if not path:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+    if not isinstance(data, dict) or not data.get("enabled"):
+        return None
+    risk = str(data.get("risk_class") or "reversible").strip()
+    if risk not in ("reversible", "read_only"):
+        return None
+    expires = _parse_expires(str(data.get("expires_at") or ""))
+    if expires is None:
+        return None
+    ts = time.time() if now is None else now
+    if ts > expires + CLOCK_SKEW_SECONDS:
+        return None
+    return data
 
 
 def mutate_lease_active(
@@ -311,28 +355,105 @@ def mutate_lease_active(
 ) -> bool:
     """Session mutate lease (TTL file) — founder reversible apply without permanent kill switches.
 
-    Lease file schema: {"enabled": true, "expires_at": "<ISO-8601 Z>", "risk_class": "reversible"}
+    Lease file schema:
+      {"enabled": true, "expires_at": "<ISO-8601 Z>", "risk_class": "reversible",
+       "applies": ["PLESK_SSL_APPLY", ...], "actor": "human:founder"}
     Path: MUTATE_LEASE_PATH env or /tmp/subactor-mutate-lease.json.
     """
+    return load_mutate_lease(environ, now=now) is not None
+
+
+def mutate_lease_allows_apply(
+    flag: str,
+    environ: dict[str, str] | None = None,
+    *,
+    now: float | None = None,
+) -> bool:
+    """True when env flag is 1, or an active founder lease lists that apply flag."""
     env = environ if environ is not None else os.environ
-    path = (env.get("MUTATE_LEASE_PATH") or DEFAULT_MUTATE_LEASE_PATH).strip()
+    name = str(flag or "").strip()
+    if not name:
+        return False
+    if (env.get(name) or "").strip() == "1":
+        return True
+    lease = load_mutate_lease(env, now=now)
+    if not lease:
+        return False
+    applies = lease.get("applies")
+    if applies is True or applies == "*":
+        return True
+    if not isinstance(applies, list):
+        # Default handoff: lease alone opens the standard Plesk apply set.
+        applies = list(DEFAULT_HANDOFF_APPLIES)
+    return name in {str(item).strip() for item in applies}
+
+
+def issue_mutate_lease_file(
+    *,
+    ttl_seconds: int = 3600,
+    risk_class: str = "reversible",
+    actor: str = "",
+    reason: str = "",
+    applies: list[str] | None = None,
+    environ: dict[str, str] | None = None,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Write a session mutate lease file (founder handoff). Caps TTL at 4h."""
+    env = environ if environ is not None else os.environ
+    path = _lease_path(env)
     if not path:
-        return False
+        return {"ok": False, "error": "mutate_lease_path_missing"}
     try:
-        with open(path, encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return False
-    if not isinstance(data, dict) or not data.get("enabled"):
-        return False
-    risk = str(data.get("risk_class") or "reversible").strip()
+        ttl = int(ttl_seconds)
+    except (TypeError, ValueError):
+        return {"ok": False, "error": "mutate_lease_ttl_invalid"}
+    if ttl < 60:
+        return {"ok": False, "error": "mutate_lease_ttl_too_short"}
+    if ttl > MAX_LEASE_TTL_SECONDS:
+        ttl = MAX_LEASE_TTL_SECONDS
+    risk = str(risk_class or "reversible").strip()
     if risk not in ("reversible", "read_only"):
-        return False
-    expires = _parse_expires(str(data.get("expires_at") or ""))
-    if expires is None:
-        return False
+        return {"ok": False, "error": "mutate_lease_risk_class_invalid"}
     ts = time.time() if now is None else now
-    return ts <= expires + CLOCK_SKEW_SECONDS
+    expires_at = datetime.fromtimestamp(ts + ttl, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    apply_list = list(applies) if isinstance(applies, list) and applies else list(DEFAULT_HANDOFF_APPLIES)
+    payload = {
+        "enabled": True,
+        "expires_at": expires_at,
+        "risk_class": risk,
+        "ttl_seconds": ttl,
+        "actor": str(actor or "").strip() or "human:founder",
+        "reason": str(reason or "").strip()[:500],
+        "applies": apply_list,
+        "issued_by": "founder-autonomy-chat",
+        "issued_at": datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+    }
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write("\n")
+        os.replace(tmp, path)
+    except OSError as error:
+        return {"ok": False, "error": f"mutate_lease_write_failed:{error}"}
+    return {"ok": True, "lease": payload, "path": path}
+
+
+def clear_mutate_lease_file(environ: dict[str, str] | None = None) -> dict[str, Any]:
+    env = environ if environ is not None else os.environ
+    path = _lease_path(env)
+    if not path:
+        return {"ok": False, "error": "mutate_lease_path_missing"}
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        return {"ok": True, "cleared": False, "path": path}
+    except OSError as error:
+        return {"ok": False, "error": f"mutate_lease_clear_failed:{error}"}
+    return {"ok": True, "cleared": True, "path": path}
 
 
 def mutations_gates_open(environ: dict[str, str] | None = None) -> bool:

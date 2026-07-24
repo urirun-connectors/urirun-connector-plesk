@@ -503,6 +503,7 @@
         "strategy": "?str",
         "certificate_name": "?str",
         "probe": "obj",
+        "dns_preflight": "?obj",
         "dry_run": "bool"
       },
       "errors": ["precondition-unmet", "degraded-backend"],
@@ -526,7 +527,7 @@
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"extension_id": "?str", "base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
+      "inp": {"extension_id": "?str", "base_url": "?str", "admin_vault_entry_id": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
       "out": {"schema": "str", "extensions": "list", "installed": "int", "authority": "str", "source": "str"},
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": [{"payload": {}, "result": {"ok": true, "schema": "urirun.plesk-extension-inventory/v1", "extensions": [], "installed": 0, "authority": "plesk-administrator", "source": "xml-api:extension.get"}}]
@@ -535,7 +536,7 @@
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
+      "inp": {"base_url": "?str", "admin_vault_entry_id": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
       "out": {"schema": "str", "extensions": "list", "installed": "int", "profiled": "int", "unknown": "list"},
       "errors": ["precondition-unmet", "degraded-backend"],
       "examples": []

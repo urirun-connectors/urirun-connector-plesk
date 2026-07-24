@@ -130,6 +130,11 @@ and explicit permission denial all fail closed before the XML `site.add` call.
 
 Fail-closed: default is probe-only. Mutate requires `apply=true`,
 `AUTONOMY_MUTATIONS_ENABLED=1`, and `PLESK_SSL_APPLY=1`.
+Before the direct-origin TLS probe or any ACME action, the connector checks
+public A/AAAA state through Cloudflare DNS, Google DNS, and the runtime
+resolver. A missing hostname returns `plesk_ssl_dns_dependency_blocked` with
+root cause `dns_name_missing` and a read-only DNS reconciliation next action;
+no certificate mutation is attempted.
 
 | provider | Behavior |
 | --- | --- |

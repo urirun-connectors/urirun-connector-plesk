@@ -43,6 +43,7 @@ import urirun_connector_plesk.core as core
 from urirun_connector_plesk.apply_grant import CLOCK_SKEW_SECONDS, issue_apply_grant
 from urirun_connector_plesk.apply_grant_replay import reset_default_jti_replay_store
 from urirun_connector_plesk.connector_result import CONNECTOR_RESULT_SCHEMA
+from urirun_connector_plesk.dns_providers import tls_dns_preflight
 from urirun_connector_plesk.reverse_proxy import (
     BEGIN_MARKER,
     END_MARKER,
@@ -601,6 +602,7 @@ def _extensions_xml():
 def test_extension_catalog_discovers_runtime_objects_without_granting_unknown_operations(monkeypatch):
     monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": "vault-value")
     monkeypatch.setattr(core, "_xml_agent", lambda *args: _extensions_xml())
+    monkeypatch.setattr(core, "_request_json", lambda *args, **kwargs: (403, {}))
 
     inventory = extension_catalog(base_url="https://plesk.example.com:8443")
     capabilities = extension_capabilities(base_url="https://plesk.example.com:8443")
@@ -613,6 +615,23 @@ def test_extension_catalog_discovers_runtime_objects_without_granting_unknown_op
     sslit = next(item for item in capabilities["extensions"] if item["id"] == "sslit")
     assert sslit["operations"][0]["uri"] == "plesk://host/site/command/ssl-ensure"
     assert "vault-value" not in json.dumps({"inventory": inventory, "capabilities": capabilities})
+
+
+def test_extension_catalog_merges_rest_cli_inventory_when_xml_is_incomplete(monkeypatch):
+    monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url="": "vault-value")
+    monkeypatch.setattr(core, "_xml_agent", lambda *args: _extensions_xml())
+    monkeypatch.setattr(core, "_request_json", lambda *args, **kwargs: (200, {
+        "code": 0,
+        "stdout": "cloudflaredns - DNS Integration for Cloudflare®\ngit - Git\n",
+        "stderr": "",
+    }))
+
+    inventory = extension_catalog(base_url="https://plesk.example.com:8443")
+
+    assert inventory["ok"] and inventory["installed"] == 4
+    assert any(item["id"] == "cloudflaredns" for item in inventory["extensions"])
+    assert inventory["source"] == "xml-api:extension.get+rest-cli:extension.--list"
+    assert "vault-value" not in json.dumps(inventory)
 
 
 def test_profiled_extension_query_builds_structured_xml_and_redacts_output(monkeypatch):
@@ -1087,6 +1106,7 @@ def test_ensure_ssl_probe_only_without_apply(monkeypatch):
         }
 
     monkeypatch.setattr("urirun_connector_plesk.ssl_ops.origin_tls_probe", fake_probe)
+    _ssl_dns_ready(monkeypatch)
     result = ensure_ssl(
         hostname="docs.subactor.com",
         origin_ip="217.160.250.222",
@@ -1105,6 +1125,7 @@ def test_ensure_ssl_apply_denied_without_env(monkeypatch):
         "urirun_connector_plesk.ssl_ops.origin_tls_probe",
         lambda **kwargs: {"ok": False, "sans": [], "error": "tls_san_mismatch"},
     )
+    _ssl_dns_ready(monkeypatch)
     result = ensure_ssl(
         hostname="docs.subactor.com",
         origin_ip="1.2.3.4",
@@ -1132,6 +1153,7 @@ def test_ensure_ssl_assign_when_san_ok(monkeypatch):
             "error": None,
         },
     )
+    _ssl_dns_ready(monkeypatch)
     result = ensure_ssl(
         hostname="docs.subactor.com",
         origin_ip="217.160.250.222",
@@ -1161,6 +1183,7 @@ def test_ensure_ssl_assign_strategy(monkeypatch):
         "urirun_connector_plesk.ssl_ops.origin_tls_probe",
         lambda **kwargs: next(probes),
     )
+    _ssl_dns_ready(monkeypatch)
     monkeypatch.setattr(
         "urirun_connector_plesk.ssl_ops.resolve_site_id",
         lambda **kwargs: 308,
@@ -2031,6 +2054,24 @@ def test_site_sync_allows_sanitized_public_status_basename(tmp_path):
     assert result["files_planned"] == 1
 
 
+def _ssl_dns_ready(monkeypatch):
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.tls_dns_preflight",
+        lambda hostname, expected_origin="": {
+            "schema": "urirun.plesk-tls-dns-preflight/v1",
+            "hostname": hostname,
+            "ready": True,
+            "root_cause": None,
+            "addresses": [expected_origin] if expected_origin else ["203.0.113.10"],
+            "expected_origin": expected_origin or None,
+            "origin_matches": True,
+            "blocks": [],
+            "next_action": None,
+            "observations": [],
+        },
+    )
+
+
 def _ssl_apply_env(monkeypatch, probe_results):
     """Common wiring for a full ssl-ensure ladder run under apply."""
     monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
@@ -2046,7 +2087,52 @@ def _ssl_apply_env(monkeypatch, probe_results):
     monkeypatch.setattr(
         "urirun_connector_plesk.ssl_ops.origin_tls_probe", lambda **kwargs: next(probes)
     )
+    _ssl_dns_ready(monkeypatch)
     monkeypatch.setattr("urirun_connector_plesk.ssl_ops.resolve_site_id", lambda **kwargs: 308)
+
+
+def test_tls_dns_preflight_identifies_missing_name_as_the_root_cause():
+    def missing(_host, record_type, _expected):
+        return {
+            "observations": [
+                {"resolver": "cloudflare", "ok": False, "records": [], "error": "dns_name_not_found"},
+                {"resolver": "google", "ok": False, "records": [], "error": "dns_name_not_found"},
+                {"resolver": "runtime-system", "ok": False, "records": [], "error": "dns_system_resolver_failed"},
+            ],
+            "record_type": record_type,
+        }
+
+    result = tls_dns_preflight("www.subactor.com", "217.160.250.222", resolver=missing)
+    assert result["ready"] is False
+    assert result["root_cause"] == "dns_name_missing"
+    assert result["blocks"] == ["acme_domain_validation", "tls_certificate_issuance"]
+    assert result["next_action"]["payload"]["host"] == "www.subactor.com"
+
+
+def test_ensure_ssl_stops_before_tls_or_acme_when_public_dns_is_missing(monkeypatch):
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.tls_dns_preflight",
+        lambda *_args, **_kwargs: {
+            "ready": False,
+            "root_cause": "dns_name_missing",
+            "blocks": ["acme_domain_validation", "tls_certificate_issuance"],
+            "next_action": {"uri": "plesk://host/dns/query/propagation"},
+        },
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.ssl_ops.origin_tls_probe",
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("TLS probe must wait for DNS")),
+    )
+    result = ensure_ssl(
+        hostname="www.subactor.com",
+        origin_ip="217.160.250.222",
+        base_url="https://prototypowanie.pl:8443",
+        apply=True,
+    )
+    assert result["ok"] is False
+    assert result["error"] == "plesk_ssl_dns_dependency_blocked"
+    assert result["root_cause"] == "dns_name_missing"
+    assert result["mutation_attempted"] is False
 
 
 def test_ensure_ssl_auto_walks_ladder_until_a_strategy_covers_the_host(monkeypatch):

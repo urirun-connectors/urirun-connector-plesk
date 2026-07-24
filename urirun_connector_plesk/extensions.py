@@ -66,6 +66,28 @@ def parse_extension_inventory(raw: str) -> list[dict[str, Any]]:
     return sorted(result, key=lambda item: item["id"])
 
 
+def parse_extension_cli_inventory(raw: str) -> list[dict[str, Any]]:
+    """Parse the stable ``extension --list`` text without treating it as a shell command."""
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for line in str(raw or "").splitlines():
+        match = re.match(r"^\s*([a-z][a-z0-9_-]{0,63})\s+-\s+(.+?)\s*$", line, re.IGNORECASE)
+        if not match:
+            continue
+        extension_id = match.group(1).lower()
+        if not _IDENTIFIER.fullmatch(extension_id) or extension_id in seen:
+            continue
+        seen.add(extension_id)
+        result.append({
+            "id": extension_id,
+            "name": match.group(2).strip()[:160] or extension_id,
+            "version": None,
+            "release": None,
+            "active": True,
+        })
+    return sorted(result, key=lambda item: item["id"])
+
+
 def _operation_spec(extension_id: str, operation: str, effect: str) -> dict[str, Any]:
     if not _IDENTIFIER.fullmatch(extension_id) or not _IDENTIFIER.fullmatch(operation):
         raise RuntimeError("plesk_extension_operation_invalid")

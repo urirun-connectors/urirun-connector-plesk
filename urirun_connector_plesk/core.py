@@ -39,9 +39,13 @@ from .immutable_manifest import build_immutable_manifest, verify_plan_hash
 from .connector_result import classify_connector_reason, connector_result
 from .apply_grant import (
     autonomy_mutations_enabled,
+    clear_mutate_lease_file,
     consume_apply_grant_jti,
     format_intent_pack,
+    issue_mutate_lease_file,
+    load_mutate_lease,
     mutate_lease_active,
+    mutate_lease_allows_apply,
     mutations_gates_open,
     verify_apply_grant,
 )
@@ -53,6 +57,7 @@ from .extensions import (
     extension_operation_plan,
     load_extension_profiles,
     parse_extension_call,
+    parse_extension_cli_inventory,
     parse_extension_inventory,
 )
 from .dns_providers import (
@@ -794,7 +799,7 @@ def ensure_mailbox(
             )
         if not autonomy_mutations_enabled() and not mutate_lease_active():
             return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
-        if os.environ.get("PLESK_MAILBOX_APPLY", "").strip() != "1":
+        if not mutate_lease_allows_apply("PLESK_MAILBOX_APPLY"):
             return urirun.fail("plesk_mailbox_apply_required", dry_run=False, mutation_attempted=False)
         if plan_hash.strip().lower() != digest:
             return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
@@ -974,8 +979,11 @@ def extension_catalog(
     extension_id: str = "",
     base_url: str = "",
     admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    runtime_vault_entry_id: str = "plesk-runtime",
     vault_url: str = "",
 ) -> dict[str, Any]:
+    extensions: list[dict[str, Any]] = []
+    xml_error: RuntimeError | None = None
     try:
         raw = _admin_xml(
             base_url=base_url,
@@ -985,13 +993,40 @@ def extension_catalog(
         )
         extensions = parse_extension_inventory(raw)
     except RuntimeError as error:
-        return urirun.fail(str(error))
+        xml_error = error
+
+    cli_used = False
+    api_key = ""
+    try:
+        origin = _base_url(base_url)
+        api_key = _vault_lease(runtime_vault_entry_id, origin, "api_key", vault_url)
+        status, data = _request_json(
+            f"{origin}/api/v2/cli/extension/call",
+            method="POST",
+            headers={"X-API-Key": api_key},
+            body={"params": ["--list"]},
+        )
+        if status in {200, 201} and int(data.get("code") or 0) == 0:
+            cli_rows = parse_extension_cli_inventory(str(data.get("stdout") or ""))
+            if extension_id.strip():
+                cli_rows = [row for row in cli_rows if row["id"] == extension_id.strip().lower()]
+            merged = {row["id"]: row for row in cli_rows}
+            merged.update({row["id"]: row for row in extensions})
+            extensions = sorted(merged.values(), key=lambda item: item["id"])
+            cli_used = True
+    except RuntimeError:
+        pass
+    finally:
+        api_key = ""
+
+    if xml_error is not None and not cli_used:
+        return urirun.fail(str(xml_error))
     return urirun.ok(
         schema="urirun.plesk-extension-inventory/v1",
         extensions=extensions,
         installed=len(extensions),
         authority="plesk-administrator",
-        source="xml-api:extension.get",
+        source="xml-api:extension.get+rest-cli:extension.--list" if cli_used else "xml-api:extension.get",
     )
 
 
@@ -999,11 +1034,13 @@ def extension_catalog(
 def extension_capabilities(
     base_url: str = "",
     admin_vault_entry_id: str = "plesk-admin-bootstrap",
+    runtime_vault_entry_id: str = "plesk-runtime",
     vault_url: str = "",
 ) -> dict[str, Any]:
     inventory = extension_catalog(
         base_url=base_url,
         admin_vault_entry_id=admin_vault_entry_id,
+        runtime_vault_entry_id=runtime_vault_entry_id,
         vault_url=vault_url,
     )
     if not inventory.get("ok"):
@@ -1382,7 +1419,7 @@ def dns_replace(
 
     if apply and not autonomy_mutations_enabled() and not mutate_lease_active():
         return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
-    if apply and os.environ.get("PLESK_DNS_APPLY", "").strip() != "1":
+    if apply and not mutate_lease_allows_apply("PLESK_DNS_APPLY"):
         return urirun.fail("plesk_dns_apply_required", dry_run=False, mutation_attempted=False)
 
     try:
@@ -1587,7 +1624,7 @@ def dns_reconcile(
 
         if apply and not autonomy_mutations_enabled() and not mutate_lease_active():
             return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
-        if apply and os.environ.get("CLOUDFLARE_DNS_APPLY", "").strip() != "1":
+        if apply and not mutate_lease_allows_apply("CLOUDFLARE_DNS_APPLY"):
             return urirun.fail("cloudflare_dns_apply_required", dry_run=False, mutation_attempted=False)
 
         token = _vault_lease(
@@ -2013,6 +2050,7 @@ class _SslCtx:
     mode: str
     caps: dict[str, Any]
     probe: dict[str, Any]
+    dns_preflight: dict[str, Any]
     attempts: list[dict[str, Any]]
     base_url: str          # as passed in (the XML agent resolves it itself)
     origin_api: str        # resolved REST/panel base
@@ -2045,6 +2083,7 @@ class _SslCtx:
             strategy=result.get("strategy"),
             created=result.get("strategy") not in {"assign", "probe"},
             probe=after,
+            dns_preflight=self.dns_preflight,
             attempts=self.attempts,
             capabilities=self.caps,
             panel_action=result.get("panel_action"),
@@ -2068,6 +2107,7 @@ def _ssl_target(hostname: str, provider: str, origin_ip: str, connect_host: str,
 
 
 def _ssl_gate(host: str, peer: str, mode: str, apply: bool, probe: dict[str, Any],
+              dns_preflight: dict[str, Any],
               caps: dict[str, Any]) -> dict[str, Any] | None:
     """Fail-closed gate: probe-only, permission and already-covered outcomes.
 
@@ -2083,6 +2123,7 @@ def _ssl_gate(host: str, peer: str, mode: str, apply: bool, probe: dict[str, Any
             strategy="probe",
             certificate_name=None,
             probe=probe,
+            dns_preflight=dns_preflight,
             capabilities=caps,
             note="SAN/CN already covers hostname",
         )
@@ -2094,6 +2135,7 @@ def _ssl_gate(host: str, peer: str, mode: str, apply: bool, probe: dict[str, Any
             hostname=host,
             connect_host=peer,
             probe=probe,
+            dns_preflight=dns_preflight,
             capabilities=caps,
         )
     if not may_write:
@@ -2102,6 +2144,7 @@ def _ssl_gate(host: str, peer: str, mode: str, apply: bool, probe: dict[str, Any
             hostname=host,
             connect_host=peer,
             probe=probe,
+            dns_preflight=dns_preflight,
             capabilities=caps,
             strategies=caps.get("ssl_ensure", {}).get("strategies"),
             note="set apply=true, AUTONOMY_MUTATIONS_ENABLED=1, PLESK_SSL_APPLY=1",
@@ -2115,6 +2158,7 @@ def _ssl_gate(host: str, peer: str, mode: str, apply: bool, probe: dict[str, Any
             strategy="probe",
             created=False,
             probe=probe,
+            dns_preflight=dns_preflight,
             capabilities=caps,
         )
     return None
@@ -2302,6 +2346,7 @@ def _ssl_exhausted(ctx: _SslCtx) -> dict[str, Any]:
         connect_host=ctx.peer,
         site_id=ctx.site_id,
         probe=ctx.probe,
+        dns_preflight=ctx.dns_preflight,
         attempts=ctx.attempts,
         capabilities=ctx.caps,
         panel_action=ssl_ops.PANEL_ACTION_LE,
@@ -2341,8 +2386,22 @@ def ensure_ssl(
         return invalid
 
     caps = build_capabilities(paramiko_mod=paramiko)
+    dns_preflight = ssl_ops.tls_dns_preflight(host, expected_origin=origin_ip)
+    if not dns_preflight.get("ready"):
+        cause = str(dns_preflight.get("root_cause") or "dns_observation_inconclusive")
+        return urirun.fail(
+            "plesk_ssl_dns_dependency_blocked" if cause != "dns_observation_inconclusive"
+            else "plesk_ssl_dns_preflight_inconclusive",
+            dry_run=not bool(apply),
+            hostname=host,
+            connect_host=peer,
+            root_cause=cause,
+            dns_preflight=dns_preflight,
+            mutation_attempted=False,
+            next_action=dns_preflight.get("next_action"),
+        )
     probe = ssl_ops.origin_tls_probe(connect_host=peer, hostname=host)
-    gated = _ssl_gate(host, peer, mode, bool(apply), probe, caps)
+    gated = _ssl_gate(host, peer, mode, bool(apply), probe, dns_preflight, caps)
     if gated:
         return gated
 
@@ -2356,6 +2415,7 @@ def ensure_ssl(
             mode=mode,
             caps=caps,
             probe=probe,
+            dns_preflight=dns_preflight,
             attempts=attempts,
             base_url=base_url,
             origin_api=origin_api,
@@ -2375,7 +2435,7 @@ def ensure_ssl(
             xml_agent=_xml_agent,
         )
         if ctx.site_id is None:
-            return urirun.fail("plesk_ssl_site_not_found", hostname=host, capabilities=caps)
+            return urirun.fail("plesk_ssl_site_not_found", hostname=host, capabilities=caps, dns_preflight=dns_preflight)
 
         for modes, stage in _SSL_STAGES:
             if mode in modes:
@@ -2384,7 +2444,7 @@ def ensure_ssl(
                     return outcome
         return _ssl_exhausted(ctx)
     except RuntimeError as error:
-        return urirun.fail(str(error), hostname=host, capabilities=caps, attempts=attempts)
+        return urirun.fail(str(error), hostname=host, capabilities=caps, attempts=attempts, dns_preflight=dns_preflight)
     finally:
         if ctx is not None:
             ctx.wipe()
@@ -2439,7 +2499,7 @@ def ensure_subdomain(
     target = f"{origin_api}|subdomain:{fqdn}"
     if apply and not autonomy_mutations_enabled() and not mutate_lease_active():
         return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
-    if apply and os.environ.get("PLESK_SUBDOMAIN_APPLY", "").strip() != "1":
+    if apply and not mutate_lease_allows_apply("PLESK_SUBDOMAIN_APPLY"):
         return urirun.fail("plesk_subdomain_apply_required", dry_run=False, mutation_attempted=False)
     cust_user = cust_pass = ""
     try:
@@ -2608,7 +2668,7 @@ def ensure_reverse_proxy(
         )
     if not autonomy_mutations_enabled() and not mutate_lease_active():
         return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
-    if os.environ.get("PLESK_REVERSE_PROXY_APPLY", "").strip() != "1":
+    if not mutate_lease_allows_apply("PLESK_REVERSE_PROXY_APPLY"):
         return urirun.fail("plesk_reverse_proxy_apply_required", dry_run=False, mutation_attempted=False)
     if plan_hash.strip().lower() != plan["plan_hash"]:
         return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
@@ -4079,6 +4139,51 @@ def connector_manifest() -> dict[str, Any]:
 
 def main(argv: list[str] | None = None) -> int:
     return conn.cli(argv, manifest_prose=_urirun_compat.load_manifest(__package__))
+
+
+@conn.handler(
+    "session/command/mutate-lease",
+    isolated=True,
+    meta={"label": "Issue or clear founder session mutate lease (TTL handoff)"},
+)
+def session_mutate_lease(
+    action: str = "issue",
+    ttl_seconds: int = 3600,
+    risk_class: str = "reversible",
+    actor: str = "",
+    reason: str = "",
+) -> dict[str, Any]:
+    """Founder chat handoff: write a short-lived mutate lease on this node."""
+    act = str(action or "issue").strip().lower()
+    if act in {"status", "query"}:
+        lease = load_mutate_lease()
+        return urirun.ok(active=bool(lease), lease=lease, mutation_attempted=False)
+    if act in {"clear", "revoke", "cancel"}:
+        result = clear_mutate_lease_file()
+        if not result.get("ok"):
+            return urirun.fail(str(result.get("error") or "mutate_lease_clear_failed"))
+        return urirun.ok(**result, active=False, mutation_attempted=True)
+    if act not in {"issue", "grant", "start"}:
+        return urirun.fail("mutate_lease_action_invalid")
+    result = issue_mutate_lease_file(
+        ttl_seconds=ttl_seconds,
+        risk_class=risk_class,
+        actor=actor,
+        reason=reason,
+    )
+    if not result.get("ok"):
+        return urirun.fail(str(result.get("error") or "mutate_lease_issue_failed"))
+    return urirun.ok(**result, active=True, mutation_attempted=True)
+
+
+@conn.handler(
+    "session/query/mutate-lease",
+    isolated=True,
+    meta={"label": "Read founder session mutate lease status"},
+)
+def session_mutate_lease_status() -> dict[str, Any]:
+    lease = load_mutate_lease()
+    return urirun.ok(active=bool(lease), lease=lease, mutation_attempted=False)
 
 
 if __name__ == "__main__":

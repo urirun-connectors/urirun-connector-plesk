@@ -25,6 +25,7 @@ import uuid
 from typing import Any, Callable
 
 from .apply_grant import autonomy_mutations_enabled
+from .dns_providers import tls_dns_preflight
 from .verify_ladder import check_tls_san, hostname_matches_san
 
 PANEL_ACTION_LE = (
@@ -78,12 +79,13 @@ VaultLease = Callable[[str, str, str, str], str]
 
 
 def ssl_apply_permitted(*, apply: bool) -> tuple[bool, str | None]:
-    """Fail-closed mutate gate for ssl-ensure (env only; no grant required)."""
+    """Fail-closed mutate gate for ssl-ensure (env or founder mutate lease)."""
     if not apply:
         return False, None
-    if not autonomy_mutations_enabled():
+    from .apply_grant import autonomy_mutations_enabled, mutate_lease_active, mutate_lease_allows_apply
+    if not autonomy_mutations_enabled() and not mutate_lease_active():
         return False, "apply_denied_autonomy_mutations"
-    if os.environ.get("PLESK_SSL_APPLY", "").strip() != "1":
+    if not mutate_lease_allows_apply("PLESK_SSL_APPLY"):
         return False, "apply_denied_plesk_ssl_apply"
     return True, None
 

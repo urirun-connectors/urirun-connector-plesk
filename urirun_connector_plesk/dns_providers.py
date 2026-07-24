@@ -64,8 +64,13 @@ def _doh_records(name: str, record_type: str, endpoint: str) -> list[dict[str, A
     status, payload = _json_request(
         f"{endpoint}?{query}", headers={"accept": "application/dns-json"}, timeout=8,
     )
-    if status != 200 or int(payload.get("Status", -1)) != 0:
-        raise RuntimeError("dns_authority_query_failed")
+    if status != 200:
+        raise RuntimeError("dns_resolver_http_failed")
+    dns_status = int(payload.get("Status", -1))
+    if dns_status == 3:
+        raise RuntimeError("dns_name_not_found")
+    if dns_status != 0:
+        raise RuntimeError("dns_resolver_response_failed")
     type_number = {"A": 1, "NS": 2, "CNAME": 5, "AAAA": 28}[record_type]
     return sorted(({
         "value": str(row.get("data") or "").strip().rstrip(".").lower(),
@@ -117,15 +122,15 @@ def resolve_dns_propagation(host: str, record_type: str, expected_value: str = "
     for resolver, endpoint in _RESOLVERS:
         try:
             records = _doh_records(host, record_type, endpoint)
-            observations.append({"resolver": resolver, "ok": bool(records), "records": records})
-        except RuntimeError:
-            observations.append({"resolver": resolver, "ok": False, "records": []})
+            observations.append({"resolver": resolver, "ok": True, "records": records, "error": None})
+        except RuntimeError as error:
+            observations.append({"resolver": resolver, "ok": False, "records": [], "error": str(error)})
     if record_type in {"A", "AAAA"}:
         try:
             system_records = _system_records(host, record_type)
-            observations.append({"resolver": "runtime-system", "ok": bool(system_records), "records": system_records})
-        except RuntimeError:
-            observations.append({"resolver": "runtime-system", "ok": False, "records": []})
+            observations.append({"resolver": "runtime-system", "ok": True, "records": system_records, "error": None})
+        except RuntimeError as error:
+            observations.append({"resolver": "runtime-system", "ok": False, "records": [], "error": str(error)})
     successful = [row for row in observations if row["ok"]]
     value_sets = {tuple(record["value"] for record in row["records"]) for row in successful}
     consensus = len(successful) == len(observations) and len(value_sets) == 1
@@ -142,6 +147,78 @@ def resolve_dns_propagation(host: str, record_type: str, expected_value: str = "
         "propagated": propagated,
         "ttl_min": min(ttls) if ttls else None,
         "ttl_max": max(ttls) if ttls else None,
+        "observations": observations,
+    }
+
+
+def tls_dns_preflight(
+    hostname: str,
+    expected_origin: str = "",
+    *,
+    resolver: Any = None,
+) -> dict[str, Any]:
+    """Prove public address readiness before any certificate mutation.
+
+    This is deliberately independent from the direct-origin TLS probe. ACME
+    validates the public hostname, so a successful socket connection to an
+    explicit ``origin_ip`` is not evidence that public DNS exists.
+    """
+    query = resolver or resolve_dns_propagation
+    host = str(hostname or "").strip().rstrip(".").lower()
+    expected = str(expected_origin or "").strip().lower()
+    observations: list[dict[str, Any]] = []
+    addresses: set[str] = set()
+    for record_type in ("A", "AAAA"):
+        result = query(host, record_type, expected if record_type == "A" else "")
+        for row in result.get("observations") or []:
+            normalized = {
+                "resolver": str(row.get("resolver") or "unknown"),
+                "record_type": record_type,
+                "ok": bool(row.get("ok")),
+                "error": str(row.get("error") or "") or None,
+                "records": [
+                    {"value": str(record.get("value") or "").lower(), "ttl": int(record.get("ttl") or 0)}
+                    for record in row.get("records") or []
+                    if record.get("value")
+                ],
+            }
+            observations.append(normalized)
+            addresses.update(record["value"] for record in normalized["records"])
+
+    ordered = sorted(addresses)
+    public = [row for row in observations if row["resolver"] in {"cloudflare", "google"}]
+    public_resolvers = {row["resolver"] for row in public}
+    absence_proven = public_resolvers == {"cloudflare", "google"} and all(
+        (row["ok"] and not row["records"]) or row["error"] == "dns_name_not_found"
+        for row in public
+    )
+    origin_matches = not expected or expected in addresses
+    if ordered and origin_matches:
+        cause = None
+        ready = True
+    elif ordered:
+        cause = "dns_origin_mismatch"
+        ready = False
+    elif absence_proven:
+        cause = "dns_name_missing"
+        ready = False
+    else:
+        cause = "dns_observation_inconclusive"
+        ready = False
+    return {
+        "schema": "urirun.plesk-tls-dns-preflight/v1",
+        "hostname": host,
+        "ready": ready,
+        "root_cause": cause,
+        "addresses": ordered,
+        "expected_origin": expected or None,
+        "origin_matches": origin_matches if ordered else False,
+        "blocks": [] if ready else ["acme_domain_validation", "tls_certificate_issuance"],
+        "next_action": None if ready else {
+            "uri": "plesk://host/dns/query/propagation",
+            "payload": {"host": host, "record_type": "A", "expected_value": expected},
+            "then_capability": "dns.record.reconcile",
+        },
         "observations": observations,
     }
 
