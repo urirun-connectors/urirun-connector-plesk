@@ -33,6 +33,7 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/extension/query/call` | invoke a profiled read-only extension XML operation |
 | `plesk://host/extension/command/call` | dry-run or execute a profiled extension mutation with gates and a signed grant |
 | `plesk://host/subscription/query/capabilities` | verify customer authorization and domain capacity before planning a site |
+| `plesk://host/subscription/query/snapshot` | twin-fact snapshot of subscription capacity (one name or list visible to lease) |
 | `plesk://host/domain/command/ensure` | dry-run or idempotently add a domain under an existing subscription |
 | `plesk://host/dns/query/authority` | detect the authoritative DNS provider using two-resolver NS consensus |
 | `plesk://host/dns/query/propagation` | compare expected records and remaining TTL across two public resolvers |

@@ -1520,15 +1520,45 @@ def dns_replace(
 
 
 @conn.handler("dns/query/authority", isolated=True, meta={"label": "Detect authoritative DNS provider with resolver consensus"})
-def dns_authority(zone: str = "") -> dict[str, Any]:
+def dns_authority(zone: str = "", instance_id: str = "") -> dict[str, Any]:
     try:
         wanted_zone = _dns_zone(zone)
         authority = resolve_dns_authority(wanted_zone)
-        if not authority["consistent"]:
+        provider = authority.get("provider")
+        nameservers = list(authority.get("nameservers") or [])
+        consistent = bool(authority.get("consistent"))
+        management = (
+            "cloudflaredns" if provider == "cloudflare"
+            else "plesk" if provider == "plesk"
+            else provider
+        )
+        fact = _twin_fact(
+            twin_type="plesk.dns.authority",
+            instance_id=(instance_id or wanted_zone).strip() or wanted_zone,
+            uri="plesk://host/dns/query/authority",
+            payload={
+                "hostname": wanted_zone,
+                "provider": provider,
+                "nameservers": nameservers,
+                "management_plane": management,
+                "consistent": consistent,
+            },
+            fact_quality="fresh" if consistent else "stale",
+        )
+        if not consistent:
             return urirun.fail(
-                "dns_authority_inconsistent", authority=authority, mutation_attempted=False,
+                "dns_authority_inconsistent",
+                authority=authority,
+                twin_fact=fact,
+                mutation_attempted=False,
             )
-        return urirun.ok(authority=authority, provider=authority["provider"], mutation_attempted=False)
+        return urirun.ok(
+            authority=authority,
+            provider=provider,
+            twin_fact=fact,
+            fact_quality=fact["fact_quality"],
+            mutation_attempted=False,
+        )
     except RuntimeError as error:
         return urirun.fail(str(error), mutation_attempted=False)
 
@@ -1809,6 +1839,114 @@ def subscription_capabilities(
         return urirun.fail(str(error))
     finally:
         username = password = ""
+
+
+def _subscription_rows_from_webspace_xml(raw: str) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for result in _xml_results(raw, "get"):
+        if (result.findtext("status") or "").strip() != "ok":
+            continue
+        data = result.find("data")
+        gen = data.find("gen_info") if data is not None else result.find("gen_info")
+        name = ""
+        if gen is not None:
+            name = (gen.findtext("name") or "").strip().lower()
+        if not name:
+            name = (result.findtext("name") or "").strip().lower()
+        site_id = (result.findtext("id") or "").strip()
+        named = _xml_named_values(result if data is None else data)
+        domain_limit, _limit_key = _limit_value(named)
+        rows.append({
+            "id": int(site_id) if site_id.isdigit() else site_id or None,
+            "name": name or None,
+            "domains_limit": domain_limit,
+            "domains_used": None,
+        })
+    return rows
+
+
+@conn.handler(
+    "subscription/query/snapshot",
+    isolated=True,
+    meta={"label": "Snapshot subscription capacity as a twin fact (read-only)"},
+)
+def subscription_query_snapshot(
+    subscription: str = "",
+    instance_id: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    """Observe subscription(s) as ``subactor.twin-fact/v1`` without mutation.
+
+    When ``subscription`` is set, returns a one-row snapshot with used/limit.
+    When empty, lists webspaces visible to the leased credential (estimated
+    limits when dataset incomplete).
+    """
+    wanted = (subscription or "").strip().lower()
+    if wanted and not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", wanted):
+        return urirun.fail("plesk_subscription_name_invalid", mutation_attempted=False)
+    username = password = ""
+    subscriptions: list[dict[str, Any]] = []
+    fact_quality = "fresh"
+    observe_error = None
+    try:
+        origin = _base_url(base_url)
+        username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(subscription_vault_entry_id, origin, "password", vault_url)
+        if wanted:
+            caps = _subscription_capabilities_with_credentials(
+                base_url=base_url, subscription=wanted, username=username, password=password,
+            )
+            if not caps.get("ok"):
+                observe_error = caps.get("error") or "plesk_subscription_capability_failed"
+                fact_quality = "estimated"
+                subscriptions = [{"id": None, "name": wanted, "domains_limit": None, "domains_used": None}]
+            else:
+                subscriptions = [{
+                    "id": caps.get("subscription_id") or caps.get("webspace_id"),
+                    "name": wanted,
+                    "domains_limit": caps.get("domains_limit"),
+                    "domains_used": caps.get("domains_used"),
+                }]
+        else:
+            packet = '''<?xml version="1.0" encoding="UTF-8"?>
+<packet><webspace><get><filter/>
+<dataset><gen_info/><limits/></dataset></get></webspace></packet>'''
+            raw = _xml_agent(base_url, username, password, packet)
+            subscriptions = _subscription_rows_from_webspace_xml(raw)
+            if not subscriptions:
+                observe_error = "plesk_subscription_list_empty"
+                fact_quality = "estimated"
+    except RuntimeError as error:
+        observe_error = str(error) or "plesk_xml_transport_failed"
+        fact_quality = "estimated"
+        if wanted:
+            subscriptions = [{"id": None, "name": wanted, "domains_limit": None, "domains_used": None}]
+    finally:
+        username = password = ""
+
+    binding = (instance_id or wanted or "plesk-default").strip() or "plesk-default"
+    payload = {
+        "count": len(subscriptions),
+        "subscriptions": subscriptions,
+        "observe_error": observe_error,
+        "filter_subscription": wanted or None,
+    }
+    fact = _twin_fact(
+        twin_type="plesk.subscription",
+        instance_id=binding,
+        uri="plesk://host/subscription/query/snapshot",
+        payload=payload,
+        fact_quality=fact_quality,
+    )
+    return urirun.ok(
+        twin_fact=fact,
+        count=len(subscriptions),
+        subscriptions=subscriptions,
+        fact_quality=fact_quality,
+        mutation_attempted=False,
+    )
 
 
 @conn.handler(

@@ -34,6 +34,7 @@ from urirun_connector_plesk import (
     extension_command,
     extension_query,
     subscription_capabilities,
+    subscription_query_snapshot,
     site_publish,
     site_query_docroot,
     site_remote_inventory,
@@ -66,6 +67,7 @@ ROUTES = {
     "plesk://host/extension/query/call",
     "plesk://host/extension/command/call",
     "plesk://host/subscription/query/capabilities",
+    "plesk://host/subscription/query/snapshot",
     "plesk://host/domain/command/ensure",
     "plesk://host/dns/query/records",
     "plesk://host/dns/query/authority",
@@ -488,6 +490,54 @@ def test_dns_authority_reports_provider_consensus(monkeypatch):
     result = dns_authority(zone="example.com")
     assert result["ok"] and result["provider"] == "cloudflare"
     assert result["authority"]["consistent"] is True
+    assert result["twin_fact"]["schema"] == "subactor.twin-fact/v1"
+    assert result["twin_fact"]["twin_type"] == "plesk.dns.authority"
+    assert result["twin_fact"]["payload"]["provider"] == "cloudflare"
+    assert result["twin_fact"]["payload"]["management_plane"] == "cloudflaredns"
+    assert result["fact_quality"] == "fresh"
+
+
+def test_subscription_query_snapshot_emits_twin_fact(monkeypatch):
+    monkeypatch.setattr(core, "_base_url", lambda _url: "https://plesk.example.test:8443")
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "secret")
+    monkeypatch.setattr(
+        core,
+        "_subscription_capabilities_with_credentials",
+        lambda **kwargs: {
+            "ok": True,
+            "subscription": "prototypowanie.pl",
+            "domains_used": 3,
+            "domains_limit": 10,
+            "webspace_id": 42,
+        },
+    )
+    result = subscription_query_snapshot(
+        subscription="prototypowanie.pl",
+        instance_id="panel-demo",
+        base_url="https://plesk.example.test:8443",
+    )
+    assert result["ok"] is True
+    assert result["mutation_attempted"] is False
+    assert result["fact_quality"] == "fresh"
+    assert result["count"] == 1
+    fact = result["twin_fact"]
+    assert fact["uri"] == "plesk://host/subscription/query/snapshot"
+    assert fact["twin_type"] == "plesk.subscription"
+    assert fact["payload"]["subscriptions"][0]["domains_used"] == 3
+
+
+def test_subscription_query_snapshot_estimates_on_transport_failure(monkeypatch):
+    monkeypatch.setattr(core, "_base_url", lambda _url: "https://plesk.example.test:8443")
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "secret")
+    monkeypatch.setattr(
+        core,
+        "_subscription_capabilities_with_credentials",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("plesk_xml_transport_failed")),
+    )
+    result = subscription_query_snapshot(subscription="prototypowanie.pl")
+    assert result["ok"] is True
+    assert result["fact_quality"] == "estimated"
+    assert result["twin_fact"]["payload"]["observe_error"] == "plesk_xml_transport_failed"
 
 
 def test_dns_propagation_exposes_resolver_consensus_and_ttl(monkeypatch):
