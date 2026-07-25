@@ -2349,6 +2349,37 @@ def test_site_query_docroot_strips_release_current_symlink(monkeypatch):
     assert result["twin_fact"]["payload"]["decision"] == "accept"
 
 
+def test_site_query_docroot_main_domain_uses_httpdocs(monkeypatch):
+    xml = """<?xml version="1.0"?>
+    <packet><site><get><result><status>ok</status>
+    <data><hosting><vrt_hst>
+    <property><name>www_root</name>
+    <value>/var/www/vhosts/subactor.com/httpdocs</value></property>
+    </vrt_hst></hosting></data></result></get></site></packet>"""
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._vault_lease",
+        lambda *args, **kwargs: "secret",
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._xml_agent",
+        lambda *args, **kwargs: xml,
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._base_url",
+        lambda _url: "https://plesk.example.test:8443",
+    )
+    result = site_query_docroot(
+        domain="subactor.com",
+        main_domain="subactor.com",
+        declared="/httpdocs",
+        base_url="https://plesk.example.test:8443",
+    )
+    assert result["ok"] is True
+    assert result["twin_fact"]["payload"]["observed_docroot"] == "/httpdocs"
+    assert result["twin_fact"]["payload"]["decision"] == "accept"
+    assert result["twin_fact"]["payload"]["rule_docroot"] == "/httpdocs"
+
+
 def test_site_query_docroot_estimates_when_panel_unreachable(monkeypatch):
     monkeypatch.setattr(
         "urirun_connector_plesk.core._vault_lease",

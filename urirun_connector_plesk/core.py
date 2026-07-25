@@ -3220,8 +3220,13 @@ def _observed_docroot_from_www_root(
             if segment.lower() == subscription and index + 1 < len(trimmed):
                 return f"/{trimmed[index + 1]}"
     if site:
-        for segment in trimmed:
+        for index, segment in enumerate(trimmed):
             if segment.lower() == site:
+                # Subscription folder named like the main domain: docroot is the next
+                # segment (usually httpdocs). Subdomain folders match the domain name
+                # with no further non-release segment.
+                if index + 1 < len(trimmed):
+                    return f"/{trimmed[index + 1]}"
                 return f"/{segment}"
     return f"/{trimmed[-1]}"
 
