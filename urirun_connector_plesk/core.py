@@ -3187,6 +3187,9 @@ def site_remote_inventory(
             transport.close()
 
 
+_RELEASE_DOCROOT_SEGMENTS = frozenset({"current", "previous", "releases", "release"})
+
+
 def _rule_docroot(domain: str, main_domain: str = "") -> str:
     name = (domain or "").strip().lower()
     main = (main_domain or "").strip().lower()
@@ -3195,16 +3198,32 @@ def _rule_docroot(domain: str, main_domain: str = "") -> str:
     return f"/{name}" if name else "/httpdocs"
 
 
-def _observed_docroot_from_www_root(www_root: str, main_domain: str = "") -> str:
+def _observed_docroot_from_www_root(
+    www_root: str, main_domain: str = "", domain: str = "",
+) -> str:
+    """Derive Plesk docroot folder from absolute www_root.
+
+    Layout: ``/var/www/vhosts/<subscription>/<docroot>[/<release>…]``.
+    A trailing ``current``/``previous`` symlink is a release pointer, not the
+    docroot itself (live: ``…/subactor.com/docs.subactor.com/current``).
+    """
     parts = [part for part in str(www_root or "").rstrip("/").split("/") if part]
     if not parts:
         return ""
+    trimmed = list(parts)
+    while len(trimmed) > 1 and trimmed[-1].lower() in _RELEASE_DOCROOT_SEGMENTS:
+        trimmed.pop()
     subscription = (main_domain or "").strip().lower()
+    site = (domain or "").strip().lower()
     if subscription:
-        for index, segment in enumerate(parts):
-            if segment.lower() == subscription and index + 1 < len(parts):
-                return f"/{parts[index + 1]}"
-    return f"/{parts[-1]}"
+        for index, segment in enumerate(trimmed):
+            if segment.lower() == subscription and index + 1 < len(trimmed):
+                return f"/{trimmed[index + 1]}"
+    if site:
+        for segment in trimmed:
+            if segment.lower() == site:
+                return f"/{segment}"
+    return f"/{trimmed[-1]}"
 
 
 def _twin_fact(*, twin_type: str, instance_id: str, uri: str, payload: dict[str, Any],
@@ -3281,7 +3300,7 @@ def site_query_docroot(
             if not www_root:
                 observe_reason = "www_root_absent"
             else:
-                observed = _observed_docroot_from_www_root(www_root, main or panel)
+                observed = _observed_docroot_from_www_root(www_root, main, site)
                 observation_ok = bool(observed)
                 if not observation_ok:
                     observe_reason = "docroot_unresolved"

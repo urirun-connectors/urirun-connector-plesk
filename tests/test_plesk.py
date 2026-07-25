@@ -2318,6 +2318,37 @@ def test_site_query_docroot_emits_twin_fact_from_xml(monkeypatch):
     assert fact["snapshot_hash"].startswith("sha256:")
 
 
+def test_site_query_docroot_strips_release_current_symlink(monkeypatch):
+    xml = """<?xml version="1.0"?>
+    <packet><site><get><result><status>ok</status>
+    <data><hosting><vrt_hst>
+    <property><name>www_root</name>
+    <value>/var/www/vhosts/subactor.com/docs.subactor.com/current</value></property>
+    </vrt_hst></hosting></data></result></get></site></packet>"""
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._vault_lease",
+        lambda *args, **kwargs: "secret",
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._xml_agent",
+        lambda *args, **kwargs: xml,
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._base_url",
+        lambda _url: "https://plesk.example.test:8443",
+    )
+    # No main_domain — must still resolve domain folder, not trailing "current".
+    result = site_query_docroot(
+        domain="docs.subactor.com",
+        declared="/docs.subactor.com",
+        base_url="https://plesk.example.test:8443",
+    )
+    assert result["ok"] is True
+    assert result["authority"] == "observed"
+    assert result["twin_fact"]["payload"]["observed_docroot"] == "/docs.subactor.com"
+    assert result["twin_fact"]["payload"]["decision"] == "accept"
+
+
 def test_site_query_docroot_estimates_when_panel_unreachable(monkeypatch):
     monkeypatch.setattr(
         "urirun_connector_plesk.core._vault_lease",
