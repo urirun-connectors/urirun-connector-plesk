@@ -35,6 +35,7 @@ from urirun_connector_plesk import (
     extension_query,
     subscription_capabilities,
     site_publish,
+    site_query_docroot,
     site_remote_inventory,
     site_sync,
     urirun_bindings,
@@ -87,7 +88,10 @@ ROUTES = {
     "plesk://host/site/command/release-rollback",
     "plesk://host/site/query/release-current",
     "plesk://host/site/query/methods",
+    "plesk://host/site/query/docroot",
     "plesk://host/site/query/remote-inventory",
+    "plesk://host/session/query/mutate-lease",
+    "plesk://host/session/command/mutate-lease",
     "plesk://host/doctor/query/report",
 }
 
@@ -2224,3 +2228,61 @@ def test_ensure_ssl_explicit_provider_does_not_fall_through(monkeypatch):
         provider="panel-pem",
     )
     assert result["ok"] is False and result["error"] == "plesk_ssl_panel_upload_failed"
+
+
+def test_site_query_docroot_emits_twin_fact_from_xml(monkeypatch):
+    xml = """<?xml version="1.0"?>
+    <packet><site><get><result><status>ok</status>
+    <data><hosting><vrt_hst>
+    <property><name>www_root</name><value>/var/www/vhosts/subactor.com/docs.subactor.com</value></property>
+    </vrt_hst></hosting></data></result></get></site></packet>"""
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._vault_lease",
+        lambda *args, **kwargs: "secret",
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._xml_agent",
+        lambda *args, **kwargs: xml,
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._base_url",
+        lambda _url: "https://plesk.example.test:8443",
+    )
+    result = site_query_docroot(
+        domain="docs.subactor.com",
+        host="subactor.com",
+        main_domain="subactor.com",
+        declared="/docs.subactor.com",
+        instance_id="panel-demo",
+        base_url="https://plesk.example.test:8443",
+    )
+    assert result["ok"] is True
+    assert result["mutation_attempted"] is False
+    assert result["fact_quality"] == "fresh"
+    assert result["authority"] == "observed"
+    fact = result["twin_fact"]
+    assert fact["schema"] == "subactor.twin-fact/v1"
+    assert fact["twin_type"] == "plesk.site.docroot"
+    assert fact["uri"] == "plesk://host/site/query/docroot"
+    assert fact["payload"]["observed_docroot"] == "/docs.subactor.com"
+    assert fact["snapshot_hash"].startswith("sha256:")
+
+
+def test_site_query_docroot_estimates_when_panel_unreachable(monkeypatch):
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._vault_lease",
+        lambda *args, **kwargs: "secret",
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._xml_agent",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("plesk_xml_transport_failed")),
+    )
+    monkeypatch.setattr(
+        "urirun_connector_plesk.core._base_url",
+        lambda _url: "https://plesk.example.test:8443",
+    )
+    result = site_query_docroot(domain="docs.subactor.com", main_domain="subactor.com")
+    assert result["ok"] is True
+    assert result["fact_quality"] == "estimated"
+    assert result["authority"] == "rule"
+    assert result["twin_fact"]["payload"]["rule_docroot"] == "/docs.subactor.com"

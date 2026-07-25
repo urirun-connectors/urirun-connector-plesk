@@ -3037,6 +3037,7 @@ def site_remote_inventory(
             entries_total=len(attrs),
             truncated=len(attrs) > limit,
             host_fingerprint=fingerprint,
+
         )
     except RuntimeError as error:
         return urirun.fail(str(error), host=host, domain=site_domain, remote_path=remote_path, transport="sftp")
@@ -3046,6 +3047,176 @@ def site_remote_inventory(
         username = password = ""
         if transport is not None:
             transport.close()
+
+
+def _rule_docroot(domain: str, main_domain: str = "") -> str:
+    name = (domain or "").strip().lower()
+    main = (main_domain or "").strip().lower()
+    if main and name == main:
+        return "/httpdocs"
+    return f"/{name}" if name else "/httpdocs"
+
+
+def _observed_docroot_from_www_root(www_root: str, main_domain: str = "") -> str:
+    parts = [part for part in str(www_root or "").rstrip("/").split("/") if part]
+    if not parts:
+        return ""
+    subscription = (main_domain or "").strip().lower()
+    if subscription:
+        for index, segment in enumerate(parts):
+            if segment.lower() == subscription and index + 1 < len(parts):
+                return f"/{parts[index + 1]}"
+    return f"/{parts[-1]}"
+
+
+def _twin_fact(*, twin_type: str, instance_id: str, uri: str, payload: dict[str, Any],
+               feature_flags: dict[str, bool] | None = None,
+               fact_quality: str = "fresh") -> dict[str, Any]:
+    """Build subactor.twin-fact/v1 without depending on the Node uri-twin package."""
+    body = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    observed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return {
+        "schema": "subactor.twin-fact/v1",
+        "twin_type": twin_type,
+        "instance_id": instance_id,
+        "uri": uri,
+        "observed_at": observed_at,
+        "freshness_ms": 0,
+        "snapshot_hash": f"sha256:{hashlib.sha256(body.encode('utf-8')).hexdigest()}",
+        "feature_flags": feature_flags or {},
+        "payload": payload,
+        "fact_quality": fact_quality,
+        "redacted": [],
+    }
+
+
+@conn.handler(
+    "site/query/docroot",
+    isolated=True,
+    meta={"label": "Observe Plesk www_root/docroot as a twin fact (read-only)"},
+)
+def site_query_docroot(
+    domain: str = "",
+    host: str = "",
+    main_domain: str = "",
+    declared: str = "",
+    instance_id: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    """Read-only docroot observation for uri-twin / reality-check.
+
+    Returns a ``subactor.twin-fact/v1`` envelope. Missing Plesk data does not
+    mutate anything: quality falls back to ``estimated`` using the topology rule.
+    """
+    site = (domain or "").strip().lower()
+    if not site or not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", site):
+        return urirun.fail("plesk_site_domain_invalid", mutation_attempted=False)
+    panel = (host or "").strip().lower() or site
+    main = (main_domain or "").strip().lower()
+    rule = _rule_docroot(site, main)
+    declared_path = (declared or "").strip().rstrip("/") or rule
+    binding = (instance_id or panel or "plesk-default").strip() or "plesk-default"
+    uri = "plesk://host/site/query/docroot"
+
+    username = password = ""
+    observation_ok = False
+    www_root = ""
+    observed = ""
+    observe_reason = ""
+    try:
+        origin = _base_url(base_url)
+        username = _vault_lease(subscription_vault_entry_id, origin, "username", vault_url)
+        password = _vault_lease(subscription_vault_entry_id, origin, "password", vault_url)
+        packet = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            f"<packet><site><get><filter><name>{_xml_escape(site)}</name></filter>"
+            "<dataset><hosting/></dataset></get></site></packet>"
+        )
+        raw = _xml_agent(base_url, username, password, packet)
+        if not _xml_ok(raw):
+            observe_reason = "plesk_site_get_failed"
+        else:
+            props = _xml_props(raw)
+            www_root = (props.get("www_root") or "").strip()
+            if not www_root:
+                observe_reason = "www_root_absent"
+            else:
+                observed = _observed_docroot_from_www_root(www_root, main or panel)
+                observation_ok = bool(observed)
+                if not observation_ok:
+                    observe_reason = "docroot_unresolved"
+    except RuntimeError as error:
+        observe_reason = str(error) or "plesk_xml_transport_failed"
+    finally:
+        username = password = ""
+
+    if observation_ok:
+        authority = "observed"
+        fact_quality = "fresh"
+        expected = observed
+        within = declared_path == observed or declared_path.startswith(f"{observed}/")
+        decision = "accept" if within else "refuse"
+        reason = (
+            ""
+            if within
+            else (
+                f"remote_path {declared_path} is not under the docroot Plesk serves "
+                f"for {site} ({observed})."
+            )
+        )
+        if observed != rule:
+            decision = "refuse"
+            reason = (
+                f"Plesk serves {site} from {observed} (www_root {www_root}), "
+                f"but the rule expected {rule}. Reconcile topology before publishing."
+            )
+            expected = observed
+    else:
+        authority = "rule"
+        fact_quality = "estimated"
+        expected = rule
+        within = declared_path == rule or declared_path.startswith(f"{rule}/")
+        decision = "accept" if within else "refuse"
+        reason = (
+            observe_reason
+            or (
+                ""
+                if within
+                else f"remote_path {declared_path} does not match rule docroot {rule} for {site}"
+            )
+        )
+
+    payload = {
+        "domain": site,
+        "host": panel,
+        "declared": declared_path,
+        "rule_docroot": rule,
+        "observed_docroot": observed or None,
+        "observed_www_root": www_root or None,
+        "decision": decision,
+        "authority": authority,
+        "expected_remote_path": expected,
+        "reason": reason or None,
+        "observe_error": observe_reason or None,
+    }
+    fact = _twin_fact(
+        twin_type="plesk.site.docroot",
+        instance_id=binding,
+        uri=uri,
+        payload=payload,
+        fact_quality=fact_quality,
+    )
+    return urirun.ok(
+        twin_fact=fact,
+        domain=site,
+        docroot=payload.get("observed_docroot") or rule,
+        fact_quality=fact_quality,
+        authority=authority,
+        decision=decision,
+        mutation_attempted=False,
+    )
 
 
 def _sync_validate(*, source_dir: str, remote_path: str, host: str, transport: str,

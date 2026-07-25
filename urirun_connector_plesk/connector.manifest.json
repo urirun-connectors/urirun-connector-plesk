@@ -88,6 +88,8 @@
     "plesk://host/site/command/release-rollback",
     "plesk://host/site/query/release-current",
     "plesk://host/site/query/methods",
+    "plesk://host/site/query/docroot",
+    "plesk://host/site/query/remote-inventory",
     "plesk://host/doctor/query/report"
   ],
   "examples": [

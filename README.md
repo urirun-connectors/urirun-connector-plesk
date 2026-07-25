@@ -44,6 +44,7 @@ servers and do not contact a real Plesk instance.
 | `plesk://host/mailbox/command/create` | compatibility alias for ensure in create-only mode; fail-closed without apply grant |
 | `plesk://host/ftpuser/command/ensure` | rotate system SFTP/FTP password (XML) or ensure additional FTP user; store as `plesk-sftp` / `plesk-ftp` (https origin) |
 | `plesk://host/site/query/remote-inventory` | bounded read-only SFTP listing; ambiguous `/httpdocs` requires a vault `credential_origin` bound to the requested domain |
+| `plesk://host/site/query/docroot` | observe live `www_root`/docroot as `subactor.twin-fact/v1` (read-only; estimated fallback when panel unreachable) |
 | `plesk://host/site/query/methods` | probe which deployment transports (SFTP/FTP) are authorized |
 | `plesk://host/site/command/sync` | dry-run (default) or apply `www/` → `/httpdocs` tree sync (SFTP preferred, FTP fallback) |
 | `plesk://host/site/command/publish` | alias of `site/command/sync` |
