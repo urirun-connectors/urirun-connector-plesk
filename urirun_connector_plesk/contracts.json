@@ -19,7 +19,10 @@
         "authorized": "bool",
         "credential_type": "str"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
           "payload": {},
@@ -37,23 +40,30 @@
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"admin_vault_entry_id": "?str", "runtime_vault_entry_id": "?str"},
-      "out": {"methods": "list"},
+      "inp": {
+        "admin_vault_entry_id": "?str",
+        "runtime_vault_entry_id": "?str"
+      },
+      "out": {
+        "methods": "list"
+      },
       "errors": [],
       "examples": [
         {
           "payload": {},
           "result": {
             "ok": true,
-            "methods": [{
-              "type": "api_key",
-              "command_uri": "plesk://host/auth/command/bootstrap-api-key",
-              "root_credential_handle": "plesk-admin-bootstrap",
-              "result_credential_handle": "plesk-runtime",
-              "interactive_consent_required": false,
-              "mfa_required": false,
-              "secret_value_visible": false
-            }]
+            "methods": [
+              {
+                "type": "api_key",
+                "command_uri": "plesk://host/auth/command/bootstrap-api-key",
+                "root_credential_handle": "plesk-admin-bootstrap",
+                "result_credential_handle": "plesk-runtime",
+                "interactive_consent_required": false,
+                "mfa_required": false,
+                "secret_value_visible": false
+              }
+            ]
           }
         }
       ]
@@ -62,14 +72,30 @@
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"base_url": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {
-        "schema": "str", "authenticated": "bool", "credential_handle": "str",
-        "credential_type": "str", "scopes": "list", "expires_at": "?str",
-        "refreshable": "bool", "delegatable": "bool", "interactive_consent_required": "bool",
-        "secret_value_visible": "bool", "principal": "str", "provider": "str", "evidence": "dict"
+      "inp": {
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "out": {
+        "schema": "str",
+        "authenticated": "bool",
+        "credential_handle": "str",
+        "credential_type": "str",
+        "scopes": "list",
+        "expires_at": "?str",
+        "refreshable": "bool",
+        "delegatable": "bool",
+        "interactive_consent_required": "bool",
+        "secret_value_visible": "bool",
+        "principal": "str",
+        "provider": "str",
+        "evidence": "dict"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": []
     },
     "auth/query/status": {
@@ -83,25 +109,55 @@
         "vault_url": "?str"
       },
       "out": {
-        "schema": "str", "base_url": "str", "authorized": "bool", "authenticated": "bool",
-        "http_status": "int", "credential_handle": "?str", "credential_type": "?str",
-        "scopes": "list", "expires_at": "?str", "refreshable": "bool", "delegatable": "bool",
-        "interactive_consent_required": "bool", "secret_value_visible": "bool",
-        "principal": "?str", "provider": "str", "evidence": "dict"
+        "schema": "str",
+        "base_url": "str",
+        "authorized": "bool",
+        "authenticated": "bool",
+        "http_status": "int",
+        "credential_handle": "?str",
+        "credential_type": "?str",
+        "scopes": "list",
+        "expires_at": "?str",
+        "refreshable": "bool",
+        "delegatable": "bool",
+        "interactive_consent_required": "bool",
+        "secret_value_visible": "bool",
+        "principal": "?str",
+        "provider": "str",
+        "evidence": "dict"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
           "payload": {},
-            "result": {
-              "ok": true, "schema": "subactor.connector-auth-status/v1",
-              "base_url": "https://plesk.example.com:8443", "authorized": true,
-              "authenticated": true, "http_status": 200, "credential_handle": "plesk-runtime",
-              "credential_type": "api_key", "scopes": ["plesk.api.v2"], "expires_at": null,
-              "refreshable": false, "delegatable": false, "interactive_consent_required": false,
-              "secret_value_visible": false, "principal": "organization:plesk-account", "provider": "plesk",
-              "evidence": {"provider_probe": true, "scope_probe": false, "evidence_bundle_id": null}
+          "result": {
+            "ok": true,
+            "schema": "subactor.connector-auth-status/v1",
+            "base_url": "https://plesk.example.com:8443",
+            "authorized": true,
+            "authenticated": true,
+            "http_status": 200,
+            "credential_handle": "plesk-runtime",
+            "credential_type": "api_key",
+            "scopes": [
+              "plesk.api.v2"
+            ],
+            "expires_at": null,
+            "refreshable": false,
+            "delegatable": false,
+            "interactive_consent_required": false,
+            "secret_value_visible": false,
+            "principal": "organization:plesk-account",
+            "provider": "plesk",
+            "evidence": {
+              "provider_probe": true,
+              "scope_probe": false,
+              "evidence_bundle_id": null
             }
+          }
         }
       ]
     },
@@ -109,11 +165,31 @@
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"path": "str", "base_url": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"http_status": "int", "data": "any"},
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "inp": {
+        "path": "str",
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "http_status": "int",
+        "data": "any"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
-        {"payload": {"path": "/api/v2/domains"}, "result": {"ok": true, "http_status": 200, "data": []}}
+        {
+          "payload": {
+            "path": "/api/v2/domains"
+          },
+          "result": {
+            "ok": true,
+            "http_status": 200,
+            "data": []
+          }
+        }
       ]
     },
     "api/command/request": {
@@ -128,12 +204,30 @@
         "runtime_vault_entry_id": "?str",
         "vault_url": "?str"
       },
-      "out": {"http_status": "int", "data": "any"},
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "out": {
+        "http_status": "int",
+        "data": "any"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
-          "payload": {"path": "/api/v2/domains", "method": "POST", "body": {"name": "example.com"}},
-          "result": {"ok": true, "http_status": 201, "data": {"id": 1}}
+          "payload": {
+            "path": "/api/v2/domains",
+            "method": "POST",
+            "body": {
+              "name": "example.com"
+            }
+          },
+          "result": {
+            "ok": true,
+            "http_status": 201,
+            "data": {
+              "id": 1
+            }
+          }
         }
       ]
     },
@@ -142,81 +236,227 @@
       "effect": "query",
       "reversible": false,
       "inp": {
-        "site_id": "int", "host": "?str", "record_type": "?str", "base_url": "?str",
-        "subscription_vault_entry_id": "?str", "vault_url": "?str"
+        "site_id": "int",
+        "host": "?str",
+        "record_type": "?str",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "vault_url": "?str"
       },
-      "out": {"site_id": "int", "records": "list", "count": "int", "mutation_attempted": "bool"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{
-        "payload": {"site_id": 185, "host": "*.example.com"},
-        "result": {"ok": true, "site_id": 185, "records": [], "count": 0, "mutation_attempted": false}
-      }]
+      "out": {
+        "site_id": "int",
+        "records": "list",
+        "count": "int",
+        "mutation_attempted": "bool"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "site_id": 185,
+            "host": "*.example.com"
+          },
+          "result": {
+            "ok": true,
+            "site_id": 185,
+            "records": [],
+            "count": 0,
+            "mutation_attempted": false
+          }
+        }
+      ]
     },
     "dns/query/authority": {
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"zone": "str"},
-      "out": {"provider": "str", "authority": "object", "mutation_attempted": "bool"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{
-        "payload": {"zone": "example.com"},
-        "result": {"ok": true, "provider": "cloudflare", "authority": {"zone": "example.com", "consistent": true}, "mutation_attempted": false}
-      }]
+      "inp": {
+        "zone": "str"
+      },
+      "out": {
+        "provider": "str",
+        "authority": "object",
+        "mutation_attempted": "bool"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "zone": "example.com"
+          },
+          "result": {
+            "ok": true,
+            "provider": "cloudflare",
+            "authority": {
+              "zone": "example.com",
+              "consistent": true
+            },
+            "mutation_attempted": false
+          }
+        }
+      ]
     },
     "dns/query/propagation": {
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"host": "str", "record_type": "?str", "expected_value": "?str"},
-      "out": {"propagated": "bool", "consensus": "bool", "propagation": "object", "mutation_attempted": "bool"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{
-        "payload": {"host": "status.example.com", "record_type": "A", "expected_value": "192.0.2.10"},
-        "result": {"ok": true, "propagated": true, "consensus": true, "propagation": {"ttl_min": 120, "ttl_max": 300}, "mutation_attempted": false}
-      }]
+      "inp": {
+        "host": "str",
+        "record_type": "?str",
+        "expected_value": "?str"
+      },
+      "out": {
+        "propagated": "bool",
+        "consensus": "bool",
+        "propagation": "object",
+        "mutation_attempted": "bool"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "host": "status.example.com",
+            "record_type": "A",
+            "expected_value": "192.0.2.10"
+          },
+          "result": {
+            "ok": true,
+            "propagated": true,
+            "consensus": true,
+            "propagation": {
+              "ttl_min": 120,
+              "ttl_max": 300
+            },
+            "mutation_attempted": false
+          }
+        }
+      ]
     },
     "dns/command/replace": {
       "version": "v1",
       "effect": "command",
       "reversible": true,
       "inp": {
-        "site_id": "int", "host": "str", "record_type": "?str", "value": "str",
-        "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str",
-        "pack_id": "?str", "pack_version": "?str", "base_url": "?str",
-        "subscription_vault_entry_id": "?str", "vault_url": "?str"
+        "site_id": "int",
+        "host": "str",
+        "record_type": "?str",
+        "value": "str",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "vault_url": "?str"
       },
       "out": {
-        "dry_run": "bool", "executed": "bool", "mutation_attempted": "bool", "target": "str",
-        "plan_hash": "str", "changed": "bool", "verified": "?bool"
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "target": "str",
+        "plan_hash": "str",
+        "changed": "bool",
+        "verified": "?bool"
       },
-      "errors": ["precondition-unmet", "permission-denied", "conflict", "degraded-backend"],
-      "examples": [{
-        "payload": {"site_id": 185, "host": "*.example.com", "record_type": "A", "value": "192.0.2.10"},
-        "result": {"ok": true, "dry_run": true, "executed": false, "mutation_attempted": false, "target": "https://plesk.example.com:8443|dns:185:*.example.com", "plan_hash": "sha256", "changed": true}
-      }]
+      "errors": [
+        "precondition-unmet",
+        "permission-denied",
+        "conflict",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "site_id": 185,
+            "host": "*.example.com",
+            "record_type": "A",
+            "value": "192.0.2.10"
+          },
+          "result": {
+            "ok": true,
+            "dry_run": true,
+            "executed": false,
+            "mutation_attempted": false,
+            "target": "https://plesk.example.com:8443|dns:185:*.example.com",
+            "plan_hash": "sha256",
+            "changed": true
+          }
+        }
+      ]
     },
     "dns/command/reconcile": {
       "version": "v1",
       "effect": "command",
       "reversible": true,
       "inp": {
-        "zone": "str", "host": "str", "record_type": "?str", "value": "str",
-        "ttl": "?int", "proxied": "?bool", "expected_provider": "?str", "site_id": "?int",
-        "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str",
-        "pack_id": "?str", "pack_version": "?str", "base_url": "?str",
-        "subscription_vault_entry_id": "?str", "cloudflare_vault_entry_id": "?str", "vault_url": "?str"
+        "zone": "str",
+        "host": "str",
+        "record_type": "?str",
+        "value": "str",
+        "ttl": "?int",
+        "proxied": "?bool",
+        "expected_provider": "?str",
+        "site_id": "?int",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "cloudflare_vault_entry_id": "?str",
+        "vault_url": "?str"
       },
       "out": {
-        "provider": "str", "authority": "object", "dry_run": "bool", "executed": "bool",
-        "mutation_attempted": "bool", "target": "str", "plan_hash": "str",
-        "changed": "bool", "verified": "?bool"
+        "provider": "str",
+        "authority": "object",
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "target": "str",
+        "plan_hash": "str",
+        "changed": "bool",
+        "verified": "?bool"
       },
-      "errors": ["precondition-unmet", "permission-denied", "conflict", "degraded-backend"],
-      "examples": [{
-        "payload": {"zone": "example.com", "host": "status.example.com", "record_type": "A", "value": "192.0.2.10", "expected_provider": "cloudflare"},
-        "result": {"ok": true, "provider": "cloudflare", "dry_run": true, "executed": false, "mutation_attempted": false, "target": "cloudflare://example.com/dns:status.example.com", "plan_hash": "sha256", "changed": true}
-      }]
+      "errors": [
+        "precondition-unmet",
+        "permission-denied",
+        "conflict",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "zone": "example.com",
+            "host": "status.example.com",
+            "record_type": "A",
+            "value": "192.0.2.10",
+            "expected_provider": "cloudflare"
+          },
+          "result": {
+            "ok": true,
+            "provider": "cloudflare",
+            "dry_run": true,
+            "executed": false,
+            "mutation_attempted": false,
+            "target": "cloudflare://example.com/dns:status.example.com",
+            "plan_hash": "sha256",
+            "changed": true
+          }
+        }
+      ]
     },
     "mailbox/query/status": {
       "version": "v1",
@@ -229,9 +469,30 @@
         "vault_url": "?str",
         "api_path": "?str"
       },
-      "out": {"email": "str", "exists": "bool", "http_status": "int", "mutation_attempted": "bool"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{"payload": {"email": "hello@example.com"}, "result": {"ok": true, "email": "hello@example.com", "exists": true, "http_status": 200, "mutation_attempted": false}}]
+      "out": {
+        "email": "str",
+        "exists": "bool",
+        "http_status": "int",
+        "mutation_attempted": "bool"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "email": "hello@example.com"
+          },
+          "result": {
+            "ok": true,
+            "email": "hello@example.com",
+            "exists": true,
+            "http_status": 200,
+            "mutation_attempted": false
+          }
+        }
+      ]
     },
     "mailbox/command/ensure": {
       "version": "v2",
@@ -275,7 +536,10 @@
         "plan_hash": "str",
         "api_result": "any"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
           "payload": {
@@ -307,15 +571,55 @@
       "effect": "command",
       "reversible": false,
       "inp": {
-        "email": "str", "display_name": "?str", "credential_vault_entry_id": "?str",
-        "credential_origin": "str", "smtp_vault_entry_id": "?str", "smtp_credential_origin": "?str",
-        "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str",
-        "pack_id": "?str", "pack_version": "?str", "base_url": "?str",
-        "runtime_vault_entry_id": "?str", "vault_url": "?str", "api_path": "?str"
+        "email": "str",
+        "display_name": "?str",
+        "credential_vault_entry_id": "?str",
+        "credential_origin": "str",
+        "smtp_vault_entry_id": "?str",
+        "smtp_credential_origin": "?str",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
+        "base_url": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str",
+        "api_path": "?str"
       },
-      "out": {"email": "str", "created": "bool", "dry_run": "bool", "executed": "bool", "mutation_attempted": "bool", "target": "str", "plan_hash": "str"},
-      "errors": ["precondition-unmet", "permission-denied", "degraded-backend"],
-      "examples": [{"payload": {"email": "hello@example.com", "credential_origin": "imap://mail.example.com"}, "result": {"ok": true, "email": "hello@example.com", "created": false, "dry_run": true, "executed": false, "mutation_attempted": false, "target": "https://plesk.example.com:8443|mailbox:hello@example.com", "plan_hash": "sha256"}}]
+      "out": {
+        "email": "str",
+        "created": "bool",
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "target": "str",
+        "plan_hash": "str"
+      },
+      "errors": [
+        "precondition-unmet",
+        "permission-denied",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "email": "hello@example.com",
+            "credential_origin": "imap://mail.example.com"
+          },
+          "result": {
+            "ok": true,
+            "email": "hello@example.com",
+            "created": false,
+            "dry_run": true,
+            "executed": false,
+            "mutation_attempted": false,
+            "target": "https://plesk.example.com:8443|mailbox:hello@example.com",
+            "plan_hash": "sha256"
+          }
+        }
+      ]
     },
     "ftpuser/command/ensure": {
       "version": "v1",
@@ -346,7 +650,10 @@
         "credential_origin": "str",
         "transport_hint": "?str"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
           "payload": {
@@ -396,10 +703,16 @@
         "www_root": "str",
         "subdomain_id": "?int"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
-          "payload": {"parent_domain": "subactor.com", "subdomain": "docs"},
+          "payload": {
+            "parent_domain": "subactor.com",
+            "subdomain": "docs"
+          },
           "result": {
             "ok": true,
             "created": false,
@@ -444,42 +757,119 @@
         "changed": "?bool",
         "probe": "obj"
       },
-      "errors": ["precondition-unmet", "degraded-backend", "permission-denied", "verification-failed"],
-      "examples": [{
-        "payload": {
-          "hostname": "founder.subactor.com",
-          "upstream": "https://founder-origin.example.net",
-          "authentication_required": true,
-          "apply": false
-        },
-        "result": {
-          "ok": true,
-          "dry_run": true,
-          "executed": false,
-          "mutation_attempted": false,
-          "target": "https://plesk.example.com:8443|reverse-proxy:founder.subactor.com",
-          "plan_hash": "sha256",
-          "probe": {"reachable": true, "authentication_challenge": true}
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend",
+        "permission-denied",
+        "verification-failed"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "hostname": "founder.subactor.com",
+            "upstream": "https://founder-origin.example.net",
+            "authentication_required": true,
+            "apply": false
+          },
+          "result": {
+            "ok": true,
+            "dry_run": true,
+            "executed": false,
+            "mutation_attempted": false,
+            "target": "https://plesk.example.com:8443|reverse-proxy:founder.subactor.com",
+            "plan_hash": "sha256",
+            "probe": {
+              "reachable": true,
+              "authentication_challenge": true
+            }
+          }
         }
-      }]
+      ]
     },
     "subscription/query/capabilities": {
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"subscription": "str", "base_url": "?str", "subscription_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"subscription": "str", "authenticated": "bool", "domains_used": "int", "domains_limit": "?int", "limit_known": "bool", "can_create_domain": "bool"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{"payload": {"subscription": "prototypowanie.pl"}, "result": {"ok": true, "subscription": "prototypowanie.pl", "authenticated": true, "domains_used": 2, "domains_limit": 10, "limit_known": true, "can_create_domain": true}}]
+      "inp": {
+        "subscription": "str",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "subscription": "str",
+        "authenticated": "bool",
+        "domains_used": "int",
+        "domains_limit": "?int",
+        "limit_known": "bool",
+        "can_create_domain": "bool"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "subscription": "prototypowanie.pl"
+          },
+          "result": {
+            "ok": true,
+            "subscription": "prototypowanie.pl",
+            "authenticated": true,
+            "domains_used": 2,
+            "domains_limit": 10,
+            "limit_known": true,
+            "can_create_domain": true
+          }
+        }
+      ]
     },
     "domain/command/ensure": {
       "version": "v1",
       "effect": "command",
       "reversible": false,
-      "inp": {"domain": "str", "subscription": "str", "document_root": "?str", "apply": "?bool", "base_url": "?str", "subscription_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"domain": "str", "subscription": "str", "document_root": "str", "created": "bool", "existed": "bool", "dry_run": "bool", "site_id": "?int"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{"payload": {"domain": "autonomicznosc.pl", "subscription": "prototypowanie.pl", "apply": false}, "result": {"ok": true, "domain": "autonomicznosc.pl", "subscription": "prototypowanie.pl", "document_root": "httpdocs", "created": false, "existed": false, "dry_run": true, "site_id": null}}]
+      "inp": {
+        "domain": "str",
+        "subscription": "str",
+        "document_root": "?str",
+        "apply": "?bool",
+        "base_url": "?str",
+        "subscription_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "domain": "str",
+        "subscription": "str",
+        "document_root": "str",
+        "created": "bool",
+        "existed": "bool",
+        "dry_run": "bool",
+        "site_id": "?int"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "domain": "autonomicznosc.pl",
+            "subscription": "prototypowanie.pl",
+            "apply": false
+          },
+          "result": {
+            "ok": true,
+            "domain": "autonomicznosc.pl",
+            "subscription": "prototypowanie.pl",
+            "document_root": "httpdocs",
+            "created": false,
+            "existed": false,
+            "dry_run": true,
+            "site_id": null
+          }
+        }
+      ]
     },
     "site/command/ssl-ensure": {
       "version": "v1",
@@ -506,7 +896,10 @@
         "dns_preflight": "?obj",
         "dry_run": "bool"
       },
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": [
         {
           "payload": {
@@ -527,36 +920,141 @@
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"extension_id": "?str", "base_url": "?str", "admin_vault_entry_id": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"schema": "str", "extensions": "list", "installed": "int", "authority": "str", "source": "str"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{"payload": {}, "result": {"ok": true, "schema": "urirun.plesk-extension-inventory/v1", "extensions": [], "installed": 0, "authority": "plesk-administrator", "source": "xml-api:extension.get"}}]
+      "inp": {
+        "extension_id": "?str",
+        "base_url": "?str",
+        "admin_vault_entry_id": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "schema": "str",
+        "extensions": "list",
+        "installed": "int",
+        "authority": "str",
+        "source": "str"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {},
+          "result": {
+            "ok": true,
+            "schema": "urirun.plesk-extension-inventory/v1",
+            "extensions": [],
+            "installed": 0,
+            "authority": "plesk-administrator",
+            "source": "xml-api:extension.get"
+          }
+        }
+      ]
     },
     "extensions/query/capabilities": {
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"base_url": "?str", "admin_vault_entry_id": "?str", "runtime_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"schema": "str", "extensions": "list", "installed": "int", "profiled": "int", "unknown": "list"},
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "inp": {
+        "base_url": "?str",
+        "admin_vault_entry_id": "?str",
+        "runtime_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "schema": "str",
+        "extensions": "list",
+        "installed": "int",
+        "profiled": "int",
+        "unknown": "list"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": []
     },
     "extension/query/call": {
       "version": "v1",
       "effect": "query",
       "reversible": false,
-      "inp": {"extension_id": "str", "operation": "str", "arguments": "?dict", "base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"extension": "dict", "operation": "str", "transport": "str", "data": "any", "executed": "bool", "mutation_attempted": "bool"},
-      "errors": ["precondition-unmet", "degraded-backend"],
-      "examples": [{"payload": {"extension_id": "git", "operation": "get", "arguments": {"domain": "example.com"}}, "result": {"ok": true, "extension": {"id": "git", "active": true}, "operation": "get", "transport": "xml-extension", "data": {}, "executed": true, "mutation_attempted": false}}]
+      "inp": {
+        "extension_id": "str",
+        "operation": "str",
+        "arguments": "?dict",
+        "base_url": "?str",
+        "admin_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "extension": "dict",
+        "operation": "str",
+        "transport": "str",
+        "data": "any",
+        "executed": "bool",
+        "mutation_attempted": "bool"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
+      "examples": [
+        {
+          "payload": {
+            "extension_id": "git",
+            "operation": "get",
+            "arguments": {
+              "domain": "example.com"
+            }
+          },
+          "result": {
+            "ok": true,
+            "extension": {
+              "id": "git",
+              "active": true
+            },
+            "operation": "get",
+            "transport": "xml-extension",
+            "data": {},
+            "executed": true,
+            "mutation_attempted": false
+          }
+        }
+      ]
     },
     "extension/command/call": {
       "version": "v1",
       "effect": "command",
       "reversible": false,
-      "inp": {"extension_id": "str", "operation": "str", "arguments": "?dict", "apply": "?bool", "plan_hash": "?str", "apply_grant": "?str", "actor": "?str", "pack_id": "?str", "pack_version": "?str", "base_url": "?str", "admin_vault_entry_id": "?str", "vault_url": "?str"},
-      "out": {"dry_run": "bool", "executed": "bool", "mutation_attempted": "bool", "target": "?str", "plan": "?dict", "plan_hash": "?str", "artifact_sha256": "?str", "delegated_to": "?str"},
-      "errors": ["precondition-unmet", "degraded-backend"],
+      "inp": {
+        "extension_id": "str",
+        "operation": "str",
+        "arguments": "?dict",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
+        "base_url": "?str",
+        "admin_vault_entry_id": "?str",
+        "vault_url": "?str"
+      },
+      "out": {
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "target": "?str",
+        "plan": "?dict",
+        "plan_hash": "?str",
+        "artifact_sha256": "?str",
+        "delegated_to": "?str"
+      },
+      "errors": [
+        "precondition-unmet",
+        "degraded-backend"
+      ],
       "examples": []
     },
     "doctor/query/report": {
@@ -564,11 +1062,43 @@
       "effect": "query",
       "reversible": false,
       "inp": {},
-      "out": {"connector": "str", "version": "str", "status": "str"},
+      "out": {
+        "connector": "str",
+        "version": "str",
+        "status": "str"
+      },
       "errors": [],
       "examples": [
-        {"payload": {}, "result": {"ok": true, "connector": "plesk", "version": "0.10.0", "status": "ready"}}
+        {
+          "payload": {},
+          "result": {
+            "ok": true,
+            "connector": "plesk",
+            "version": "0.10.0",
+            "status": "ready"
+          }
+        }
       ]
+    },
+    "site/command/sync": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false
+    },
+    "site/command/release-activate": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
+    },
+    "site/command/release-rollback": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
+    },
+    "session/command/mutate-lease": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
     }
   },
   "wires": []
