@@ -1099,6 +1099,26 @@
       "version": "v1",
       "effect": "command",
       "reversible": true
+    },
+    "site/command/publish": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": false
+    },
+    "site/command/publish-verify": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
+    },
+    "site/command/release-verify": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
+    },
+    "site/command/release-upload": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
     }
   },
   "wires": []
