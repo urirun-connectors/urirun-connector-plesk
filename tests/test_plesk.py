@@ -841,6 +841,8 @@ def test_base_url_requires_https_except_loopback():
 def test_bindings_contract_and_manifest():
     document = urirun_bindings()
     assert set(document["bindings"]) == ROUTES
+    assert document["bindings"]["plesk://host/site/command/sync"]["policy"]["timeout"] == 195.0
+    assert document["bindings"]["plesk://host/site/command/publish"]["policy"]["timeout"] == 195.0
     registry = urirun.compile_registry(json.loads(json.dumps(document)))
     assert ROUTES <= {route["uri"] for route in urirun.list_routes(registry)}
     manifest = connector_manifest()

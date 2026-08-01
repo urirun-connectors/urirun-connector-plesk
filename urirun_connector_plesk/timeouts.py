@@ -39,3 +39,15 @@ def transport_timeouts() -> TransportTimeouts:
     if total < connect + min(operation, 30.0):
         total = connect + operation
     return TransportTimeouts(connect=connect, operation=operation, total=total)
+
+
+def isolated_execution_timeout(headroom: float = 15.0) -> float:
+    """Outer urirun subprocess deadline for a full transport operation.
+
+    The isolated runner defaults to 30 seconds, which is shorter than the
+    connector's declared SFTP/FTP operation and total budgets. Keep the outer
+    deadline slightly above the connector-owned total budget so the connector
+    can return its typed timeout/partial-upload result instead of being killed
+    by the generic runner.
+    """
+    return transport_timeouts().total + max(1.0, float(headroom))

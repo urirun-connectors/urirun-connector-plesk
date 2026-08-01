@@ -49,7 +49,7 @@ from .apply_grant import (
     mutations_gates_open,
     verify_apply_grant,
 )
-from .timeouts import transport_timeouts
+from .timeouts import isolated_execution_timeout, transport_timeouts
 from .extensions import (
     extension_call_packet,
     extension_capability_catalog,
@@ -3708,6 +3708,7 @@ def _site_tree_sync(
 @conn.handler(
     "site/command/sync",
     isolated=True,
+    policy={"timeout": isolated_execution_timeout()},
     meta={"label": "Dry-run (default) or apply www→httpdocs tree sync over SFTP/FTP"},
 )
 def site_sync(
@@ -3762,6 +3763,7 @@ def site_sync(
 @conn.handler(
     "site/command/publish",
     isolated=True,
+    policy={"timeout": isolated_execution_timeout()},
     meta={"label": "Alias of site/command/sync (dry-run by default; apply requires grant + plan_hash)"},
 )
 def site_publish(
