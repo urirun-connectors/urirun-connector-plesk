@@ -45,8 +45,19 @@
     "github": "https://github.com/urirun-connectors"
   },
   "docsUrl": "https://github.com/urirun-connectors/urirun-connector-plesk",
-  "keywords": ["plesk", "hosting", "domains", "mail", "rest-api", "xml-api", "extensions", "vault"],
-  "uriSchemes": ["plesk"],
+  "keywords": [
+    "plesk",
+    "hosting",
+    "domains",
+    "mail",
+    "rest-api",
+    "xml-api",
+    "extensions",
+    "vault"
+  ],
+  "uriSchemes": [
+    "plesk"
+  ],
   "authConformance": {
     "schema": "subactor.connector-auth-status/v1",
     "statusRoute": "plesk://host/auth/query/status",
@@ -62,37 +73,39 @@
     "plesk://host/auth/query/acquisition-methods",
     "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
-    "plesk://host/extensions/query/catalog",
-    "plesk://host/extensions/query/capabilities",
-    "plesk://host/extension/query/call",
-    "plesk://host/extension/command/call",
-    "plesk://host/subscription/query/capabilities",
-    "plesk://host/subscription/query/snapshot",
-    "plesk://host/domain/command/ensure",
-    "plesk://host/dns/query/records",
+    "plesk://host/dns/command/reconcile",
+    "plesk://host/dns/command/replace",
     "plesk://host/dns/query/authority",
     "plesk://host/dns/query/propagation",
-    "plesk://host/dns/command/replace",
-    "plesk://host/dns/command/reconcile",
+    "plesk://host/dns/query/records",
+    "plesk://host/doctor/query/report",
+    "plesk://host/domain/command/ensure",
+    "plesk://host/extension/command/call",
+    "plesk://host/extension/query/call",
+    "plesk://host/extensions/query/capabilities",
+    "plesk://host/extensions/query/catalog",
+    "plesk://host/ftpuser/command/ensure",
     "plesk://host/mailbox/command/create",
     "plesk://host/mailbox/command/ensure",
     "plesk://host/mailbox/query/status",
-    "plesk://host/ftpuser/command/ensure",
-    "plesk://host/site/command/subdomain-ensure",
-    "plesk://host/site/command/reverse-proxy-ensure",
-    "plesk://host/site/command/ssl-ensure",
+    "plesk://host/session/command/mutate-lease",
+    "plesk://host/session/query/mutate-lease",
     "plesk://host/site/command/publish",
-    "plesk://host/site/command/sync",
-    "plesk://host/site/command/release-upload",
-    "plesk://host/site/command/release-verify",
     "plesk://host/site/command/publish-verify",
     "plesk://host/site/command/release-activate",
     "plesk://host/site/command/release-rollback",
-    "plesk://host/site/query/release-current",
-    "plesk://host/site/query/methods",
+    "plesk://host/site/command/release-upload",
+    "plesk://host/site/command/release-verify",
+    "plesk://host/site/command/reverse-proxy-ensure",
+    "plesk://host/site/command/ssl-ensure",
+    "plesk://host/site/command/subdomain-ensure",
+    "plesk://host/site/command/sync",
     "plesk://host/site/query/docroot",
+    "plesk://host/site/query/methods",
+    "plesk://host/site/query/release-current",
     "plesk://host/site/query/remote-inventory",
-    "plesk://host/doctor/query/report"
+    "plesk://host/subscription/query/capabilities",
+    "plesk://host/subscription/query/snapshot"
   ],
   "examples": [
     {
@@ -103,7 +116,9 @@
     {
       "title": "List domains",
       "uri": "plesk://host/api/query/request",
-      "payload": {"path": "/api/v2/domains"}
+      "payload": {
+        "path": "/api/v2/domains"
+      }
     },
     {
       "title": "Dry-run www → httpdocs sync",
@@ -117,5 +132,7 @@
       }
     }
   ],
-  "adapterKinds": ["local-function"]
+  "adapterKinds": [
+    "local-function"
+  ]
 }
