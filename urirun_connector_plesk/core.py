@@ -146,7 +146,19 @@ def _request_json(
 
 def _vault_settings(vault_url: str = "") -> tuple[str, str]:
     url = (vault_url or os.environ.get("URIRUN_VAULT_URL", "")).rstrip("/")
-    token = os.environ.get("URIRUN_VAULT_TOKEN", "")
+    default_reference = "getv://URIRUN_VAULT_TOKEN"
+    reference = os.environ.get("URIRUN_VAULT_TOKEN_REF", default_reference).strip()
+    if not reference.startswith(("getv://", "secret://", "{getv:", "{secret:")):
+        raise RuntimeError("plesk_vault_token_ref_invalid")
+    try:
+        token = urirun.resolve_secret(
+            reference,
+            secret_allow=os.environ.get("URIRUN_SECRET_ALLOW", default_reference),
+        )
+    except KeyError:
+        token = ""
+    except PermissionError as error:
+        raise RuntimeError("plesk_vault_token_ref_denied") from error
     if not url or not token:
         raise RuntimeError("plesk_vault_not_configured")
     return url, token

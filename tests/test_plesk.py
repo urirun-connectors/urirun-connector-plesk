@@ -1416,6 +1416,7 @@ def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):
     for thread in threads:
         thread.start()
     monkeypatch.setenv("URIRUN_VAULT_TOKEN", "vault-service-token")
+    monkeypatch.setenv("URIRUN_VAULT_TOKEN_REF", "getv://URIRUN_VAULT_TOKEN")
     vault_url = f"http://127.0.0.1:{vault.server_port}"
     plesk_url = f"http://127.0.0.1:{plesk.server_port}"
     try:
