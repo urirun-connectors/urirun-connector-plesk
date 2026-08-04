@@ -1628,6 +1628,28 @@ def test_site_sync_requires_and_revalidates_portable_deployment_binding(monkeypa
         "ftp_vault_entry_id": binding["credential_refs"]["ftp"],
     }
 
+    monkeypatch.setattr(core, "_vault_settings", lambda _vault_url="": ("http://vault", "token"))
+    monkeypatch.setattr(
+        core,
+        "_request_json",
+        lambda *args, **kwargs: (404, {"ok": False, "error": "vault_entry_not_found"}),
+    )
+    not_ready = site_sync(**payload)
+    assert not_ready["ok"] is False
+    assert not_ready["error"] == "deployment_credentials_not_ready"
+    assert not_ready["mutation_attempted"] is False
+    assert {item["entry_id"] for item in not_ready["credential_preflight"]["entries"]} == {
+        binding["credential_refs"]["sftp"], binding["credential_refs"]["ftp"],
+    }
+
+    monkeypatch.setattr(
+        core,
+        "_request_json",
+        lambda *args, **kwargs: (200, {
+            "ok": True,
+            "scope": {"operations": ["plesk.site.sync"], "targets": ["domain:autonomicznosc.pl"]},
+        }),
+    )
     accepted = site_sync(**payload)
     assert accepted["ok"] is True and accepted["dry_run"] is True
 
@@ -1804,7 +1826,7 @@ def test_site_sync_rejects_ambiguous_httpdocs_for_unbound_domain(tmp_path):
     assert result["mutation_attempted"] is False
 
 
-def test_site_sync_accepts_httpdocs_with_domain_bound_transport_entries(tmp_path):
+def test_site_sync_rejects_httpdocs_when_only_entry_names_bind_domain(tmp_path):
     www = tmp_path / "www"
     www.mkdir()
     _seed_site(www)
@@ -1819,8 +1841,9 @@ def test_site_sync_accepts_httpdocs_with_domain_bound_transport_entries(tmp_path
         ftp_vault_entry_id="plesk-ftp-autonomicznosc-pl",
     )
 
-    assert result["ok"] is True
-    assert result["dry_run"] is True
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_sync_scope_unbound"
+    assert result["mutation_attempted"] is False
 
 
 def test_site_sync_rejects_unbound_chroot_root(tmp_path):
