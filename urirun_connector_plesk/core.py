@@ -547,6 +547,14 @@ def _vault_entry_binds_domain(entry_id: str, domain: str) -> bool:
 
 
 def _vault_entry_scope_binds_domain(entry_id: str, origin: str, domain: str, vault_url: str = "") -> bool:
+    return _vault_entry_scope_metadata(entry_id, origin, domain, vault_url)["ok"]
+
+
+def _vault_entry_scope_metadata(entry_id: str, origin: str, domain: str, vault_url: str = "") -> dict[str, Any]:
+    result = {"entry_id": str(entry_id or ""), "ok": False, "error": None}
+    if not result["entry_id"]:
+        result["error"] = "deployment_credential_entry_missing"
+        return result
     try:
         url, token = _vault_settings(vault_url)
         status, data = _request_json(
@@ -556,17 +564,24 @@ def _vault_entry_scope_binds_domain(entry_id: str, origin: str, domain: str, vau
             body={"origin": origin},
             timeout=transport_timeouts().connect,
         )
-    except RuntimeError:
-        return False
-    scope = data.get("scope") if status == 200 and isinstance(data, dict) else None
+    except RuntimeError as error:
+        result["error"] = str(error)
+        return result
+    if status != 200 or not isinstance(data, dict) or data.get("ok") is not True:
+        result["error"] = str(data.get("error") or f"http_{status}") if isinstance(data, dict) else f"http_{status}"
+        return result
+    scope = data.get("scope")
     if not isinstance(scope, dict):
-        return False
+        result["error"] = "deployment_credential_scope_mismatch"
+        return result
     operations = {str(item) for item in scope.get("operations") or []}
     targets = {str(item) for item in scope.get("targets") or []}
-    return "plesk.site.sync" in operations and f"domain:{str(domain).lower().rstrip('.')}" in targets
+    result["ok"] = "plesk.site.sync" in operations and f"domain:{str(domain).lower().rstrip('.')}" in targets
+    result["error"] = None if result["ok"] else "deployment_credential_scope_mismatch"
+    return result
 
 
-def _sync_vault_scope_verified(
+def _deployment_credentials_preflight(
     *,
     host: str,
     domain: str,
@@ -576,19 +591,27 @@ def _sync_vault_scope_verified(
     ftp_vault_entry_id: str,
     credential_origin: str,
     vault_url: str,
-) -> bool:
-    if posixpath.normpath(str(remote_path or "")) != "/httpdocs" or not str(domain or "").strip():
-        return False
+) -> dict[str, Any]:
+    _ = remote_path
+    if not str(domain or "").strip():
+        return {"ok": False, "checked": False, "error": "deployment_credentials_not_ready", "entries": []}
     origin = _transport_origin("sftp", host, credential_origin)
     entries = {
         "sftp": sftp_vault_entry_id,
         "ftp": ftp_vault_entry_id,
     }
-    selected = list(entries.values()) if transport == "auto" else [entries.get(transport, "")]
-    return bool(selected) and all(
-        entry and _vault_entry_scope_binds_domain(entry, origin, domain, vault_url)
-        for entry in selected
-    )
+    selected = entries.items() if transport == "auto" else [(transport, entries.get(transport, ""))]
+    checked = []
+    for selected_transport, entry_id in selected:
+        metadata = _vault_entry_scope_metadata(str(entry_id or ""), origin, domain, vault_url)
+        checked.append({
+            "transport": selected_transport,
+            "entry_id": metadata["entry_id"],
+            "ok": metadata["ok"],
+            "error": metadata["error"],
+        })
+    ok = bool(checked) and all(item["ok"] for item in checked)
+    return {"ok": ok, "checked": True, "error": None if ok else "deployment_credentials_not_ready", "entries": checked}
 
 
 def _sync_scope_error(
@@ -621,14 +644,6 @@ def _sync_scope_error(
     if origin.hostname and origin.hostname.lower().rstrip(".") == clean_domain:
         return None
     if credential_scope_verified:
-        return None
-    bindings = {
-        "sftp": _vault_entry_binds_domain(sftp_vault_entry_id, clean_domain),
-        "ftp": _vault_entry_binds_domain(ftp_vault_entry_id, clean_domain),
-    }
-    if transport == "auto" and all(bindings.values()):
-        return None
-    if transport in bindings and bindings[transport]:
         return None
     return "plesk_site_sync_scope_unbound"
 
@@ -3958,6 +3973,28 @@ def _site_tree_sync(
                 deployment_binding_ref=deployment_binding_ref or None,
                 mutation_attempted=False,
             )
+    requires_scope_preflight = bool(deployment_binding_ref) or (
+        bool(str(domain or "").strip()) and posixpath.normpath(str(remote_path or "")) == "/httpdocs"
+    )
+    credential_preflight = _deployment_credentials_preflight(
+        host=host,
+        domain=domain,
+        remote_path=remote_path,
+        transport=transport,
+        sftp_vault_entry_id=sftp_vault_entry_id,
+        ftp_vault_entry_id=ftp_vault_entry_id,
+        credential_origin=credential_origin,
+        vault_url=vault_url,
+    ) if requires_scope_preflight else None
+    if deployment_binding_ref and credential_preflight and not credential_preflight["ok"]:
+        return urirun.fail(
+            "deployment_credentials_not_ready",
+            domain=domain,
+            remote_path=remote_path,
+            deployment_binding_ref=deployment_binding_ref,
+            credential_preflight=credential_preflight,
+            mutation_attempted=False,
+        )
     scope_error = _sync_scope_error(
         host=host,
         domain=domain,
@@ -3966,16 +4003,7 @@ def _site_tree_sync(
         sftp_vault_entry_id=sftp_vault_entry_id,
         ftp_vault_entry_id=ftp_vault_entry_id,
         credential_origin=credential_origin,
-        credential_scope_verified=_sync_vault_scope_verified(
-            host=host,
-            domain=domain,
-            remote_path=remote_path,
-            transport=transport,
-            sftp_vault_entry_id=sftp_vault_entry_id,
-            ftp_vault_entry_id=ftp_vault_entry_id,
-            credential_origin=credential_origin,
-            vault_url=vault_url,
-        ),
+        credential_scope_verified=bool(credential_preflight and credential_preflight["ok"]),
     )
     if scope_error:
         return urirun.fail(scope_error, domain=domain, remote_path=remote_path, mutation_attempted=False)
