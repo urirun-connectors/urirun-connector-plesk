@@ -7,6 +7,7 @@ import ftplib
 import hashlib
 import json
 import os
+import posixpath
 import re
 import secrets
 import shlex
@@ -179,7 +180,7 @@ def _vault_lease(entry_id: str, origin: str, field: str, vault_url: str = "") ->
         raise RuntimeError(map_exception(error, phase="lease")) from error
     secret = str(data.get("secret") or "")
     if status in {401, 403}:
-        raise RuntimeError("credential_expired")
+        raise RuntimeError("plesk_vault_token_rejected")
     if status == 429:
         raise RuntimeError("rate_limited")
     if status != 200 or not secret:
@@ -507,7 +508,14 @@ def _transport_origin(transport: str, host: str, credential_origin: str = "") ->
     return credential_origin or f"https://{host}"
 
 
-def _inventory_scope_error(host: str, domain: str, remote_path: str, credential_origin: str = "") -> str | None:
+def _inventory_scope_error(
+    host: str,
+    domain: str,
+    remote_path: str,
+    credential_origin: str = "",
+    sftp_vault_entry_id: str = "plesk-sftp",
+    vault_url: str = "",
+) -> str | None:
     """Reject an ambiguous chroot root unless the vault origin binds it to the domain.
 
     ``/httpdocs`` has different meanings for different Plesk subscription users.
@@ -516,12 +524,311 @@ def _inventory_scope_error(host: str, domain: str, remote_path: str, credential_
     shorthand instead requires the effective vault origin hostname to equal
     the requested domain.  This check runs before a credential lease.
     """
-    if remote_path != "/httpdocs":
+    if posixpath.normpath(remote_path) not in {"/", "/httpdocs"}:
         return None
     origin = urllib.parse.urlparse(_transport_origin("sftp", host, credential_origin))
-    if not origin.hostname or origin.hostname.lower().rstrip(".") != domain.lower().rstrip("."):
-        return "plesk_site_inventory_scope_unbound"
+    if origin.hostname and origin.hostname.lower().rstrip(".") == domain.lower().rstrip("."):
+        return None
+    if _vault_entry_binds_domain(sftp_vault_entry_id, domain):
+        return None
+    if _vault_entry_scope_binds_domain(
+        sftp_vault_entry_id,
+        _transport_origin("sftp", host, credential_origin),
+        domain,
+        vault_url,
+    ):
+        return None
+    return "plesk_site_inventory_scope_unbound"
+
+
+def _vault_entry_binds_domain(entry_id: str, domain: str) -> bool:
+    suffix = re.sub(r"[^a-z0-9]+", "-", str(domain or "").lower()).strip("-")
+    return bool(suffix) and str(entry_id or "").lower().endswith(f"-{suffix}")
+
+
+def _vault_entry_scope_binds_domain(entry_id: str, origin: str, domain: str, vault_url: str = "") -> bool:
+    try:
+        url, token = _vault_settings(vault_url)
+        status, data = _request_json(
+            f"{url}/internal/vault/{urllib.parse.quote(entry_id, safe='')}/metadata",
+            method="POST",
+            headers={"authorization": f"Bearer {token}"},
+            body={"origin": origin},
+            timeout=transport_timeouts().connect,
+        )
+    except RuntimeError:
+        return False
+    scope = data.get("scope") if status == 200 and isinstance(data, dict) else None
+    if not isinstance(scope, dict):
+        return False
+    operations = {str(item) for item in scope.get("operations") or []}
+    targets = {str(item) for item in scope.get("targets") or []}
+    return "plesk.site.sync" in operations and f"domain:{str(domain).lower().rstrip('.')}" in targets
+
+
+def _sync_vault_scope_verified(
+    *,
+    host: str,
+    domain: str,
+    remote_path: str,
+    transport: str,
+    sftp_vault_entry_id: str,
+    ftp_vault_entry_id: str,
+    credential_origin: str,
+    vault_url: str,
+) -> bool:
+    if posixpath.normpath(str(remote_path or "")) != "/httpdocs" or not str(domain or "").strip():
+        return False
+    origin = _transport_origin("sftp", host, credential_origin)
+    entries = {
+        "sftp": sftp_vault_entry_id,
+        "ftp": ftp_vault_entry_id,
+    }
+    selected = list(entries.values()) if transport == "auto" else [entries.get(transport, "")]
+    return bool(selected) and all(
+        entry and _vault_entry_scope_binds_domain(entry, origin, domain, vault_url)
+        for entry in selected
+    )
+
+
+def _sync_scope_error(
+    *,
+    host: str,
+    domain: str,
+    remote_path: str,
+    transport: str,
+    sftp_vault_entry_id: str,
+    ftp_vault_entry_id: str,
+    credential_origin: str = "",
+    credential_scope_verified: bool = False,
+) -> str | None:
+    """Fail closed when a sync target is not bound to its declared domain."""
+    clean_domain = str(domain or "").lower().rstrip(".")
+    if not clean_domain:
+        return None
+    normalized_path = posixpath.normpath(str(remote_path or ""))
+    if normalized_path == "/":
+        return "plesk_site_sync_scope_mismatch"
+    vhost_prefix = "/var/www/vhosts/"
+    if normalized_path.startswith(vhost_prefix):
+        expected_prefix = f"{vhost_prefix}{clean_domain}/"
+        if not normalized_path.startswith(expected_prefix):
+            return "plesk_site_sync_scope_mismatch"
+        return None
+    if normalized_path != "/httpdocs":
+        return None
+    origin = urllib.parse.urlparse(_transport_origin("sftp", host, credential_origin))
+    if origin.hostname and origin.hostname.lower().rstrip(".") == clean_domain:
+        return None
+    if credential_scope_verified:
+        return None
+    bindings = {
+        "sftp": _vault_entry_binds_domain(sftp_vault_entry_id, clean_domain),
+        "ftp": _vault_entry_binds_domain(ftp_vault_entry_id, clean_domain),
+    }
+    if transport == "auto" and all(bindings.values()):
+        return None
+    if transport in bindings and bindings[transport]:
+        return None
+    return "plesk_site_sync_scope_unbound"
+
+
+def _deployment_binding_digest(binding: dict[str, Any]) -> str:
+    body = json.dumps(binding, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(body.encode("utf-8")).hexdigest()
+
+
+def _load_registry(path_env: str, schema: str, unavailable: str, invalid: str) -> tuple[dict[str, Any] | None, str | None]:
+    registry_path = os.environ.get(path_env, "").strip()
+    if not registry_path:
+        return None, unavailable
+    try:
+        with open(registry_path, encoding="utf-8") as handle:
+            registry = json.load(handle)
+    except (OSError, ValueError):
+        return None, unavailable
+    if registry.get("schema") != schema or registry.get("version") != 1:
+        return None, invalid
+    return registry, None
+
+
+def _registered_source_error(source_ref: str, source_dir: str) -> str | None:
+    source_registry, error = _load_registry(
+        "PLESK_SITE_RESOURCES_PATH",
+        "subactor.site-resources.v1",
+        "plesk_site_source_registry_unavailable",
+        "plesk_site_source_registry_invalid",
+    )
+    if error:
+        return error
+    source_matches = [item for item in source_registry.get("resources") or [] if item.get("id") == source_ref]
+    if len(source_matches) != 1:
+        return "plesk_site_source_ref_unknown"
+    configured_path = str(source_matches[0].get("path") or "").strip()
+    if not configured_path or os.path.realpath(source_dir) != os.path.realpath(configured_path):
+        return "plesk_site_source_path_mismatch"
     return None
+
+
+def _deployment_binding_error(
+    *,
+    source_dir: str,
+    source_ref: str,
+    deployment_binding_ref: str,
+    deployment_binding_hash: str,
+    deployment_binding_version: int,
+    domain: str,
+    host: str,
+    remote_path: str,
+    credential_origin: str,
+    sftp_vault_entry_id: str,
+    ftp_vault_entry_id: str,
+) -> str | None:
+    """Re-resolve the portable non-secret binding and require an exact target."""
+    required = os.environ.get("PLESK_DEPLOYMENT_BINDING_REQUIRED", "").strip().lower() in {"1", "true", "yes"}
+    binding_ref = str(deployment_binding_ref or "").strip()
+    if not binding_ref:
+        return "plesk_site_deployment_binding_required" if required else None
+    registry, registry_error = _load_registry(
+        "PLESK_DEPLOYMENT_BINDINGS_PATH",
+        "subactor.deployment-bindings/v1",
+        "plesk_site_deployment_registry_unavailable",
+        "plesk_site_deployment_registry_invalid",
+    )
+    if registry_error:
+        return registry_error
+    matches = [item for item in registry.get("bindings") or [] if item.get("id") == binding_ref]
+    if len(matches) != 1:
+        return "plesk_site_deployment_binding_unknown"
+    binding = matches[0]
+    digest = _deployment_binding_digest(binding)
+    if not re.fullmatch(r"[a-f0-9]{64}", str(deployment_binding_hash or "")) or not secrets.compare_digest(digest, str(deployment_binding_hash)):
+        return "plesk_site_deployment_binding_hash_mismatch"
+    try:
+        requested_version = int(deployment_binding_version or 0)
+        registry_version = int(registry.get("version") or 0)
+    except (TypeError, ValueError):
+        return "plesk_site_deployment_binding_version_mismatch"
+    if requested_version != registry_version:
+        return "plesk_site_deployment_binding_version_mismatch"
+    target = binding.get("target") or {}
+    credential_refs = binding.get("credential_refs") or {}
+    expected = {
+        "source_ref": binding.get("source_ref"),
+        "domain": target.get("domain"),
+        "host": target.get("transport_host"),
+        "remote_path": target.get("remote_path"),
+        "credential_origin": target.get("credential_origin"),
+        "sftp_vault_entry_id": credential_refs.get("sftp"),
+        "ftp_vault_entry_id": credential_refs.get("ftp"),
+    }
+    actual = {
+        "source_ref": source_ref,
+        "domain": domain,
+        "host": host,
+        "remote_path": remote_path,
+        "credential_origin": credential_origin,
+        "sftp_vault_entry_id": sftp_vault_entry_id,
+        "ftp_vault_entry_id": ftp_vault_entry_id,
+    }
+    if binding.get("provider") != "plesk" or binding.get("connector_uri") != "plesk://host/site/command/sync":
+        return "plesk_site_deployment_binding_provider_mismatch"
+    if expected != actual:
+        return "plesk_site_deployment_binding_target_mismatch"
+    return _registered_source_error(source_ref, source_dir)
+
+
+def _twin_profile_contract(
+    *,
+    source_dir: str,
+    source_ref: str,
+    deployment_binding_ref: str,
+    deployment_binding_hash: str,
+    deployment_binding_version: int,
+    twin_profile_ref: str,
+    twin_profile_hash: str,
+    twin_profile_version: int,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Resolve a production-anchored twin profile without accepting target overrides."""
+    deployment_registry, error = _load_registry(
+        "PLESK_DEPLOYMENT_BINDINGS_PATH",
+        "subactor.deployment-bindings/v1",
+        "plesk_site_deployment_registry_unavailable",
+        "plesk_site_deployment_registry_invalid",
+    )
+    if error:
+        return error, None
+    profiles_registry, error = _load_registry(
+        "PLESK_TWIN_PROFILES_PATH",
+        "subactor.deployment-twin-profiles/v1",
+        "plesk_site_twin_registry_unavailable",
+        "plesk_site_twin_registry_invalid",
+    )
+    if error:
+        return error, None
+    try:
+        if int(deployment_binding_version or 0) != int(deployment_registry.get("version") or 0):
+            return "plesk_site_deployment_binding_version_mismatch", None
+        if int(twin_profile_version or 0) != int(profiles_registry.get("version") or 0):
+            return "plesk_site_twin_profile_version_mismatch", None
+    except (TypeError, ValueError):
+        return "plesk_site_twin_profile_version_mismatch", None
+    bindings = [item for item in deployment_registry.get("bindings") or [] if item.get("id") == deployment_binding_ref]
+    if len(bindings) != 1:
+        return "plesk_site_deployment_binding_unknown", None
+    binding = bindings[0]
+    binding_digest = _deployment_binding_digest(binding)
+    if not re.fullmatch(r"[a-f0-9]{64}", str(deployment_binding_hash or "")) or not secrets.compare_digest(binding_digest, str(deployment_binding_hash)):
+        return "plesk_site_deployment_binding_hash_mismatch", None
+    profiles = [item for item in profiles_registry.get("profiles") or [] if item.get("id") == twin_profile_ref]
+    if len(profiles) != 1:
+        return "plesk_site_twin_profile_unknown", None
+    profile = profiles[0]
+    profile_digest = _deployment_binding_digest(profile)
+    if not re.fullmatch(r"[a-f0-9]{64}", str(twin_profile_hash or "")) or not secrets.compare_digest(profile_digest, str(twin_profile_hash)):
+        return "plesk_site_twin_profile_hash_mismatch", None
+    target = profile.get("target") or {}
+    verification = profile.get("verification") or {}
+    isolation = profile.get("isolation") or {}
+    domain = str(target.get("domain") or "").lower()
+    remote_path = str(target.get("remote_path") or "")
+    if (
+        binding.get("source_ref") != source_ref
+        or profile.get("source_ref") != source_ref
+        or profile.get("production_binding_ref") != binding.get("id")
+        or profile.get("production_binding_hash") != binding_digest
+    ):
+        return "plesk_site_twin_profile_binding_mismatch", None
+    if (
+        binding.get("provider") != "plesk"
+        or profile.get("adapter") != "local-release-fs"
+        or profile.get("connector_uri") != "plesk://host/site/command/twin-sync"
+        or profile.get("runtime_root_ref") != "twin-volume:plesk"
+        or isolation != {
+            "network_access": "none",
+            "production_credentials": "forbidden",
+            "writable_scope": "runtime-root-only",
+        }
+    ):
+        return "plesk_site_twin_profile_adapter_mismatch", None
+    if not domain.endswith(".test") or domain == ".test":
+        return "plesk_site_twin_domain_required", None
+    if remote_path != f"/var/www/vhosts/{domain}/httpdocs":
+        return "plesk_site_twin_remote_path_invalid", None
+    if target.get("effective_docroot") != "/httpdocs":
+        return "plesk_site_twin_remote_path_invalid", None
+    if (
+        verification.get("mode") != "sha256"
+        or verification.get("require_source_release_match") is not True
+        or not str(verification.get("entrypoint") or "").strip()
+        or str(verification.get("entrypoint") or "").startswith("/")
+        or ".." in str(verification.get("entrypoint") or "").split("/")
+    ):
+        return "plesk_site_twin_verification_invalid", None
+    source_error = _registered_source_error(source_ref, source_dir)
+    if source_error:
+        return source_error, None
+    return None, {"profile": profile, "binding": binding, "profile_digest": profile_digest}
 
 
 def _detect_transports(host: str, *, sftp_port: int, ftp_port: int, ftp_tls: bool,
@@ -3127,13 +3434,21 @@ def site_remote_inventory(
     if not _SAFE_REMOTE.fullmatch(remote_path) or ".." in remote_path or "//" in remote_path:
         return urirun.fail("plesk_site_remote_path_invalid")
     allowed_roots = (
+        "/",
         f"/var/www/vhosts/{site_domain}",
         f"/{site_domain}",
         "/httpdocs",
     )
     if not any(remote_path == root or remote_path.startswith(f"{root}/") for root in allowed_roots):
         return urirun.fail("plesk_site_inventory_scope_denied")
-    scope_error = _inventory_scope_error(host, site_domain, remote_path, credential_origin)
+    scope_error = _inventory_scope_error(
+        host,
+        site_domain,
+        remote_path,
+        credential_origin,
+        sftp_vault_entry_id,
+        vault_url,
+    )
     if scope_error:
         return urirun.fail(
             scope_error,
@@ -3291,6 +3606,10 @@ def site_query_docroot(
     main = (main_domain or "").strip().lower()
     rule = _rule_docroot(site, main)
     declared_path = (declared or "").strip().rstrip("/") or rule
+    declared_effective = declared_path
+    declared_vhost_prefix = f"/var/www/vhosts/{site}/"
+    if declared_path.startswith(declared_vhost_prefix):
+        declared_effective = _observed_docroot_from_www_root(declared_path, main, site)
     binding = (instance_id or panel or "plesk-default").strip() or "plesk-default"
     uri = "plesk://host/site/query/docroot"
 
@@ -3329,8 +3648,8 @@ def site_query_docroot(
     if observation_ok:
         authority = "observed"
         fact_quality = "fresh"
-        expected = observed
-        within = declared_path == observed or declared_path.startswith(f"{observed}/")
+        within = declared_effective == observed or declared_effective.startswith(f"{observed}/")
+        expected = declared_path if within else observed
         decision = "accept" if within else "refuse"
         reason = (
             ""
@@ -3351,7 +3670,7 @@ def site_query_docroot(
         authority = "rule"
         fact_quality = "estimated"
         expected = rule
-        within = declared_path == rule or declared_path.startswith(f"{rule}/")
+        within = declared_effective == rule or declared_effective.startswith(f"{rule}/")
         decision = "accept" if within else "refuse"
         reason = (
             observe_reason
@@ -3366,6 +3685,7 @@ def site_query_docroot(
         "domain": site,
         "host": panel,
         "declared": declared_path,
+        "declared_effective_docroot": declared_effective,
         "rule_docroot": rule,
         "observed_docroot": observed or None,
         "observed_www_root": www_root or None,
@@ -3605,12 +3925,60 @@ def _site_tree_sync(
     pack_id: str = "",
     pack_version: str = "",
     recipe_ref: str = "",
+    source_ref: str = "",
+    deployment_binding_ref: str = "",
+    deployment_binding_hash: str = "",
+    deployment_binding_version: int = 0,
+    enforce_deployment_binding: bool = False,
 ) -> dict[str, Any]:
     """Plan, gate and (when permitted) apply the local tree onto the remote path."""
     invalid = _sync_validate(source_dir=source_dir, remote_path=remote_path, host=host,
                              transport=transport, sftp_port=sftp_port, ftp_port=ftp_port)
     if invalid:
         return urirun.fail(invalid)
+    if enforce_deployment_binding:
+        binding_error = _deployment_binding_error(
+            source_dir=source_dir,
+            source_ref=source_ref,
+            deployment_binding_ref=deployment_binding_ref,
+            deployment_binding_hash=deployment_binding_hash,
+            deployment_binding_version=deployment_binding_version,
+            domain=domain,
+            host=host,
+            remote_path=remote_path,
+            credential_origin=credential_origin,
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            ftp_vault_entry_id=ftp_vault_entry_id,
+        )
+        if binding_error:
+            return urirun.fail(
+                binding_error,
+                domain=domain,
+                remote_path=remote_path,
+                deployment_binding_ref=deployment_binding_ref or None,
+                mutation_attempted=False,
+            )
+    scope_error = _sync_scope_error(
+        host=host,
+        domain=domain,
+        remote_path=remote_path,
+        transport=transport,
+        sftp_vault_entry_id=sftp_vault_entry_id,
+        ftp_vault_entry_id=ftp_vault_entry_id,
+        credential_origin=credential_origin,
+        credential_scope_verified=_sync_vault_scope_verified(
+            host=host,
+            domain=domain,
+            remote_path=remote_path,
+            transport=transport,
+            sftp_vault_entry_id=sftp_vault_entry_id,
+            ftp_vault_entry_id=ftp_vault_entry_id,
+            credential_origin=credential_origin,
+            vault_url=vault_url,
+        ),
+    )
+    if scope_error:
+        return urirun.fail(scope_error, domain=domain, remote_path=remote_path, mutation_attempted=False)
 
     exclude_patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
     plan = _plan_local_tree(source_dir, remote_path, exclude_patterns)
@@ -3705,6 +4073,340 @@ def _site_tree_sync(
     )
 
 
+def _twin_apply_enabled() -> bool:
+    return os.environ.get("PLESK_TWIN_APPLY_ENABLED", "").strip().lower() in {"1", "true", "yes"}
+
+
+def _twin_storage_root(*, create: bool = True) -> str:
+    configured = os.environ.get("PLESK_TWIN_ROOT", "").strip()
+    if not configured:
+        raise RuntimeError("plesk_site_twin_root_invalid")
+    root = os.path.realpath(configured)
+    if root == os.path.sep:
+        raise RuntimeError("plesk_site_twin_root_invalid")
+    if create:
+        os.makedirs(root, exist_ok=True)
+    elif not os.path.isdir(root):
+        raise RuntimeError("plesk_site_twin_release_not_found")
+    return root
+
+
+@conn.handler(
+    "site/command/twin-sync",
+    isolated=True,
+    policy={"timeout": isolated_execution_timeout()},
+    meta={"label": "Apply a production-anchored site plan into an isolated local digital twin"},
+)
+def site_twin_sync(
+    source_dir: str = "",
+    source_ref: str = "",
+    deployment_binding_ref: str = "",
+    deployment_binding_hash: str = "",
+    deployment_binding_version: int = 0,
+    twin_profile_ref: str = "",
+    twin_profile_hash: str = "",
+    twin_profile_version: int = 0,
+    apply: bool = False,
+    plan_hash: str = "",
+    exclude: list[str] | None = None,
+) -> dict[str, Any]:
+    """Plan or materialize an exact site tree in a network-free twin volume.
+
+    The production binding remains the topology anchor, while the twin profile
+    supplies a synthetic ``.test`` destination. No production credential or
+    mutation gate is consulted because this route cannot select a network
+    transport and writes only below ``PLESK_TWIN_ROOT``.
+    """
+    contract_error, contract = _twin_profile_contract(
+        source_dir=source_dir,
+        source_ref=source_ref,
+        deployment_binding_ref=deployment_binding_ref,
+        deployment_binding_hash=deployment_binding_hash,
+        deployment_binding_version=deployment_binding_version,
+        twin_profile_ref=twin_profile_ref,
+        twin_profile_hash=twin_profile_hash,
+        twin_profile_version=twin_profile_version,
+    )
+    if contract_error:
+        return urirun.fail(
+            contract_error,
+            deployment_binding_ref=deployment_binding_ref or None,
+            twin_profile_ref=twin_profile_ref or None,
+            mutation_attempted=False,
+        )
+    profile = contract["profile"]
+    target = profile["target"]
+    domain = target["domain"]
+    remote_path = target["remote_path"]
+    if not _source_allowed(source_dir):
+        return urirun.fail("plesk_site_source_not_allowlisted", mutation_attempted=False)
+    exclude_patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
+    plan = _plan_local_tree(source_dir, remote_path, exclude_patterns)
+    manifest = build_immutable_manifest(
+        plan=plan,
+        host="plesk-twin.test",
+        domain=domain,
+        remote_path=remote_path,
+        pack_id="deployment-twin",
+        pack_version=str(twin_profile_version),
+        recipe_ref=twin_profile_ref,
+    )
+    common = {
+        "execution_plane": "digital-twin",
+        "adapter": "local-release-fs",
+        "production_binding_ref": deployment_binding_ref,
+        "production_binding_hash": deployment_binding_hash,
+        "twin_profile_ref": twin_profile_ref,
+        "twin_profile_hash": twin_profile_hash,
+        "domain": domain,
+        "remote_path": remote_path,
+        "files_planned": len(plan),
+        "bytes_planned": manifest["bytes_total"],
+        "plan": plan,
+        "manifest": manifest,
+        "plan_hash": manifest["plan_hash"],
+    }
+    if not apply:
+        return connector_result(
+            ok=True,
+            dry_run=True,
+            executed=False,
+            mutation_attempted=False,
+            note="resubmit apply=true with this exact plan_hash to materialize only the isolated twin",
+            **common,
+        )
+    if not _twin_apply_enabled():
+        return connector_result(
+            ok=False,
+            reason="plesk_site_twin_apply_disabled",
+            error="plesk_site_twin_apply_disabled",
+            dry_run=True,
+            executed=False,
+            mutation_attempted=False,
+            **common,
+        )
+    mismatch, verified_manifest = _sync_plan_hash_gate(
+        plan=plan,
+        plan_hash=plan_hash,
+        host="plesk-twin.test",
+        domain=domain,
+        remote_path=remote_path,
+    )
+    if mismatch is not None:
+        return {**mismatch, **common, "manifest": verified_manifest, "plan_hash": verified_manifest["plan_hash"]}
+
+    from .release_ops import (
+        LocalReleaseFs,
+        RELEASE_META_NAME,
+        activate_release,
+        build_release_meta,
+        release_dir,
+        verify_release_local,
+    )
+
+    try:
+        fs = LocalReleaseFs(_twin_storage_root())
+        release_id = f"rel_twin_{manifest['plan_hash'][:16]}"
+        destination = release_dir(remote_path, release_id)
+        fs.mkdir_p(destination)
+        uploaded = []
+        for item in plan:
+            relative = str(item["path"])
+            local_path = os.path.join(os.path.realpath(source_dir), *relative.split("/"))
+            with open(local_path, "rb") as handle:
+                content = handle.read()
+            actual = hashlib.sha256(content).hexdigest()
+            if actual != item["sha256"]:
+                raise RuntimeError("plesk_site_twin_source_changed")
+            virtual_path = f"{destination}/{relative}"
+            fs.write_bytes(virtual_path, content)
+            written = fs.read_bytes(virtual_path)
+            if written is None or hashlib.sha256(written).hexdigest() != item["sha256"]:
+                raise RuntimeError("plesk_site_twin_remote_hash_mismatch")
+            uploaded.append({"path": relative, "bytes": len(content), "sha256": actual})
+        meta = build_release_meta(
+            release_id=release_id,
+            plan_hash=manifest["plan_hash"],
+            host="plesk-twin.test",
+            domain=domain,
+            files=plan,
+            artifact_sha256=manifest.get("source_sha256") or "",
+            pack_version=str(twin_profile_version),
+        )
+        fs.write_bytes(
+            f"{destination}/{RELEASE_META_NAME}",
+            json.dumps(meta, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+        )
+        local_verify = verify_release_local(
+            plan=plan,
+            release_id=release_id,
+            expected_plan_hash=manifest["plan_hash"],
+            meta=meta,
+        )
+        entrypoint = str(profile["verification"]["entrypoint"])
+        entrypoint_bytes = fs.read_bytes(f"{destination}/{entrypoint}")
+        if entrypoint_bytes is None:
+            raise RuntimeError("plesk_site_twin_entrypoint_missing")
+        entrypoint_sha256 = hashlib.sha256(entrypoint_bytes).hexdigest()
+        planned_entrypoint = next((item for item in plan if item["path"] == entrypoint), None)
+        if not planned_entrypoint or entrypoint_sha256 != planned_entrypoint["sha256"]:
+            raise RuntimeError("plesk_site_twin_entrypoint_hash_mismatch")
+        activation = activate_release(
+            fs,
+            release_root=remote_path,
+            release_id=release_id,
+            strategy="symlink",
+        )
+        receipt_body = {
+            "production_binding_hash": deployment_binding_hash,
+            "twin_profile_hash": twin_profile_hash,
+            "plan_hash": manifest["plan_hash"],
+            "source_sha256": manifest.get("source_sha256"),
+            "entrypoint": entrypoint,
+            "entrypoint_sha256": entrypoint_sha256,
+            "release_id": release_id,
+        }
+        receipt_sha256 = hashlib.sha256(
+            json.dumps(receipt_body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+        return connector_result(
+            ok=True,
+            dry_run=False,
+            executed=True,
+            mutation_attempted=True,
+            verified=True,
+            transport="local-release-fs",
+            files_uploaded=len(uploaded),
+            bytes_uploaded=manifest["bytes_total"],
+            files=uploaded,
+            release={**activation, **local_verify},
+            verification={
+                "mode": "sha256",
+                "entrypoint": entrypoint,
+                "entrypoint_sha256": entrypoint_sha256,
+                "source_matches_release": True,
+            },
+            receipt={**receipt_body, "receipt_sha256": receipt_sha256},
+            **common,
+        )
+    except (OSError, RuntimeError) as error:
+        return connector_result(
+            ok=False,
+            reason=str(error),
+            error=str(error),
+            dry_run=False,
+            executed=True,
+            mutation_attempted=True,
+            verified=False,
+            **common,
+        )
+
+
+@conn.handler(
+    "site/query/twin-current",
+    isolated=True,
+    meta={"label": "Observe and reverify the current isolated deployment twin release"},
+)
+def site_twin_current(
+    source_dir: str = "",
+    source_ref: str = "",
+    deployment_binding_ref: str = "",
+    deployment_binding_hash: str = "",
+    deployment_binding_version: int = 0,
+    twin_profile_ref: str = "",
+    twin_profile_hash: str = "",
+    twin_profile_version: int = 0,
+    exclude: list[str] | None = None,
+) -> dict[str, Any]:
+    contract_error, contract = _twin_profile_contract(
+        source_dir=source_dir,
+        source_ref=source_ref,
+        deployment_binding_ref=deployment_binding_ref,
+        deployment_binding_hash=deployment_binding_hash,
+        deployment_binding_version=deployment_binding_version,
+        twin_profile_ref=twin_profile_ref,
+        twin_profile_hash=twin_profile_hash,
+        twin_profile_version=twin_profile_version,
+    )
+    if contract_error:
+        return urirun.fail(contract_error, mutation_attempted=False)
+    profile = contract["profile"]
+    target = profile["target"]
+    domain = target["domain"]
+    remote_path = target["remote_path"]
+    from .release_ops import LocalReleaseFs, RELEASE_META_NAME, read_current_state, release_dir
+    try:
+        fs = LocalReleaseFs(_twin_storage_root(create=False))
+        state = read_current_state(fs, remote_path)
+        release_id = str(state.get("current") or "")
+        if not release_id:
+            raise RuntimeError("plesk_site_twin_release_not_found")
+        destination = release_dir(remote_path, release_id)
+        raw_meta = fs.read_bytes(f"{destination}/{RELEASE_META_NAME}")
+        if raw_meta is None:
+            raise RuntimeError("plesk_site_twin_release_not_found")
+        try:
+            meta = json.loads(raw_meta.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            raise RuntimeError("plesk_site_twin_release_meta_invalid") from error
+        exclude_patterns = tuple(exclude) if exclude else _DEFAULT_EXCLUDE
+        plan = _plan_local_tree(source_dir, remote_path, exclude_patterns)
+        manifest = build_immutable_manifest(
+            plan=plan,
+            host="plesk-twin.test",
+            domain=domain,
+            remote_path=remote_path,
+        )
+        entrypoint = str(profile["verification"]["entrypoint"])
+        content = fs.read_bytes(f"{destination}/{entrypoint}")
+        planned = next((item for item in plan if item["path"] == entrypoint), None)
+        entrypoint_sha256 = hashlib.sha256(content).hexdigest() if content is not None else ""
+        source_matches_release = bool(
+            planned
+            and entrypoint_sha256 == planned["sha256"]
+            and meta.get("plan_hash") == manifest["plan_hash"]
+            and meta.get("artifact_sha256") == manifest["source_sha256"]
+        )
+        fact = _twin_fact(
+            twin_type="plesk.site.deployment",
+            instance_id=twin_profile_ref,
+            uri="plesk://host/site/query/twin-current",
+            payload={
+                "production_binding_ref": deployment_binding_ref,
+                "production_binding_hash": deployment_binding_hash,
+                "twin_profile_ref": twin_profile_ref,
+                "twin_profile_hash": twin_profile_hash,
+                "domain": domain,
+                "release_id": release_id,
+                "plan_hash": manifest["plan_hash"],
+                "source_sha256": manifest["source_sha256"],
+                "entrypoint": entrypoint,
+                "entrypoint_sha256": entrypoint_sha256 or None,
+                "source_matches_release": source_matches_release,
+            },
+            fact_quality="fresh" if source_matches_release else "conflicting",
+        )
+        if not source_matches_release:
+            return urirun.fail(
+                "plesk_site_twin_verification_failed",
+                mutation_attempted=False,
+                twin_fact=fact,
+            )
+        return urirun.ok(
+            mutation_attempted=False,
+            verified=True,
+            twin_fact=fact,
+            current=release_id,
+            previous=state.get("previous"),
+            activation_strategy=state.get("strategy"),
+            plan_hash=manifest["plan_hash"],
+            source_sha256=manifest["source_sha256"],
+            entrypoint_sha256=entrypoint_sha256,
+        )
+    except (OSError, RuntimeError) as error:
+        return urirun.fail(str(error), mutation_attempted=False)
+
+
 @conn.handler(
     "site/command/sync",
     isolated=True,
@@ -3734,6 +4436,10 @@ def site_sync(
     pack_id: str = "",
     pack_version: str = "",
     recipe_ref: str = "",
+    source_ref: str = "",
+    deployment_binding_ref: str = "",
+    deployment_binding_hash: str = "",
+    deployment_binding_version: int = 0,
 ) -> dict[str, Any]:
     return _site_tree_sync(
         source_dir=source_dir,
@@ -3757,6 +4463,11 @@ def site_sync(
         pack_id=pack_id,
         pack_version=pack_version,
         recipe_ref=recipe_ref,
+        source_ref=source_ref,
+        deployment_binding_ref=deployment_binding_ref,
+        deployment_binding_hash=deployment_binding_hash,
+        deployment_binding_version=deployment_binding_version,
+        enforce_deployment_binding=True,
     )
 
 
@@ -3789,6 +4500,10 @@ def site_publish(
     pack_id: str = "",
     pack_version: str = "",
     recipe_ref: str = "",
+    source_ref: str = "",
+    deployment_binding_ref: str = "",
+    deployment_binding_hash: str = "",
+    deployment_binding_version: int = 0,
 ) -> dict[str, Any]:
     return site_sync(
         source_dir=source_dir,
@@ -3813,6 +4528,10 @@ def site_publish(
         pack_id=pack_id,
         pack_version=pack_version,
         recipe_ref=recipe_ref,
+        source_ref=source_ref,
+        deployment_binding_ref=deployment_binding_ref,
+        deployment_binding_hash=deployment_binding_hash,
+        deployment_binding_version=deployment_binding_version,
     )
 
 

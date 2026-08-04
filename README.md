@@ -229,6 +229,23 @@ host_fingerprint     optional SHA-256 host key pin (hex)
 Requires `paramiko` (hard dependency since PR6; also baked into the `urirun-node`
 image). Do **not** `pip install` paramiko into a running container.
 
+### Isolated deployment twin
+
+`plesk://host/site/command/twin-sync` runs the same local tree planning and
+immutable-manifest logic against `LocalReleaseFs`. It requires both the exact
+production binding hash and a Git-managed `deployment-twin:*` profile hash.
+Twin profiles are restricted to `.test`, `local-release-fs`,
+`twin-volume:plesk`, and a route contract that forbids production credentials.
+
+The first call uses `apply=false` and returns `plan_hash`. A second call with
+`apply=true` and the exact hash writes an atomic release below
+`PLESK_TWIN_ROOT`, verifies every file plus the declared entrypoint, and returns
+a receipt. `PLESK_TWIN_APPLY_ENABLED=1` enables only this local-volume mutation;
+it does not open `PLESK_SYNC_APPLY` or the production mutation gate.
+`plesk://host/site/query/twin-current` rebuilds the source manifest and returns
+a fresh `plesk.site.deployment` twin fact only when the current release still
+matches the registered source, production binding and twin profile.
+
 ### Transport policy (PR6)
 
 - **Production publish** requires SFTP (`production_publish_ready` in doctor).

@@ -4,6 +4,7 @@ import base64
 import json
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 import urirun
@@ -39,6 +40,8 @@ from urirun_connector_plesk import (
     site_query_docroot,
     site_remote_inventory,
     site_sync,
+    site_twin_current,
+    site_twin_sync,
     urirun_bindings,
 )
 import urirun_connector_plesk.core as core
@@ -83,6 +86,7 @@ ROUTES = {
     "plesk://host/site/command/ssl-ensure",
     "plesk://host/site/command/publish",
     "plesk://host/site/command/sync",
+    "plesk://host/site/command/twin-sync",
     "plesk://host/site/command/release-upload",
     "plesk://host/site/command/release-verify",
     "plesk://host/site/command/publish-verify",
@@ -92,6 +96,7 @@ ROUTES = {
     "plesk://host/site/query/methods",
     "plesk://host/site/query/docroot",
     "plesk://host/site/query/remote-inventory",
+    "plesk://host/site/query/twin-current",
     "plesk://host/session/query/mutate-lease",
     "plesk://host/session/command/mutate-lease",
     "plesk://host/doctor/query/report",
@@ -193,13 +198,42 @@ def test_remote_inventory_is_bounded_and_does_not_return_credentials(monkeypatch
     assert '"u"' not in serialized and '"p"' not in serialized
 
 
-def test_remote_inventory_denies_server_root_before_leasing_credentials(monkeypatch):
+def test_remote_inventory_denies_unbound_chroot_root_before_leasing_credentials(monkeypatch):
     monkeypatch.setattr(core, "_vault_lease", lambda *_args: pytest.fail("vault must not be touched"))
     result = site_remote_inventory(
         host="plesk.example.com", domain="example.com", remote_path="/",
     )
     assert result["ok"] is False
-    assert result["error"] == "plesk_site_inventory_scope_denied"
+    assert result["error"] == "plesk_site_inventory_scope_unbound"
+
+
+def test_remote_inventory_accepts_domain_bound_chroot_root(monkeypatch):
+    class Sftp:
+        def stat(self, path):
+            assert path == "/"
+            return type("Directory", (), {"st_mode": 0o40750})()
+
+        def listdir_attr(self, path):
+            assert path == "/"
+            return []
+
+        def close(self):
+            pass
+
+    class Transport:
+        def close(self):
+            pass
+
+    monkeypatch.setattr(core, "_vault_lease", lambda *_args: "leased")
+    monkeypatch.setattr(core, "_sftp_connect", lambda *_args: (Transport(), Sftp(), "sha256:bound"))
+    result = site_remote_inventory(
+        host="plesk.example.com",
+        domain="customer.example.com",
+        remote_path="/",
+        sftp_vault_entry_id="plesk-sftp-customer-example-com",
+    )
+    assert result["ok"] is True
+    assert result["entries_total"] == 0
 
 
 def test_remote_inventory_denies_ambiguous_httpdocs_before_leasing_credentials(monkeypatch):
@@ -847,6 +881,18 @@ def test_bindings_contract_and_manifest():
     assert ROUTES <= {route["uri"] for route in urirun.list_routes(registry)}
     manifest = connector_manifest()
     assert manifest["id"] == "plesk" and set(manifest["routes"]) == ROUTES
+
+
+def test_twin_sync_declares_reversible_local_volume_effect():
+    contracts = json.loads(
+        (Path(core.__file__).with_name("contracts.json")).read_text(encoding="utf-8")
+    )
+
+    assert contracts["contracts"]["site/command/twin-sync"] == {
+        "version": "v1",
+        "effect": "command",
+        "reversible": True,
+    }
 
 
 def test_mailbox_status_uses_read_only_info_call(monkeypatch):
@@ -1529,6 +1575,330 @@ def test_site_sync_dry_run_plans_without_upload(monkeypatch, tmp_path):
     assert fake_sftp.puts == []
 
 
+def test_site_sync_requires_and_revalidates_portable_deployment_binding(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    binding = {
+        "id": "deployment:autonomicznosc-pl:production",
+        "environment": "production",
+        "source_ref": "workspace:autonomicznosc-pl",
+        "provider": "plesk",
+        "connector_uri": "plesk://host/site/command/sync",
+        "target": {
+            "domain": "autonomicznosc.pl",
+            "webspace": "autonomicznosc.pl",
+            "transport_host": "prototypowanie.pl",
+            "credential_origin": "https://prototypowanie.pl",
+            "remote_path": "/var/www/vhosts/autonomicznosc.pl/httpdocs",
+            "effective_docroot": "/httpdocs",
+            "path_mode": "absolute-vhost",
+            "docroot_main_domain": "autonomicznosc.pl",
+        },
+        "credential_refs": {
+            "sftp": "plesk-sftp-autonomicznosc-pl",
+            "ftp": "plesk-ftp-autonomicznosc-pl",
+        },
+        "verification": {"url": "https://autonomicznosc.pl/", "mode": "sha256", "entrypoint": "index.html"},
+    }
+    registry_path = tmp_path / "deployment-bindings.json"
+    registry_path.write_text(json.dumps({"schema": "subactor.deployment-bindings/v1", "version": 1, "bindings": [binding]}), encoding="utf-8")
+    source_registry_path = tmp_path / "site-resources.json"
+    source_registry_path.write_text(json.dumps({
+        "schema": "subactor.site-resources.v1",
+        "version": 1,
+        "resources": [{"id": binding["source_ref"], "path": str(www), "domain": binding["target"]["domain"]}],
+    }), encoding="utf-8")
+    monkeypatch.setenv("PLESK_DEPLOYMENT_BINDING_REQUIRED", "1")
+    monkeypatch.setenv("PLESK_DEPLOYMENT_BINDINGS_PATH", str(registry_path))
+    monkeypatch.setenv("PLESK_SITE_RESOURCES_PATH", str(source_registry_path))
+    monkeypatch.setenv("PLESK_SYNC_ALLOWED_SOURCES", str(tmp_path))
+    digest = core._deployment_binding_digest(binding)
+    payload = {
+        "source_dir": str(www),
+        "source_ref": binding["source_ref"],
+        "deployment_binding_ref": binding["id"],
+        "deployment_binding_hash": digest,
+        "deployment_binding_version": 1,
+        "remote_path": binding["target"]["remote_path"],
+        "host": binding["target"]["transport_host"],
+        "domain": binding["target"]["domain"],
+        "credential_origin": binding["target"]["credential_origin"],
+        "sftp_vault_entry_id": binding["credential_refs"]["sftp"],
+        "ftp_vault_entry_id": binding["credential_refs"]["ftp"],
+    }
+
+    accepted = site_sync(**payload)
+    assert accepted["ok"] is True and accepted["dry_run"] is True
+
+    missing = site_sync(source_dir=str(www), remote_path=payload["remote_path"], host=payload["host"], domain=payload["domain"])
+    assert missing["ok"] is False
+    assert missing["error"] == "plesk_site_deployment_binding_required"
+
+    changed = site_sync(**{**payload, "remote_path": "/httpdocs"})
+    assert changed["ok"] is False
+    assert changed["error"] == "plesk_site_deployment_binding_target_mismatch"
+    assert changed["mutation_attempted"] is False
+
+    invalid_version = site_sync(**{**payload, "deployment_binding_version": "not-a-version"})
+    assert invalid_version["ok"] is False
+    assert invalid_version["error"] == "plesk_site_deployment_binding_version_mismatch"
+    assert invalid_version["mutation_attempted"] is False
+
+    other_source = tmp_path / "wrong-site"
+    other_source.mkdir()
+    _seed_site(other_source)
+    changed_source = site_sync(**{**payload, "source_dir": str(other_source)})
+    assert changed_source["ok"] is False
+    assert changed_source["error"] == "plesk_site_source_path_mismatch"
+    assert changed_source["mutation_attempted"] is False
+
+
+def test_site_twin_sync_materializes_verified_release_without_vault_or_network(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    binding = {
+        "id": "deployment:autonomicznosc-pl:production",
+        "environment": "production",
+        "source_ref": "workspace:autonomicznosc-pl",
+        "provider": "plesk",
+        "connector_uri": "plesk://host/site/command/sync",
+        "target": {"domain": "autonomicznosc.pl"},
+    }
+    binding_hash = core._deployment_binding_digest(binding)
+    profile = {
+        "id": "deployment-twin:autonomicznosc-pl",
+        "source_ref": binding["source_ref"],
+        "production_binding_ref": binding["id"],
+        "production_binding_hash": binding_hash,
+        "connector_uri": "plesk://host/site/command/twin-sync",
+        "adapter": "local-release-fs",
+        "runtime_root_ref": "twin-volume:plesk",
+        "isolation": {"network_access": "none", "production_credentials": "forbidden", "writable_scope": "runtime-root-only"},
+        "target": {
+            "domain": "autonomicznosc-pl.twin.test",
+            "remote_path": "/var/www/vhosts/autonomicznosc-pl.twin.test/httpdocs",
+            "effective_docroot": "/httpdocs",
+        },
+        "verification": {"mode": "sha256", "entrypoint": "index.html", "require_source_release_match": True},
+    }
+    profile_hash = core._deployment_binding_digest(profile)
+    deployment_registry = tmp_path / "deployment-bindings.json"
+    deployment_registry.write_text(json.dumps({
+        "schema": "subactor.deployment-bindings/v1", "version": 1, "bindings": [binding],
+    }), encoding="utf-8")
+    twin_registry = tmp_path / "deployment-twins.json"
+    twin_registry.write_text(json.dumps({
+        "schema": "subactor.deployment-twin-profiles/v1", "version": 1, "profiles": [profile],
+    }), encoding="utf-8")
+    source_registry = tmp_path / "site-resources.json"
+    source_registry.write_text(json.dumps({
+        "schema": "subactor.site-resources.v1", "version": 1,
+        "resources": [{"id": binding["source_ref"], "path": str(www)}],
+    }), encoding="utf-8")
+    twin_root = tmp_path / "twin"
+    monkeypatch.setenv("PLESK_DEPLOYMENT_BINDINGS_PATH", str(deployment_registry))
+    monkeypatch.setenv("PLESK_TWIN_PROFILES_PATH", str(twin_registry))
+    monkeypatch.setenv("PLESK_SITE_RESOURCES_PATH", str(source_registry))
+    monkeypatch.setenv("PLESK_SYNC_ALLOWED_SOURCES", str(tmp_path))
+    monkeypatch.setenv("PLESK_TWIN_ROOT", str(twin_root))
+    monkeypatch.setenv("PLESK_TWIN_APPLY_ENABLED", "1")
+    monkeypatch.setattr(core, "_vault_lease", lambda *_args: pytest.fail("twin must not lease production credentials"))
+    payload = {
+        "source_dir": str(www),
+        "source_ref": binding["source_ref"],
+        "deployment_binding_ref": binding["id"],
+        "deployment_binding_hash": binding_hash,
+        "deployment_binding_version": 1,
+        "twin_profile_ref": profile["id"],
+        "twin_profile_hash": profile_hash,
+        "twin_profile_version": 1,
+    }
+
+    dry = site_twin_sync(**payload)
+    assert dry["ok"] is True and dry["dry_run"] is True and dry["executed"] is False
+    assert dry["execution_plane"] == "digital-twin"
+    assert not twin_root.exists()
+
+    mismatch = site_twin_sync(**payload, apply=True, plan_hash="0" * 64)
+    assert mismatch["ok"] is False and mismatch["reason"] == "plan_hash_mismatch"
+    assert mismatch["mutation_attempted"] is False
+    assert not twin_root.exists()
+
+    applied = site_twin_sync(**payload, apply=True, plan_hash=dry["plan_hash"])
+    assert applied["ok"] is True and applied["executed"] is True and applied["verified"] is True
+    assert applied["transport"] == "local-release-fs"
+    assert applied["verification"]["source_matches_release"] is True
+    assert applied["verification"]["entrypoint_sha256"] == next(
+        item["sha256"] for item in dry["plan"] if item["path"] == "index.html"
+    )
+    current = twin_root / "var/www/vhosts/autonomicznosc-pl.twin.test/httpdocs/current"
+    assert current.is_symlink()
+    assert (current / "index.html").read_text(encoding="utf-8") == "<h1>subactor</h1>"
+    assert len(applied["receipt"]["receipt_sha256"]) == 64
+
+    observed = site_twin_current(**payload)
+    assert observed["ok"] is True and observed["verified"] is True
+    assert observed["current"] == applied["release"]["release_id"]
+    assert observed["twin_fact"]["twin_type"] == "plesk.site.deployment"
+    assert observed["twin_fact"]["payload"]["source_matches_release"] is True
+
+
+def test_site_twin_sync_refuses_untrusted_profile_before_writing(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    binding = {
+        "id": "deployment:site:production", "environment": "production",
+        "source_ref": "workspace:site", "provider": "plesk",
+        "connector_uri": "plesk://host/site/command/sync", "target": {"domain": "site.example"},
+    }
+    binding_hash = core._deployment_binding_digest(binding)
+    profile = {
+        "id": "deployment-twin:site", "source_ref": "workspace:site",
+        "production_binding_ref": binding["id"], "production_binding_hash": binding_hash,
+        "connector_uri": "plesk://host/site/command/twin-sync", "adapter": "local-release-fs",
+        "runtime_root_ref": "twin-volume:plesk",
+        "isolation": {"network_access": "none", "production_credentials": "forbidden", "writable_scope": "runtime-root-only"},
+        "target": {"domain": "site.example.com", "remote_path": "/var/www/vhosts/site.example.com/httpdocs", "effective_docroot": "/httpdocs"},
+        "verification": {"mode": "sha256", "entrypoint": "index.html", "require_source_release_match": True},
+    }
+    deployment_registry = tmp_path / "bindings.json"
+    deployment_registry.write_text(json.dumps({"schema": "subactor.deployment-bindings/v1", "version": 1, "bindings": [binding]}))
+    twin_registry = tmp_path / "twins.json"
+    twin_registry.write_text(json.dumps({"schema": "subactor.deployment-twin-profiles/v1", "version": 1, "profiles": [profile]}))
+    source_registry = tmp_path / "sources.json"
+    source_registry.write_text(json.dumps({"schema": "subactor.site-resources.v1", "version": 1, "resources": [{"id": "workspace:site", "path": str(www)}]}))
+    twin_root = tmp_path / "twin"
+    monkeypatch.setenv("PLESK_DEPLOYMENT_BINDINGS_PATH", str(deployment_registry))
+    monkeypatch.setenv("PLESK_TWIN_PROFILES_PATH", str(twin_registry))
+    monkeypatch.setenv("PLESK_SITE_RESOURCES_PATH", str(source_registry))
+    monkeypatch.setenv("PLESK_SYNC_ALLOWED_SOURCES", str(tmp_path))
+    monkeypatch.setenv("PLESK_TWIN_ROOT", str(twin_root))
+    result = site_twin_sync(
+        source_dir=str(www), source_ref="workspace:site",
+        deployment_binding_ref=binding["id"], deployment_binding_hash=binding_hash,
+        deployment_binding_version=1, twin_profile_ref=profile["id"],
+        twin_profile_hash=core._deployment_binding_digest(profile), twin_profile_version=1,
+    )
+    assert result["ok"] is False and result["error"] == "plesk_site_twin_domain_required"
+    assert result["mutation_attempted"] is False and not twin_root.exists()
+
+
+def test_site_sync_rejects_ambiguous_httpdocs_for_unbound_domain(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/httpdocs",
+        host="prototypowanie.pl",
+        domain="autonomicznosc.pl",
+        credential_origin="https://prototypowanie.pl",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_sync_scope_unbound"
+    assert result["mutation_attempted"] is False
+
+
+def test_site_sync_accepts_httpdocs_with_domain_bound_transport_entries(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/httpdocs",
+        host="prototypowanie.pl",
+        domain="autonomicznosc.pl",
+        credential_origin="https://prototypowanie.pl",
+        sftp_vault_entry_id="plesk-sftp-autonomicznosc-pl",
+        ftp_vault_entry_id="plesk-ftp-autonomicznosc-pl",
+    )
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+
+
+def test_site_sync_rejects_unbound_chroot_root(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/",
+        host="prototypowanie.pl",
+        domain="autonomicznosc.pl",
+        credential_origin="https://prototypowanie.pl",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_sync_scope_mismatch"
+    assert result["mutation_attempted"] is False
+
+
+def test_site_sync_rejects_chroot_root_even_with_domain_bound_transport_entries(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/",
+        host="prototypowanie.pl",
+        domain="autonomicznosc.pl",
+        credential_origin="https://prototypowanie.pl",
+        sftp_vault_entry_id="plesk-sftp-autonomicznosc-pl",
+        ftp_vault_entry_id="plesk-ftp-autonomicznosc-pl",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_sync_scope_mismatch"
+    assert result["mutation_attempted"] is False
+
+
+def test_site_sync_accepts_generic_httpdocs_only_with_vault_domain_scope(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    monkeypatch.setattr(core, "_vault_settings", lambda _url="": ("https://vault.example", "service-token"))
+    monkeypatch.setattr(core, "_request_json", lambda *args, **kwargs: (200, {
+        "ok": True,
+        "scope": {"operations": ["plesk.site.sync"], "targets": ["domain:subactor.com"]},
+    }))
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/httpdocs",
+        host="prototypowanie.pl",
+        domain="subactor.com",
+        credential_origin="https://prototypowanie.pl",
+    )
+
+    assert result["ok"] is True
+    assert result["dry_run"] is True
+
+
+def test_site_sync_rejects_absolute_vhost_path_for_another_domain(tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/var/www/vhosts/subactor.com/httpdocs",
+        host="prototypowanie.pl",
+        domain="autonomicznosc.pl",
+    )
+
+    assert result["ok"] is False
+    assert result["error"] == "plesk_site_sync_scope_mismatch"
+
+
 def test_immutable_manifest_stable_and_byte_sensitive(tmp_path):
     www = tmp_path / "www"
     www.mkdir()
@@ -1957,7 +2327,7 @@ def test_vault_lease_maps_expired_and_rate_limited(monkeypatch):
         return 401, {}
 
     monkeypatch.setattr(core, "_request_json", expired)
-    with pytest.raises(RuntimeError, match="credential_expired"):
+    with pytest.raises(RuntimeError, match="plesk_vault_token_rejected"):
         core._vault_lease("plesk-sftp", "https://h", "password")
 
     def limited(url, **kwargs):
@@ -2086,7 +2456,7 @@ def test_site_sync_allows_docs_basename(tmp_path):
     docs = tmp_path / "docs"
     docs.mkdir()
     (docs / "index.html").write_text("<h1>docs</h1>", encoding="utf-8")
-    result = site_sync(source_dir=str(docs), host="prototypowanie.pl", domain="docs.subactor.com")
+    result = site_sync(source_dir=str(docs), host="prototypowanie.pl", domain="docs.subactor.com", remote_path="/docs.subactor.com")
     assert result["ok"] and result["dry_run"] is True
     assert result["files_planned"] == 1
     assert result.get("domain") == "docs.subactor.com"
@@ -2096,7 +2466,7 @@ def test_site_sync_allows_logo_basename(tmp_path):
     logo = tmp_path / "logo"
     logo.mkdir()
     (logo / "index.html").write_text("<h1>logo</h1>", encoding="utf-8")
-    result = site_sync(source_dir=str(logo), host="prototypowanie.pl", domain="logo.subactor.com")
+    result = site_sync(source_dir=str(logo), host="prototypowanie.pl", domain="logo.subactor.com", remote_path="/logo.subactor.com")
     assert result["ok"] and result["dry_run"] is True
     assert result["files_planned"] == 1
     assert result.get("domain") == "logo.subactor.com"
@@ -2106,7 +2476,7 @@ def test_site_sync_allows_sanitized_public_status_basename(tmp_path):
     status = tmp_path / "public-status"
     status.mkdir()
     (status / "health.php").write_text("<?php echo '{}';", encoding="utf-8")
-    result = site_sync(source_dir=str(status), host="prototypowanie.pl", domain="status.subactor.com")
+    result = site_sync(source_dir=str(status), host="prototypowanie.pl", domain="status.subactor.com", remote_path="/status.subactor.com")
     assert result["ok"] and result["dry_run"] is True
     assert result["files_planned"] == 1
 
@@ -2381,6 +2751,31 @@ def test_site_query_docroot_main_domain_uses_httpdocs(monkeypatch):
     assert result["twin_fact"]["payload"]["observed_docroot"] == "/httpdocs"
     assert result["twin_fact"]["payload"]["decision"] == "accept"
     assert result["twin_fact"]["payload"]["rule_docroot"] == "/httpdocs"
+
+
+def test_site_query_docroot_accepts_same_domain_absolute_vhost_path(monkeypatch):
+    xml = """<?xml version="1.0"?>
+    <packet><site><get><result><status>ok</status>
+    <data><hosting><vrt_hst>
+    <property><name>www_root</name>
+    <value>/var/www/vhosts/autonomicznosc.pl/httpdocs</value></property>
+    </vrt_hst></hosting></data></result></get></site></packet>"""
+    monkeypatch.setattr("urirun_connector_plesk.core._vault_lease", lambda *args, **kwargs: "secret")
+    monkeypatch.setattr("urirun_connector_plesk.core._xml_agent", lambda *args, **kwargs: xml)
+    monkeypatch.setattr("urirun_connector_plesk.core._base_url", lambda _url: "https://plesk.example.test:8443")
+
+    result = site_query_docroot(
+        domain="autonomicznosc.pl",
+        main_domain="autonomicznosc.pl",
+        declared="/var/www/vhosts/autonomicznosc.pl/httpdocs",
+        base_url="https://plesk.example.test:8443",
+    )
+
+    payload = result["twin_fact"]["payload"]
+    assert result["ok"] is True
+    assert payload["decision"] == "accept"
+    assert payload["declared_effective_docroot"] == "/httpdocs"
+    assert payload["expected_remote_path"] == "/var/www/vhosts/autonomicznosc.pl/httpdocs"
 
 
 def test_site_query_docroot_estimates_when_panel_unreachable(monkeypatch):

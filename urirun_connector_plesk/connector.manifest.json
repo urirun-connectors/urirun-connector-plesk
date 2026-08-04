@@ -1,7 +1,7 @@
 {
   "id": "plesk",
   "name": "Plesk",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "status": "available",
   "category": "Infrastructure",
   "summary": "Manage Plesk through vault-backed REST, XML, SFTP and profiled extension URI processes.",
@@ -100,10 +100,12 @@
     "plesk://host/site/command/ssl-ensure",
     "plesk://host/site/command/subdomain-ensure",
     "plesk://host/site/command/sync",
+    "plesk://host/site/command/twin-sync",
     "plesk://host/site/query/docroot",
     "plesk://host/site/query/methods",
     "plesk://host/site/query/release-current",
     "plesk://host/site/query/remote-inventory",
+    "plesk://host/site/query/twin-current",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/subscription/query/snapshot"
   ],
@@ -125,6 +127,10 @@
       "uri": "plesk://host/site/command/sync",
       "payload": {
         "source_dir": "/repo/www",
+        "source_ref": "workspace:www",
+        "deployment_binding_ref": "deployment:subactor-com:production",
+        "deployment_binding_hash": "<sha256-of-binding>",
+        "deployment_binding_version": 1,
         "remote_path": "/httpdocs",
         "host": "prototypowanie.pl",
         "domain": "subactor.com",

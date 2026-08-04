@@ -1085,6 +1085,11 @@
       "effect": "command",
       "reversible": false
     },
+    "site/command/twin-sync": {
+      "version": "v1",
+      "effect": "command",
+      "reversible": true
+    },
     "site/command/release-activate": {
       "version": "v1",
       "effect": "command",
