@@ -864,6 +864,21 @@ def test_api_path_rejects_escape_or_query_injection(path):
         core._api_path(path)
 
 
+def test_api_path_allows_only_bounded_domain_file_content_path():
+    assert (
+        core._api_path("/api/v2/domains/321/fs/content?path=assets/app.js")
+        == "/api/v2/domains/321/fs/content?path=assets%2Fapp.js"
+    )
+    for path in (
+        "/api/v2/domains/321/fs/content?path=../secret",
+        "/api/v2/domains/321/fs/content?path=/httpdocs/index.php",
+        "/api/v2/domains/321/fs/content?path=index.php&overwrite=1",
+        "/api/v2/domains/0/fs/content?path=index.php",
+    ):
+        with pytest.raises(RuntimeError, match="plesk_api_path_not_allowed"):
+            core._api_path(path)
+
+
 def test_base_url_requires_https_except_loopback():
     assert core._base_url("http://127.0.0.1:9000") == "http://127.0.0.1:9000"
     with pytest.raises(RuntimeError, match="plesk_https_required"):

@@ -276,9 +276,35 @@ def _redact(value: Any) -> Any:
 
 
 def _api_path(path: str) -> str:
-    if not _SAFE_API_PATH.fullmatch(path) or ".." in path:
+    parsed = urllib.parse.urlsplit(path)
+    if parsed.scheme or parsed.netloc or parsed.fragment:
         raise RuntimeError("plesk_api_path_not_allowed")
-    return path
+    if not _SAFE_API_PATH.fullmatch(parsed.path) or ".." in parsed.path:
+        raise RuntimeError("plesk_api_path_not_allowed")
+    if not parsed.query:
+        return parsed.path
+
+    # Plesk Domain Files API selects the destination with one ``path`` query
+    # parameter. Keep every other API query fail-closed so callers cannot use
+    # the generic request process to smuggle arbitrary parameters.
+    if not re.fullmatch(r"/api/v2/domains/[1-9][0-9]*/fs/content", parsed.path):
+        raise RuntimeError("plesk_api_path_not_allowed")
+    try:
+        query = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True, strict_parsing=True)
+    except ValueError as error:
+        raise RuntimeError("plesk_api_path_not_allowed") from error
+    if len(query) != 1 or query[0][0] != "path":
+        raise RuntimeError("plesk_api_path_not_allowed")
+    relative = query[0][1]
+    if (
+        not relative
+        or relative.startswith("/")
+        or ".." in relative.split("/")
+        or "//" in relative
+        or not re.fullmatch(r"[A-Za-z0-9_.\/-]+", relative)
+    ):
+        raise RuntimeError("plesk_api_path_not_allowed")
+    return f"{parsed.path}?{urllib.parse.urlencode({'path': relative})}"
 
 
 def _sftp_origin(value: str) -> str:
