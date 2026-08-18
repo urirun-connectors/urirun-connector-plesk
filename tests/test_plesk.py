@@ -65,6 +65,7 @@ ROUTES = {
     "plesk://host/auth/query/acquisition-methods",
     "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
+    "plesk://host/account/query/subscriptions",
     "plesk://host/extensions/query/catalog",
     "plesk://host/extensions/query/capabilities",
     "plesk://host/extension/query/call",
@@ -1414,6 +1415,21 @@ def test_plan_skips_git_and_deployment_junk(tmp_path):
     plan = core._plan_local_tree(str(www), "/httpdocs")
     paths = {item["path"] for item in plan}
     assert paths == {"index.html"}
+
+
+def test_resolve_release_write_path_redirects_to_current():
+    write, extra = core._resolve_release_write_path("/docs.subactor.com", current_exists=True)
+    assert write == "/docs.subactor.com/current"
+    assert extra["release_layout_redirect"] == "current"
+    assert extra["write_remote_path"] == write
+
+    same, empty = core._resolve_release_write_path("/docs.subactor.com/current", current_exists=True)
+    assert same == "/docs.subactor.com/current"
+    assert empty == {}
+
+    flat, empty2 = core._resolve_release_write_path("/httpdocs", current_exists=False)
+    assert flat == "/httpdocs"
+    assert empty2 == {}
 
 
 def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):

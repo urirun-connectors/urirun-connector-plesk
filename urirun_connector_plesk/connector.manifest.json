@@ -8,6 +8,7 @@
   "description": "The connector discovers installed Plesk extensions through the official XML extension operator and joins them with reviewed operation profiles. Unknown extensions remain visible but non-executable. Credentials are never accepted in URI payloads or returned in results.",
   "useCases": [
     "Bootstrap a Plesk REST API key without exposing administrator credentials.",
+    "Read every subscription and domain visible to one Plesk account login.",
     "Read domains, clients, subscriptions, and other Plesk API resources.",
     "Execute authorized Plesk API changes through auditable URI processes.",
     "Discover installed Plesk extensions and route only reviewed operations."
@@ -19,6 +20,7 @@
     "plesk://host/auth/query/status",
     "plesk://host/extensions/query/catalog",
     "plesk://host/extensions/query/capabilities",
+    "plesk://host/account/query/subscriptions",
     "plesk://host/subscription/query/capabilities",
     "plesk://host/subscription/query/snapshot",
     "plesk://host/domain/command/ensure",
@@ -73,6 +75,7 @@
     "plesk://host/auth/query/acquisition-methods",
     "plesk://host/auth/query/scopes",
     "plesk://host/auth/query/status",
+    "plesk://host/account/query/subscriptions",
     "plesk://host/dns/command/reconcile",
     "plesk://host/dns/command/replace",
     "plesk://host/dns/query/authority",

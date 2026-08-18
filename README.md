@@ -176,7 +176,7 @@ Vault entries use **https** origins (the vault rejects `sftp://` / `ftp://`).
 | `system` (preferred) | Rotate subscription system FTP password via XML, enable SSH shell, store for SFTP | `plesk-sftp` + mirror `plesk-ftp` |
 | `additional` | XML `ftp-user` set/add for a dedicated login | `plesk-ftp` |
 
-Requires vault entry `plesk-subscription` (`username`/`password` of the customer panel login, origin = Plesk base URL including `:8443`).
+Requires vault entry `plesk-subscription` (`username`/`password` of the customer panel login, origin = Plesk base URL including `:8443`). That login is account-scoped: one credential lists many subscriptions. Do not treat it as a single-domain connector. Refresh the secret-free inventory with `plesk://host/account/query/subscriptions` or `plesk://host/subscription/query/snapshot` without a subscription filter. Apply still needs the exact webspace, docroot and scoped SFTP/FTP vault for the chosen domain.
 
 ```json
 {

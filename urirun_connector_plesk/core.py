@@ -2170,6 +2170,21 @@ def _subscription_capabilities_with_credentials(
     }
 
 
+_SUBSCRIPTION_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,62}$")
+
+
+def _subscription_name(value: str, *, required: bool = True) -> str:
+    """Accept a webspace name. It is often a primary domain, but not required to be one."""
+    name = (value or "").strip().lower()
+    if not name:
+        if required:
+            raise ValueError("plesk_subscription_name_invalid")
+        return ""
+    if ".." in name or not _SUBSCRIPTION_NAME_RE.fullmatch(name):
+        raise ValueError("plesk_subscription_name_invalid")
+    return name
+
+
 @conn.handler(
     "subscription/query/capabilities",
     isolated=True,
@@ -2181,8 +2196,9 @@ def subscription_capabilities(
     subscription_vault_entry_id: str = "plesk-subscription",
     vault_url: str = "",
 ) -> dict[str, Any]:
-    name = (subscription or "").strip().lower()
-    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", name):
+    try:
+        name = _subscription_name(subscription)
+    except ValueError:
         return urirun.fail("plesk_subscription_name_invalid")
     username = password = ""
     try:
@@ -2243,8 +2259,9 @@ def subscription_query_snapshot(
     When empty, lists webspaces visible to the leased credential (estimated
     limits when dataset incomplete).
     """
-    wanted = (subscription or "").strip().lower()
-    if wanted and not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", wanted):
+    try:
+        wanted = _subscription_name(subscription, required=False)
+    except ValueError:
         return urirun.fail("plesk_subscription_name_invalid", mutation_attempted=False)
     username = password = ""
     subscriptions: list[dict[str, Any]] = []
@@ -2310,6 +2327,27 @@ def subscription_query_snapshot(
 
 
 @conn.handler(
+    "account/query/subscriptions",
+    isolated=True,
+    meta={"label": "List every webspace visible to the leased Plesk account"},
+)
+def account_query_subscriptions(
+    instance_id: str = "",
+    base_url: str = "",
+    subscription_vault_entry_id: str = "plesk-subscription",
+    vault_url: str = "",
+) -> dict[str, Any]:
+    """Account-scoped inventory. Same credential, many subscriptions; no domain filter."""
+    return subscription_query_snapshot(
+        subscription="",
+        instance_id=instance_id or "plesk-account",
+        base_url=base_url,
+        subscription_vault_entry_id=subscription_vault_entry_id,
+        vault_url=vault_url,
+    )
+
+
+@conn.handler(
     "domain/command/ensure",
     isolated=True,
     meta={"label": "Idempotently ensure an add-on domain under an authorized subscription"},
@@ -2324,11 +2362,12 @@ def ensure_domain(
     vault_url: str = "",
 ) -> dict[str, Any]:
     host = (domain or "").strip().lower()
-    webspace = (subscription or "").strip().lower()
     root = (document_root or "httpdocs").strip().strip("/")
     if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", host):
         return urirun.fail("plesk_domain_name_invalid")
-    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", webspace):
+    try:
+        webspace = _subscription_name(subscription)
+    except ValueError:
         return urirun.fail("plesk_subscription_name_invalid")
     if not root or not re.fullmatch(r"[A-Za-z0-9_./-]+", root) or ".." in root:
         return urirun.fail("plesk_domain_document_root_invalid")
@@ -3376,6 +3415,61 @@ def _apply_permitted(
     return True, None, claims
 
 
+def _remote_path_is_current(remote_path: str) -> bool:
+    parts = [part for part in str(remote_path or "").rstrip("/").split("/") if part]
+    return bool(parts) and parts[-1].lower() == "current"
+
+
+def _resolve_release_write_path(remote_path: str, *, current_exists: bool) -> tuple[str, dict[str, Any]]:
+    """If the binding targets a release parent, write into its live ``current``.
+
+    Production docs layout is ``…/docs.subactor.com/current`` while bindings keep
+    ``remote_path=/docs.subactor.com`` so plan_hash stays stable. Flat upload into
+    the parent leaves the public symlink/dir untouched — detect ``current`` and
+    redirect the write path only (manifest target unchanged).
+    """
+    base = str(remote_path or "").rstrip("/") or "/"
+    if _remote_path_is_current(base) or not current_exists:
+        return base, {}
+    write_path = f"{base}/current"
+    return write_path, {
+        "write_remote_path": write_path,
+        "release_layout_redirect": "current",
+    }
+
+
+def _sftp_current_exists(sftp, remote_path: str) -> bool:
+    if _remote_path_is_current(remote_path):
+        return False
+    candidate = f"{str(remote_path or '').rstrip('/')}/current"
+    try:
+        mode = sftp.stat(candidate).st_mode
+    except OSError:
+        return False
+    return bool(statmod.S_ISDIR(mode) or statmod.S_ISLNK(mode))
+
+
+def _ftp_current_exists(ftp, remote_path: str) -> bool:
+    if _remote_path_is_current(remote_path):
+        return False
+    base = str(remote_path or "").rstrip("/") or "/"
+    try:
+        names = ftp.nlst(base)
+    except Exception:
+        try:
+            cwd = ftp.pwd()
+            ftp.cwd(base)
+            names = ftp.nlst()
+            ftp.cwd(cwd)
+        except Exception:
+            return False
+    for name in names or []:
+        leaf = str(name).rstrip("/").rsplit("/", 1)[-1]
+        if leaf.lower() == "current":
+            return True
+    return False
+
+
 def _publish_over_sftp(
     source_dir,
     remote_path,
@@ -3395,10 +3489,14 @@ def _publish_over_sftp(
     try:
         transport, sftp, fingerprint = _sftp_connect(host, port, username, password, host_fingerprint)
         try:
+            write_path, redirect_extra = _resolve_release_write_path(
+                remote_path,
+                current_exists=_sftp_current_exists(sftp, remote_path),
+            )
             uploaded = _sftp_upload_dir(
                 sftp,
                 source_dir,
-                remote_path,
+                write_path,
                 exclude,
                 plan=plan,
                 verify_remote_hash=verify_remote_hash,
@@ -3409,7 +3507,7 @@ def _publish_over_sftp(
     finally:
         if transport is not None:
             transport.close()
-    return uploaded, {"host_fingerprint": fingerprint}
+    return uploaded, {"host_fingerprint": fingerprint, **redirect_extra}
 
 
 def _publish_over_ftp(source_dir, remote_path, host, port, username, password, tls, exclude=()):
@@ -3417,14 +3515,17 @@ def _publish_over_ftp(source_dir, remote_path, host, port, username, password, t
     deadline = time.monotonic() + budgets.total
     ftp = _ftp_connect(host, port, username, password, tls)
     try:
-        uploaded = _ftp_upload_dir(ftp, source_dir, remote_path, exclude, deadline=deadline)
+        write_path, redirect_extra = _resolve_release_write_path(
+            remote_path,
+            current_exists=_ftp_current_exists(ftp, remote_path),
+        )
+        uploaded = _ftp_upload_dir(ftp, source_dir, write_path, exclude, deadline=deadline)
     finally:
         try:
             ftp.quit()
         except Exception:
             pass
-    return uploaded, {"tls": bool(tls)}
-
+    return uploaded, {"tls": bool(tls), **redirect_extra}
 
 @conn.handler("site/query/methods", isolated=True, meta={"label": "Detect which file-deployment transports are authorized for a Plesk host"})
 def site_methods(
