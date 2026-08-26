@@ -933,11 +933,12 @@ def test_mailbox_ensure_generates_password_and_stores_imap_and_smtp_without_retu
         return 200, {"code": 0, "stdout": "created"}
 
     monkeypatch.setattr(core, "_authorized_request", fake_authorized_request)
-    def fake_store(entry, origin, label, values, vault_url):
-        stored[entry] = {"origin": origin, "label": label, "values": dict(values)}
+    def fake_store(entry, origin, label, values, vault_url, scope=None):
+        stored[entry] = {"origin": origin, "label": label, "values": dict(values), "scope": scope}
         return entry
 
     monkeypatch.setattr(core, "_vault_store_secrets", fake_store)
+    monkeypatch.setattr(core, "_vault_entry_scope_metadata", lambda *args, **kwargs: {"ok": True, "error": None})
     monkeypatch.setattr(core, "_mailbox_probe", lambda *_args, **_kwargs: next(probes))
     monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
     monkeypatch.setenv("PLESK_MAILBOX_APPLY", "1")
@@ -989,7 +990,8 @@ def test_mailbox_create_rejects_invalid_email_or_credential_origin():
     assert create_mailbox(email="agent@example.com", credential_origin="https://mail.example.com")["ok"] is False
 
 
-def test_ensure_ftp_user_recreates_and_stores_without_leaking_password(monkeypatch):
+def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_password(monkeypatch):
+    reset_default_jti_replay_store()
     calls = []
     stored = {}
     leases = {"username": "cust", "password": "cust-pass"}
@@ -1010,26 +1012,86 @@ def test_ensure_ftp_user_recreates_and_stores_without_leaking_password(monkeypat
             )
         return "<packet><result><status>error</status></result></packet>"
 
-    def fake_store(entry, origin, label, values, vault_url):
-        stored[entry] = {"origin": origin, "label": label, "values": dict(values)}
+    def fake_store(entry, origin, label, values, vault_url, scope=None):
+        stored[entry] = {
+            "origin": origin,
+            "label": label,
+            "values": dict(values),
+            "scope": scope,
+        }
         return entry
 
     monkeypatch.setattr(core, "_vault_lease", fake_lease)
     monkeypatch.setattr(core, "_xml_agent", fake_xml)
     monkeypatch.setattr(core, "_vault_store_secrets", fake_store)
-    result = ensure_ftp_user(
+    monkeypatch.setattr(
+        core,
+        "_vault_entry_scope_metadata",
+        lambda *args, **kwargs: {"ok": True, "error": None},
+    )
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_CREDENTIAL_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "credential-test-secret")
+
+    dry = ensure_ftp_user(
         kind="system",
         domain="subactor.com",
         base_url="https://prototypowanie.pl:8443",
         credential_vault_entry_id="plesk-sftp",
         also_ftp_vault_entry_id="plesk-ftp",
     )
+    assert dry["ok"] and dry["dry_run"] and not dry["mutation_attempted"]
+    assert len(dry["plan_hash"]) == 64 and calls == [] and stored == {}
+
+    denied = ensure_ftp_user(
+        kind="system", domain="subactor.com",
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp",
+        also_ftp_vault_entry_id="plesk-ftp",
+        apply=True, plan_hash=dry["plan_hash"], actor="authority:founder",
+        pack_id="plesk-deployment-credential", pack_version="1",
+    )
+    assert not denied["ok"] and (denied.get("error") or denied.get("reason")) == "apply_grant_required"
+    assert calls == [] and stored == {}
+
+    issued = issue_apply_grant(
+        run_id="PLF-CREDENTIAL-1",
+        actor="authority:founder",
+        intent_pack="plesk-deployment-credential@1",
+        plan_hash=dry["plan_hash"],
+        artifact_sha256=dry["artifact_sha256"],
+        target=dry["target"],
+        risk_class="governance",
+        jti="credential-once",
+    )
+    result = ensure_ftp_user(
+        kind="system", domain="subactor.com",
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp",
+        also_ftp_vault_entry_id="plesk-ftp",
+        apply=True, plan_hash=dry["plan_hash"], apply_grant=issued["grant"],
+        actor="authority:founder", pack_id="plesk-deployment-credential", pack_version="1",
+    )
     assert result["ok"] and result["kind"] == "system" and result["name"] == "subactor_ssh"
+    assert result["verified"] and result["grant_jti"] == "credential-once"
     assert stored["plesk-sftp"]["origin"] == "https://prototypowanie.pl"
     assert stored["plesk-ftp"]["values"]["username"] == "subactor_ssh"
+    assert stored["plesk-sftp"]["scope"] == {
+        "operations": ["plesk.site.sync"], "targets": ["domain:subactor.com"],
+    }
     assert len(stored["plesk-sftp"]["values"]["password"]) >= 16
     assert stored["plesk-sftp"]["values"]["password"] not in json.dumps(result)
     assert "cust-pass" not in json.dumps(result)
+
+    replay = ensure_ftp_user(
+        kind="system", domain="subactor.com",
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp",
+        also_ftp_vault_entry_id="plesk-ftp",
+        apply=True, plan_hash=dry["plan_hash"], apply_grant=issued["grant"],
+        actor="authority:founder", pack_id="plesk-deployment-credential", pack_version="1",
+    )
+    assert not replay["ok"] and (replay.get("error") or replay.get("reason")) == "apply_grant_replay"
 
 
 def test_ensure_subdomain_idempotent_when_exists(monkeypatch):

@@ -170,6 +170,11 @@ without public LE.
 ### Credentials (`ftpuser/command/ensure`)
 
 Vault entries use **https** origins (the vault rejects `sftp://` / `ftp://`).
+The first call is always `apply=false` and returns a deterministic `plan_hash`.
+Execution requires `AUTONOMY_MUTATIONS_ENABLED=1` (or an active Founder lease),
+`PLESK_CREDENTIAL_APPLY=1` (included in the standard lease), and a single-use
+governance grant bound to the exact plan and target. Generated passwords are
+written directly to Vault and never returned in the result.
 
 | kind | What it does | Default vault ids |
 | --- | --- | --- |

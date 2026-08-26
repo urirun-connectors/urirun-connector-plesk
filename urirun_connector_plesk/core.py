@@ -194,13 +194,20 @@ def _vault_store(entry_id: str, origin: str, api_key: str, vault_url: str = "") 
 
 def _vault_store_secrets(
     entry_id: str, origin: str, label: str, values: dict[str, str], vault_url: str = "",
+    scope: dict[str, list[str]] | None = None,
 ) -> str:
     url, token = _vault_settings(vault_url)
     status, data = _request_json(
         f"{url}/vault",
         method="POST",
         headers={"authorization": f"Bearer {token}"},
-        body={"id": entry_id, "origin": origin, "label": label, "secrets": values},
+        body={
+            "id": entry_id,
+            "origin": origin,
+            "label": label,
+            "secrets": values,
+            **({"scope": scope} if scope else {}),
+        },
     )
     if status not in {200, 201}:
         raise RuntimeError("plesk_vault_store_failed")
@@ -2423,36 +2430,102 @@ def ensure_ftp_user(
     base_url: str = "",
     subscription_vault_entry_id: str = "plesk-subscription",
     enable_ssh: bool = True,
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
     vault_url: str = "",
 ) -> dict[str, Any]:
-    """Ensure deploy credentials exist with a known password stored in the vault.
+    """Plan or ensure a deployment credential and store it directly in Vault.
 
     Prefer ``kind=system`` (subscription system FTP user + SSH/SFTP). Additional
     FTP accounts use ``kind=additional`` via XML ``ftp-user`` (REST v2 ftpusers is
-    unreliable on some Plesk hosts: list succeeds but DELETE/PUT 404).
+    unreliable on some Plesk hosts: list succeeds but DELETE/PUT 404). The
+    default is a secret-free dry-run. Apply requires the exact plan hash, a
+    one-shot governance grant and the credential mutation gate.
     """
     mode = (kind or "system").strip().lower()
     if mode not in {"system", "additional"}:
         return urirun.fail("plesk_ftp_kind_invalid")
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", credential_vault_entry_id):
         return urirun.fail("plesk_ftp_vault_entry_invalid")
-    password = ""
-    login = ""
-    stored_id = credential_vault_entry_id
-    vault_origin = ""
-    cust_user = cust_pass = ""
+    requested_name = (name or "").strip()
+    domain_name = (domain or "").strip().lower()
+    if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", domain_name):
+        return urirun.fail("plesk_ftp_domain_required", mutation_attempted=False)
+    if mode == "additional" and not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", requested_name):
+        return urirun.fail("plesk_ftp_user_name_invalid", mutation_attempted=False)
+    home_path = home if home.startswith("/") else f"/{home}"
+    if not _SAFE_REMOTE.fullmatch(home_path) or ".." in home_path:
+        return urirun.fail("plesk_ftp_home_invalid", mutation_attempted=False)
+
+    password = login = cust_user = cust_pass = ""
     try:
         origin_api = _base_url(base_url)
         host = urllib.parse.urlparse(origin_api).hostname or ""
         vault_origin = _https_credential_origin(credential_origin, host)
+        stored_id = credential_vault_entry_id
+        target = f"{origin_api}|deployment-credential:{domain_name}:{mode}:{stored_id}"
+        plan_body = {
+            "schema": "urirun.plesk-deployment-credential-plan/v1",
+            "kind": mode,
+            "domain": domain_name,
+            "name": requested_name or None,
+            "home": "/" if mode == "system" else home_path,
+            "credential_vault_entry_id": stored_id,
+            "also_ftp_vault_entry_id": also_ftp_vault_entry_id or None,
+            "credential_origin": vault_origin,
+            "enable_ssh": bool(enable_ssh) if mode == "system" else False,
+            "operation": "rotate" if mode == "system" else "ensure",
+            "risk_class": "governance",
+        }
+        digest = hashlib.sha256(
+            json.dumps(plan_body, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+        plan = {**plan_body, "plan_hash": digest, "artifact_sha256": digest}
+
+        if not apply:
+            return urirun.ok(
+                kind=mode, name=requested_name, home=plan_body["home"], domain=domain_name,
+                created=False, recreated=False, existed=mode == "system",
+                credential_vault_entry_id=stored_id, credential_origin=vault_origin,
+                dry_run=True, executed=False, mutation_attempted=False,
+                target=target, plan=plan, plan_hash=digest, artifact_sha256=digest,
+                transport_hint="sftp" if mode == "system" else "ftp",
+            )
+        if not autonomy_mutations_enabled() and not mutate_lease_active():
+            return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+        if not mutate_lease_allows_apply("PLESK_CREDENTIAL_APPLY"):
+            return urirun.fail("plesk_credential_apply_required", dry_run=False, mutation_attempted=False)
+        if plan_hash.strip().lower() != digest:
+            return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+        ok, error, claims = verify_apply_grant(
+            apply_grant,
+            plan_hash=digest,
+            target=target,
+            actor=actor,
+            intent_pack=format_intent_pack(pack_id, pack_version),
+            artifact_sha256=digest,
+        )
+        if not ok or not claims:
+            return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+        if claims.get("risk_class") != "governance":
+            return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+        consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+        if not consumed:
+            return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
+
         cust_user = _vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url)
         cust_pass = _vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url)
-        domain_name = (domain or "").strip()
         password = f"{secrets.token_urlsafe(20)}aZ9!"
+        deployment_scope = {
+            "operations": ["plesk.site.sync"],
+            "targets": [f"domain:{domain_name}"],
+        }
 
         if mode == "system":
-            if not domain_name:
-                raise RuntimeError("plesk_ftp_domain_required")
             ssh_prop = (
                 "<property><name>ssh</name><value>/bin/bash</value></property>"
                 if enable_ssh else ""
@@ -2494,13 +2567,20 @@ def ensure_ftp_user(
                 credential_vault_entry_id, vault_origin,
                 f"Plesk system SFTP {domain_name}",
                 {"username": login, "password": password}, vault_url,
+                scope=deployment_scope,
             )
             if also_ftp_vault_entry_id and also_ftp_vault_entry_id != credential_vault_entry_id:
                 _vault_store_secrets(
                     also_ftp_vault_entry_id, vault_origin,
                     f"Plesk system FTP {domain_name}",
                     {"username": login, "password": password}, vault_url,
+                    scope=deployment_scope,
                 )
+            vault_readback = _vault_entry_scope_metadata(
+                stored_id, vault_origin, domain_name, vault_url,
+            )
+            if not vault_readback["ok"]:
+                raise RuntimeError(vault_readback["error"] or "deployment_credential_vault_readback_failed")
             return urirun.ok(
                 kind="system", name=login, home="/", domain=domain_name,
                 created=True, recreated=True, existed=True,
@@ -2508,15 +2588,12 @@ def ensure_ftp_user(
                 credential_origin=vault_origin,
                 also_ftp_vault_entry_id=also_ftp_vault_entry_id or None,
                 transport_hint="sftp",
+                dry_run=False, executed=True, mutation_attempted=True, verified=True,
+                target=target, plan_hash=digest, grant_jti=claims["jti"],
             )
 
         # additional dedicated FTP user via XML
-        login = (name or "").strip()
-        if not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", login):
-            raise RuntimeError("plesk_ftp_user_name_invalid")
-        home_path = home if home.startswith("/") else f"/{home}"
-        if not _SAFE_REMOTE.fullmatch(home_path) or ".." in home_path:
-            raise RuntimeError("plesk_ftp_home_invalid")
+        login = requested_name
         # try set-by-name first; on failure add
         set_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
 <packet>
@@ -2530,8 +2607,6 @@ def ensure_ftp_user(
         raw = _xml_agent(base_url, cust_user, cust_pass, set_packet)
         created_new = False
         if not _xml_ok(raw):
-            if not domain_name:
-                raise RuntimeError("plesk_ftp_domain_required")
             add_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
 <packet>
   <ftp-user>
@@ -2547,20 +2622,30 @@ def ensure_ftp_user(
             if not _xml_ok(raw):
                 raise RuntimeError("plesk_ftp_additional_ensure_failed")
             created_new = True
+        verify_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
+<packet><ftp-user><get><filter><name>{_xml_escape(login)}</name></filter></get></ftp-user></packet>"""
+        if not _xml_ok(_xml_agent(base_url, cust_user, cust_pass, verify_packet)):
+            raise RuntimeError("plesk_ftp_additional_verification_failed")
         stored_id = _vault_store_secrets(
             credential_vault_entry_id, vault_origin,
             f"Plesk FTP {login}",
             {"username": login, "password": password}, vault_url,
+            scope=deployment_scope,
         )
+        vault_readback = _vault_entry_scope_metadata(stored_id, vault_origin, domain_name, vault_url)
+        if not vault_readback["ok"]:
+            raise RuntimeError(vault_readback["error"] or "deployment_credential_vault_readback_failed")
         return urirun.ok(
             kind="additional", name=login, home=home_path, domain=domain_name or None,
             created=created_new, recreated=not created_new, existed=not created_new,
             credential_vault_entry_id=stored_id,
             credential_origin=vault_origin,
             transport_hint="ftp",
+            dry_run=False, executed=True, mutation_attempted=True, verified=True,
+            target=target, plan_hash=digest, grant_jti=claims["jti"],
         )
     except RuntimeError as error:
-        return urirun.fail(str(error))
+        return urirun.fail(str(error), dry_run=not apply, mutation_attempted=bool(apply))
     finally:
         password = cust_pass = cust_user = ""
 
