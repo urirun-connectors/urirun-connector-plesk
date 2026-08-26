@@ -24,7 +24,7 @@ servers and do not contact a real Plesk instance.
 
 | URI | Purpose |
 | --- | --- |
-| `plesk://host/auth/command/bootstrap-api-key` | lease admin login/password from vault, create an API key, store it in vault |
+| `plesk://host/auth/command/bootstrap-api-key` | secret-free plan, then lease admin login/password, create an API key, store it in Vault and verify it under an exact one-shot grant |
 | `plesk://host/auth/query/acquisition-methods` | describe safe acquisition without returning credentials |
 | `plesk://host/auth/query/scopes` | probe and return credential scope evidence by handle |
 | `plesk://host/auth/query/status` | validate the stored API key |

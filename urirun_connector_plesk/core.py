@@ -915,18 +915,80 @@ def bootstrap_api_key(
     login: str = "",
     ip: str = "",
     description: str = "urirun autonomous Plesk connector",
+    apply: bool = False,
+    plan_hash: str = "",
+    apply_grant: str = "",
+    actor: str = "",
+    pack_id: str = "",
+    pack_version: str = "",
     vault_url: str = "",
 ) -> dict[str, Any]:
     origin = _base_url(base_url)
+    entry_id = _vault_entry_id(runtime_vault_entry_id, default="plesk-runtime")
+    root_entry_id = _vault_entry_id(admin_vault_entry_id, default="plesk-admin-bootstrap")
+    normalized_login = login.strip()
+    normalized_ip = ip.strip()
+    if normalized_login and not re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", normalized_login):
+        return urirun.fail("plesk_api_key_login_invalid", dry_run=not apply, mutation_attempted=False)
+    if normalized_ip and not re.fullmatch(r"[0-9A-Fa-f:.]{2,64}", normalized_ip):
+        return urirun.fail("plesk_api_key_ip_invalid", dry_run=not apply, mutation_attempted=False)
+    plan_body = {
+        "schema": "urirun.plesk-api-key-bootstrap-plan/v1",
+        "runtime_vault_entry_id": entry_id,
+        "admin_vault_entry_id": root_entry_id,
+        "login": normalized_login or None,
+        "ip": normalized_ip or None,
+        "description": description[:160],
+        "risk_class": "governance",
+    }
+    digest = hashlib.sha256(json.dumps(plan_body, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    plan = {**plan_body, "plan_hash": digest, "artifact_sha256": digest}
+    target = f"{origin}|api-key:{entry_id}"
+    if not apply:
+        return urirun.ok(
+            base_url=origin,
+            vault_entry_id=entry_id,
+            authorized=False,
+            credential_type="api_key",
+            dry_run=True,
+            executed=False,
+            mutation_attempted=False,
+            target=target,
+            plan=plan,
+            plan_hash=digest,
+            artifact_sha256=digest,
+        )
+    if not autonomy_mutations_enabled() and not mutate_lease_active():
+        return urirun.fail("autonomy_mutations_disabled", dry_run=False, mutation_attempted=False)
+    if not mutate_lease_allows_apply("PLESK_API_KEY_APPLY"):
+        return urirun.fail("plesk_api_key_apply_required", dry_run=False, mutation_attempted=False)
+    if plan_hash.strip().lower() != digest:
+        return urirun.fail("plan_hash_mismatch", dry_run=False, mutation_attempted=False)
+    ok, error, claims = verify_apply_grant(
+        apply_grant,
+        plan_hash=digest,
+        target=target,
+        actor=actor,
+        intent_pack=format_intent_pack(pack_id, pack_version),
+        artifact_sha256=digest,
+    )
+    if not ok or not claims:
+        return urirun.fail(error or "apply_grant_required", dry_run=False, mutation_attempted=False)
+    if claims.get("risk_class") != "governance":
+        return urirun.fail("apply_grant_risk_class_mismatch", dry_run=False, mutation_attempted=False)
+    consumed, replay_error = consume_apply_grant_jti(claims["jti"], claims["expires_at"])
+    if not consumed:
+        return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
+    username = password = api_key = auth = ""
     try:
-        username = _vault_lease(admin_vault_entry_id, origin, "username", vault_url)
-        password = _vault_lease(admin_vault_entry_id, origin, "password", vault_url)
+        username = _vault_lease(root_entry_id, origin, "username", vault_url)
+        password = _vault_lease(root_entry_id, origin, "password", vault_url)
         auth = base64.b64encode(f"{username}:{password}".encode()).decode()
         body = {"description": description[:160]}
-        if login:
-            body["login"] = login
-        if ip:
-            body["ip"] = ip
+        if normalized_login:
+            body["login"] = normalized_login
+        if normalized_ip:
+            body["ip"] = normalized_ip
         status, data = _request_json(
             f"{origin}/api/v2/auth/keys",
             method="POST",
@@ -936,12 +998,31 @@ def bootstrap_api_key(
         api_key = str(data.get("key") or "")
         if status not in {200, 201} or len(api_key) < 8:
             raise RuntimeError(f"plesk_api_key_create_failed:{status}")
-        stored_id = _vault_store(runtime_vault_entry_id, origin, api_key, vault_url)
+        stored_id = _vault_store(entry_id, origin, api_key, vault_url)
+        readback = auth_status(
+            base_url=origin,
+            runtime_vault_entry_id=stored_id,
+            vault_url=vault_url,
+        )
+        if not readback.get("ok") or not readback.get("authenticated"):
+            raise RuntimeError("plesk_api_key_verification_failed")
     except RuntimeError as error:
-        return urirun.fail(str(error))
+        return urirun.fail(str(error), dry_run=False, mutation_attempted=True)
     finally:
         username = password = api_key = auth = ""
-    return urirun.ok(base_url=origin, vault_entry_id=stored_id, authorized=True, credential_type="api_key")
+    return urirun.ok(
+        base_url=origin,
+        vault_entry_id=stored_id,
+        authorized=True,
+        credential_type="api_key",
+        dry_run=False,
+        executed=True,
+        mutation_attempted=True,
+        verified=True,
+        target=target,
+        plan_hash=digest,
+        grant_jti=claims["jti"],
+    )
 
 
 def _authorized_request(
