@@ -636,6 +636,12 @@
         "base_url": "?str",
         "subscription_vault_entry_id": "?str",
         "enable_ssh": "?bool",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
         "vault_url": "?str"
       },
       "out": {
@@ -648,7 +654,14 @@
         "existed": "bool",
         "credential_vault_entry_id": "str",
         "credential_origin": "str",
-        "transport_hint": "?str"
+        "transport_hint": "?str",
+        "dry_run": "?bool",
+        "executed": "?bool",
+        "mutation_attempted": "?bool",
+        "verified": "?bool",
+        "target": "?str",
+        "plan_hash": "?str",
+        "grant_jti": "?str"
       },
       "errors": [
         "precondition-unmet",
