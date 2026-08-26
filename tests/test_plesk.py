@@ -949,6 +949,10 @@ def test_bindings_contract_and_manifest():
     assert set(document["bindings"]) == ROUTES
     assert document["bindings"]["plesk://host/site/command/sync"]["policy"]["timeout"] == 195.0
     assert document["bindings"]["plesk://host/site/command/publish"]["policy"]["timeout"] == 195.0
+    for uri in ("plesk://host/site/command/sync", "plesk://host/site/command/publish"):
+        webspace = document["bindings"][uri]["inputSchema"]["properties"]["deployment_webspace"]
+        assert webspace["type"] == "string"
+        assert webspace["default"] == ""
     registry = urirun.compile_registry(json.loads(json.dumps(document)))
     assert ROUTES <= {route["uri"] for route in urirun.list_routes(registry)}
     manifest = connector_manifest()
@@ -1795,6 +1799,7 @@ def test_site_sync_requires_and_revalidates_portable_deployment_binding(monkeypa
         "remote_path": binding["target"]["remote_path"],
         "host": binding["target"]["transport_host"],
         "domain": binding["target"]["domain"],
+        "deployment_webspace": binding["target"]["webspace"],
         "credential_origin": binding["target"]["credential_origin"],
         "sftp_vault_entry_id": binding["credential_refs"]["sftp"],
         "ftp_vault_entry_id": binding["credential_refs"]["ftp"],
@@ -1833,6 +1838,11 @@ def test_site_sync_requires_and_revalidates_portable_deployment_binding(monkeypa
     assert changed["ok"] is False
     assert changed["error"] == "plesk_site_deployment_binding_target_mismatch"
     assert changed["mutation_attempted"] is False
+
+    changed_webspace = site_sync(**{**payload, "deployment_webspace": "other.example"})
+    assert changed_webspace["ok"] is False
+    assert changed_webspace["error"] == "plesk_site_deployment_binding_target_mismatch"
+    assert changed_webspace["mutation_attempted"] is False
 
     invalid_version = site_sync(**{**payload, "deployment_binding_version": "not-a-version"})
     assert invalid_version["ok"] is False
