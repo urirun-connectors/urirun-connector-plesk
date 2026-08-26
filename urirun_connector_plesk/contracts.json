@@ -11,13 +11,26 @@
         "login": "?str",
         "ip": "?str",
         "description": "?str",
+        "apply": "?bool",
+        "plan_hash": "?str",
+        "apply_grant": "?str",
+        "actor": "?str",
+        "pack_id": "?str",
+        "pack_version": "?str",
         "vault_url": "?str"
       },
       "out": {
         "base_url": "str",
         "vault_entry_id": "str",
         "authorized": "bool",
-        "credential_type": "str"
+        "credential_type": "str",
+        "dry_run": "bool",
+        "executed": "bool",
+        "mutation_attempted": "bool",
+        "target": "str",
+        "plan_hash": "str",
+        "verified": "?bool",
+        "grant_jti": "?str"
       },
       "errors": [
         "precondition-unmet",
@@ -30,8 +43,13 @@
             "ok": true,
             "base_url": "https://plesk.example.com:8443",
             "vault_entry_id": "plesk-runtime",
-            "authorized": true,
-            "credential_type": "api_key"
+            "authorized": false,
+            "credential_type": "api_key",
+            "dry_run": true,
+            "executed": false,
+            "mutation_attempted": false,
+            "target": "https://plesk.example.com:8443|api-key:plesk-runtime",
+            "plan_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
           }
         }
       ]

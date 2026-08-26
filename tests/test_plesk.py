@@ -282,15 +282,18 @@ def test_remote_inventory_accepts_domain_bound_chroot_origin(monkeypatch):
 
 
 def test_bootstrap_leases_admin_login_and_stores_key_without_returning_it(monkeypatch):
-    leased = {"username": "admin", "password": "admin-password"}
-    request = {}
+    reset_default_jti_replay_store()
+    leased = {"username": "admin", "password": "admin-password", "api_key": "generated-plesk-key"}
+    requests = []
     stored = {}
 
     monkeypatch.setattr(core, "_vault_lease", lambda entry, origin, field, vault_url: leased[field])
 
     def fake_request(url, **kwargs):
-        request.update(url=url, **kwargs)
-        return 201, {"key": "generated-plesk-key"}
+        requests.append({"url": url, **kwargs})
+        if url.endswith("/api/v2/auth/keys"):
+            return 201, {"key": "generated-plesk-key"}
+        return 200, []
 
     monkeypatch.setattr(core, "_request_json", fake_request)
     monkeypatch.setattr(
@@ -299,15 +302,68 @@ def test_bootstrap_leases_admin_login_and_stores_key_without_returning_it(monkey
         lambda entry, origin, api_key, vault_url: stored.update(entry=entry, key=api_key) or entry,
     )
 
-    result = bootstrap_api_key(base_url="https://plesk.example.com:8443")
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_API_KEY_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "bootstrap-test-secret")
+    dry_run = bootstrap_api_key(base_url="https://plesk.example.com:8443")
+    assert dry_run["ok"] and dry_run["dry_run"] and requests == [] and stored == {}
+    issued = issue_apply_grant(
+        run_id="PLF-346",
+        actor="authority:founder",
+        intent_pack="plesk-api-key-bootstrap@1",
+        plan_hash=dry_run["plan_hash"],
+        artifact_sha256=dry_run["artifact_sha256"],
+        target=dry_run["target"],
+        risk_class="governance",
+    )
+    result = bootstrap_api_key(
+        base_url="https://plesk.example.com:8443",
+        apply=True,
+        plan_hash=dry_run["plan_hash"],
+        apply_grant=issued["grant"],
+        actor="authority:founder",
+        pack_id="plesk-api-key-bootstrap",
+        pack_version="1",
+    )
 
     assert result["ok"] and result["authorized"]
-    assert request["url"].endswith("/api/v2/auth/keys")
-    assert request["method"] == "POST"
-    assert request["headers"]["authorization"] == "Basic " + base64.b64encode(b"admin:admin-password").decode()
+    assert requests[0]["url"].endswith("/api/v2/auth/keys")
+    assert requests[0]["method"] == "POST"
+    assert requests[0]["headers"]["authorization"] == "Basic " + base64.b64encode(b"admin:admin-password").decode()
+    assert requests[1]["url"].endswith("/api/v2/domains")
     assert stored == {"entry": "plesk-runtime", "key": "generated-plesk-key"}
     serialized = json.dumps(result)
     assert "admin-password" not in serialized and "generated-plesk-key" not in serialized
+
+    replay = bootstrap_api_key(
+        base_url="https://plesk.example.com:8443",
+        apply=True,
+        plan_hash=dry_run["plan_hash"],
+        apply_grant=issued["grant"],
+        actor="authority:founder",
+        pack_id="plesk-api-key-bootstrap",
+        pack_version="1",
+    )
+    assert replay["ok"] is False and replay["error"] == "apply_grant_replay"
+    assert len(requests) == 2
+
+
+def test_bootstrap_api_key_fails_closed_without_apply_authority(monkeypatch):
+    calls = []
+    monkeypatch.setattr(core, "_vault_lease", lambda *_args: calls.append("lease") or "secret")
+    monkeypatch.setattr(core, "_request_json", lambda *_args, **_kwargs: calls.append("request") or (201, {"key": "secret-key"}))
+
+    dry_run = bootstrap_api_key(base_url="https://plesk.example.com:8443")
+    assert dry_run["ok"] and dry_run["dry_run"] and calls == []
+
+    denied = bootstrap_api_key(
+        base_url="https://plesk.example.com:8443",
+        apply=True,
+        plan_hash=dry_run["plan_hash"],
+    )
+    assert denied["ok"] is False
+    assert denied["error"] == "autonomy_mutations_disabled"
+    assert calls == []
 
 
 def test_auth_conformance_returns_handles_and_never_secret_values(monkeypatch):
@@ -1561,7 +1617,29 @@ def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):
     vault_url = f"http://127.0.0.1:{vault.server_port}"
     plesk_url = f"http://127.0.0.1:{plesk.server_port}"
     try:
-        bootstrap = bootstrap_api_key(base_url=plesk_url, vault_url=vault_url)
+        monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+        monkeypatch.setenv("PLESK_API_KEY_APPLY", "1")
+        monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "bootstrap-integration-secret")
+        dry = bootstrap_api_key(base_url=plesk_url, vault_url=vault_url)
+        issued = issue_apply_grant(
+            run_id="PLF-bootstrap-integration",
+            actor="authority:founder",
+            intent_pack="plesk-api-key-bootstrap@1",
+            plan_hash=dry["plan_hash"],
+            artifact_sha256=dry["artifact_sha256"],
+            target=dry["target"],
+            risk_class="governance",
+        )
+        bootstrap = bootstrap_api_key(
+            base_url=plesk_url,
+            vault_url=vault_url,
+            apply=True,
+            plan_hash=dry["plan_hash"],
+            apply_grant=issued["grant"],
+            actor="authority:founder",
+            pack_id="plesk-api-key-bootstrap",
+            pack_version="1",
+        )
         status = auth_status(base_url=plesk_url, vault_url=vault_url)
         domains = api_query(path="/api/v2/domains", base_url=plesk_url, vault_url=vault_url)
     finally:
@@ -1574,6 +1652,7 @@ def test_end_to_end_bootstrap_then_autonomous_query(monkeypatch):
     assert domains["data"] == [{"id": 1, "name": "example.com"}]
     assert state["plesk_calls"] == [
         ("POST", "/api/v2/auth/keys"),
+        ("GET", "/api/v2/domains"),
         ("GET", "/api/v2/domains"),
         ("GET", "/api/v2/domains"),
     ]
