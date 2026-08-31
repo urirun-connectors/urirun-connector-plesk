@@ -2507,6 +2507,7 @@ def ensure_ftp_user(
     name: str = "",
     home: str = "/",
     domain: str = "",
+    webspace: str = "",
     kind: str = "system",
     credential_vault_entry_id: str = "plesk-sftp",
     also_ftp_vault_entry_id: str = "plesk-ftp",
@@ -2529,6 +2530,11 @@ def ensure_ftp_user(
     unreliable on some Plesk hosts: list succeeds but DELETE/PUT 404). The
     default is a secret-free dry-run. Apply requires the exact plan hash, a
     one-shot governance grant and the credential mutation gate.
+
+    ``webspace`` is the Plesk subscription/webspace name used for XML
+    ``webspace`` / ``ftp-user`` filters. Site domains (for example
+    ``wydruk.subactor.com`` under ``subactor.com``) must pass the parent
+    webspace; when omitted, ``domain`` is used for backward compatibility.
     """
     mode = (kind or "system").strip().lower()
     if mode not in {"system", "additional"}:
@@ -2539,6 +2545,10 @@ def ensure_ftp_user(
     domain_name = (domain or "").strip().lower()
     if not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", domain_name):
         return urirun.fail("plesk_ftp_domain_required", mutation_attempted=False)
+    try:
+        webspace_name = _subscription_name(webspace or domain_name, required=True)
+    except ValueError:
+        return urirun.fail("plesk_ftp_webspace_invalid", mutation_attempted=False)
     if mode == "additional" and not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", requested_name):
         return urirun.fail("plesk_ftp_user_name_invalid", mutation_attempted=False)
     home_path = home if home.startswith("/") else f"/{home}"
@@ -2556,6 +2566,7 @@ def ensure_ftp_user(
             "schema": "urirun.plesk-deployment-credential-plan/v1",
             "kind": mode,
             "domain": domain_name,
+            "webspace": webspace_name,
             "name": requested_name or None,
             "home": "/" if mode == "system" else home_path,
             "credential_vault_entry_id": stored_id,
@@ -2573,6 +2584,7 @@ def ensure_ftp_user(
         if not apply:
             return urirun.ok(
                 kind=mode, name=requested_name, home=plan_body["home"], domain=domain_name,
+                webspace=webspace_name,
                 created=False, recreated=False, existed=mode == "system",
                 credential_vault_entry_id=stored_id, credential_origin=vault_origin,
                 dry_run=True, executed=False, mutation_attempted=False,
@@ -2614,11 +2626,12 @@ def ensure_ftp_user(
                 "<property><name>ssh</name><value>/bin/bash</value></property>"
                 if enable_ssh else ""
             )
+            webspace_xml = _xml_escape(webspace_name)
             packet = f"""<?xml version="1.0" encoding="UTF-8"?>
 <packet>
   <webspace>
     <set>
-      <filter><name>{domain_name}</name></filter>
+      <filter><name>{webspace_xml}</name></filter>
       <values>
         <hosting>
           <vrt_hst>
@@ -2632,13 +2645,26 @@ def ensure_ftp_user(
 </packet>"""
             raw = _xml_agent(base_url, cust_user, cust_pass, packet)
             if not _xml_ok(raw):
-                raise RuntimeError("plesk_ftp_system_rotate_failed")
+                detail = _dns_provider_error(raw, "set")
+                errtext = detail.get("errtext") or ""
+                errcode = detail.get("errcode") or ""
+                # system/set failures often surface under <system> rather than <set>
+                if not errtext and "<errtext>" in raw:
+                    match = re.search(r"<errtext>([^<]*)</errtext>", raw)
+                    errtext = (match.group(1) if match else "")[:300]
+                if not errcode and "<errcode>" in raw:
+                    match = re.search(r"<errcode>([^<]*)</errcode>", raw)
+                    errcode = (match.group(1) if match else "")[:32]
+                suffix = ":".join(part for part in (errcode, errtext.replace(" ", "_")[:120]) if part)
+                raise RuntimeError(
+                    f"plesk_ftp_system_rotate_failed:{suffix}" if suffix else "plesk_ftp_system_rotate_failed"
+                )
             # read back login name
             get_packet = f"""<?xml version="1.0" encoding="UTF-8"?>
 <packet>
   <webspace>
     <get>
-      <filter><name>{domain_name}</name></filter>
+      <filter><name>{webspace_xml}</name></filter>
       <dataset><hosting/></dataset>
     </get>
   </webspace>
@@ -2667,6 +2693,7 @@ def ensure_ftp_user(
                 raise RuntimeError(vault_readback["error"] or "deployment_credential_vault_readback_failed")
             return urirun.ok(
                 kind="system", name=login, home="/", domain=domain_name,
+                webspace=webspace_name,
                 created=True, recreated=True, existed=True,
                 credential_vault_entry_id=stored_id,
                 credential_origin=vault_origin,
@@ -2698,7 +2725,7 @@ def ensure_ftp_user(
       <name>{login}</name>
       <password>{password}</password>
       <home>{home_path}</home>
-      <webspace-name>{domain_name}</webspace-name>
+      <webspace-name>{_xml_escape(webspace_name)}</webspace-name>
     </add>
   </ftp-user>
 </packet>"""
@@ -2721,6 +2748,7 @@ def ensure_ftp_user(
             raise RuntimeError(vault_readback["error"] or "deployment_credential_vault_readback_failed")
         return urirun.ok(
             kind="additional", name=login, home=home_path, domain=domain_name or None,
+            webspace=webspace_name,
             created=created_new, recreated=not created_new, existed=not created_new,
             credential_vault_entry_id=stored_id,
             credential_origin=vault_origin,

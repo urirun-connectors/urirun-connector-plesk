@@ -1052,6 +1052,7 @@ def test_mailbox_create_rejects_invalid_email_or_credential_origin():
 
 def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_password(monkeypatch):
     reset_default_jti_replay_store()
+    monkeypatch.delenv("APPLY_GRANT_JTI_STORE", raising=False)
     calls = []
     stored = {}
     leases = {"username": "cust", "password": "cust-pass"}
@@ -1134,6 +1135,7 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
     )
     assert result["ok"] and result["kind"] == "system" and result["name"] == "subactor_ssh"
     assert result["verified"] and result["grant_jti"] == "credential-once"
+    assert result["webspace"] == "subactor.com"
     assert stored["plesk-sftp"]["origin"] == "https://prototypowanie.pl"
     assert stored["plesk-ftp"]["values"]["username"] == "subactor_ssh"
     assert stored["plesk-sftp"]["scope"] == {
@@ -1142,6 +1144,7 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
     assert len(stored["plesk-sftp"]["values"]["password"]) >= 16
     assert stored["plesk-sftp"]["values"]["password"] not in json.dumps(result)
     assert "cust-pass" not in json.dumps(result)
+    assert any("<name>subactor.com</name>" in packet for packet in calls)
 
     replay = ensure_ftp_user(
         kind="system", domain="subactor.com",
@@ -1152,6 +1155,81 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
         actor="authority:founder", pack_id="plesk-deployment-credential", pack_version="1",
     )
     assert not replay["ok"] and (replay.get("error") or replay.get("reason")) == "apply_grant_replay"
+
+
+def test_ensure_ftp_user_system_rotate_uses_parent_webspace_for_subdomain(monkeypatch):
+    reset_default_jti_replay_store()
+    monkeypatch.delenv("APPLY_GRANT_JTI_STORE", raising=False)
+    calls = []
+
+    def fake_lease(entry, origin, field, vault_url=""):
+        return {"username": "cust", "password": "cust-pass"}[field]
+
+    def fake_xml(base_url, username, password, packet):
+        calls.append(packet)
+        if "<webspace><set>" in packet.replace("\n", "").replace(" ", ""):
+            assert "<name>subactor.com</name>" in packet
+            assert "wydruk.subactor.com" not in packet.replace("<value>", "")
+            return "<packet><webspace><set><result><status>ok</status></result></set></webspace></packet>"
+        if "<webspace><get>" in packet.replace("\n", "").replace(" ", ""):
+            assert "<name>subactor.com</name>" in packet
+            return (
+                "<packet><webspace><get><result><status>ok</status>"
+                "<name>ftp_login</name><value>subactor_ssh</value>"
+                "</result></get></webspace></packet>"
+            )
+        return "<packet><result><status>error</status></result></packet>"
+
+    monkeypatch.setattr(core, "_vault_lease", fake_lease)
+    monkeypatch.setattr(core, "_xml_agent", fake_xml)
+    monkeypatch.setattr(core, "_vault_store_secrets", lambda *a, **k: a[0])
+    monkeypatch.setattr(
+        core,
+        "_vault_entry_scope_metadata",
+        lambda *args, **kwargs: {"ok": True, "error": None},
+    )
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_CREDENTIAL_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "credential-test-secret")
+
+    dry = ensure_ftp_user(
+        kind="system",
+        domain="wydruk.subactor.com",
+        webspace="subactor.com",
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp-wydruk-subactor-com",
+        also_ftp_vault_entry_id="plesk-ftp-wydruk-subactor-com",
+    )
+    assert dry["ok"] and dry["webspace"] == "subactor.com"
+    assert dry["plan"]["webspace"] == "subactor.com"
+    assert dry["plan"]["domain"] == "wydruk.subactor.com"
+
+    issued = issue_apply_grant(
+        run_id="PLF-9516",
+        actor="authority:founder",
+        intent_pack="plesk-deployment-credential@1",
+        plan_hash=dry["plan_hash"],
+        artifact_sha256=dry["artifact_sha256"],
+        target=dry["target"],
+        risk_class="governance",
+        jti="wydruk-webspace-once",
+    )
+    result = ensure_ftp_user(
+        kind="system",
+        domain="wydruk.subactor.com",
+        webspace="subactor.com",
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp-wydruk-subactor-com",
+        also_ftp_vault_entry_id="plesk-ftp-wydruk-subactor-com",
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        apply_grant=issued["grant"],
+        actor="authority:founder",
+        pack_id="plesk-deployment-credential",
+        pack_version="1",
+    )
+    assert result["ok"] and result["webspace"] == "subactor.com"
+    assert any("<name>subactor.com</name>" in packet for packet in calls)
 
 
 def test_ensure_subdomain_idempotent_when_exists(monkeypatch):
