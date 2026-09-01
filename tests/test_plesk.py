@@ -1093,10 +1093,12 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
     monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
     monkeypatch.setenv("PLESK_CREDENTIAL_APPLY", "1")
     monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "credential-test-secret")
+    shared_domains = ["docs.subactor.com", "founder.subactor.com", "docs.subactor.com"]
 
     dry = ensure_ftp_user(
         kind="system",
         domain="subactor.com",
+        scope_domains=shared_domains,
         base_url="https://prototypowanie.pl:8443",
         credential_vault_entry_id="plesk-sftp",
         also_ftp_vault_entry_id="plesk-ftp",
@@ -1106,6 +1108,7 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
 
     denied = ensure_ftp_user(
         kind="system", domain="subactor.com",
+        scope_domains=shared_domains,
         base_url="https://prototypowanie.pl:8443",
         credential_vault_entry_id="plesk-sftp",
         also_ftp_vault_entry_id="plesk-ftp",
@@ -1127,6 +1130,7 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
     )
     result = ensure_ftp_user(
         kind="system", domain="subactor.com",
+        scope_domains=shared_domains,
         base_url="https://prototypowanie.pl:8443",
         credential_vault_entry_id="plesk-sftp",
         also_ftp_vault_entry_id="plesk-ftp",
@@ -1136,11 +1140,20 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
     assert result["ok"] and result["kind"] == "system" and result["name"] == "subactor_ssh"
     assert result["verified"] and result["grant_jti"] == "credential-once"
     assert result["webspace"] == "subactor.com"
+    assert result["scope_domains"] == [
+        "docs.subactor.com", "founder.subactor.com", "subactor.com",
+    ]
     assert stored["plesk-sftp"]["origin"] == "https://prototypowanie.pl"
     assert stored["plesk-ftp"]["values"]["username"] == "subactor_ssh"
     assert stored["plesk-sftp"]["scope"] == {
-        "operations": ["plesk.site.sync"], "targets": ["domain:subactor.com"],
+        "operations": ["plesk.site.sync"],
+        "targets": [
+            "domain:docs.subactor.com",
+            "domain:founder.subactor.com",
+            "domain:subactor.com",
+        ],
     }
+    assert stored["plesk-ftp"]["scope"] == stored["plesk-sftp"]["scope"]
     assert len(stored["plesk-sftp"]["values"]["password"]) >= 16
     assert stored["plesk-sftp"]["values"]["password"] not in json.dumps(result)
     assert "cust-pass" not in json.dumps(result)
@@ -1148,6 +1161,7 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
 
     replay = ensure_ftp_user(
         kind="system", domain="subactor.com",
+        scope_domains=shared_domains,
         base_url="https://prototypowanie.pl:8443",
         credential_vault_entry_id="plesk-sftp",
         also_ftp_vault_entry_id="plesk-ftp",
@@ -1155,6 +1169,22 @@ def test_ensure_ftp_user_plans_then_applies_with_one_shot_grant_without_leaking_
         actor="authority:founder", pack_id="plesk-deployment-credential", pack_version="1",
     )
     assert not replay["ok"] and (replay.get("error") or replay.get("reason")) == "apply_grant_replay"
+
+
+def test_ensure_ftp_user_rejects_invalid_or_excessive_scope_domains():
+    invalid = ensure_ftp_user(
+        kind="system",
+        domain="subactor.com",
+        scope_domains=["../outside", "founder.subactor.com"],
+    )
+    assert not invalid["ok"] and invalid["error"] == "plesk_ftp_scope_domains_invalid"
+
+    excessive = ensure_ftp_user(
+        kind="system",
+        domain="subactor.com",
+        scope_domains=[f"site-{index}.subactor.com" for index in range(65)],
+    )
+    assert not excessive["ok"] and excessive["error"] == "plesk_ftp_scope_domains_invalid"
 
 
 def test_ensure_ftp_user_system_rotate_uses_parent_webspace_for_subdomain(monkeypatch):
