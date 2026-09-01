@@ -2508,6 +2508,7 @@ def ensure_ftp_user(
     home: str = "/",
     domain: str = "",
     webspace: str = "",
+    scope_domains: list[str] | None = None,
     kind: str = "system",
     credential_vault_entry_id: str = "plesk-sftp",
     also_ftp_vault_entry_id: str = "plesk-ftp",
@@ -2535,6 +2536,11 @@ def ensure_ftp_user(
     ``webspace`` / ``ftp-user`` filters. Site domains (for example
     ``wydruk.subactor.com`` under ``subactor.com``) must pass the parent
     webspace; when omitted, ``domain`` is used for backward compatibility.
+
+    ``scope_domains`` lets one physical webspace credential authorize several
+    exact deployment domains without duplicating its secret in Vault. The
+    primary ``domain`` is always included and the complete normalized list is
+    bound into the governance plan hash.
     """
     mode = (kind or "system").strip().lower()
     if mode not in {"system", "additional"}:
@@ -2549,6 +2555,17 @@ def ensure_ftp_user(
         webspace_name = _subscription_name(webspace or domain_name, required=True)
     except ValueError:
         return urirun.fail("plesk_ftp_webspace_invalid", mutation_attempted=False)
+    requested_scope_domains = list(scope_domains or [])
+    requested_scope_domains.append(domain_name)
+    normalized_scope_domains = sorted({
+        str(item or "").strip().lower().rstrip(".")
+        for item in requested_scope_domains
+    })
+    if (
+        len(normalized_scope_domains) > 64
+        or any(not re.fullmatch(r"[a-z0-9.-]+\.[a-z]{2,}", item) for item in normalized_scope_domains)
+    ):
+        return urirun.fail("plesk_ftp_scope_domains_invalid", mutation_attempted=False)
     if mode == "additional" and not re.fullmatch(r"[A-Za-z0-9_.-]{3,32}", requested_name):
         return urirun.fail("plesk_ftp_user_name_invalid", mutation_attempted=False)
     home_path = home if home.startswith("/") else f"/{home}"
@@ -2567,6 +2584,7 @@ def ensure_ftp_user(
             "kind": mode,
             "domain": domain_name,
             "webspace": webspace_name,
+            "scope_domains": normalized_scope_domains,
             "name": requested_name or None,
             "home": "/" if mode == "system" else home_path,
             "credential_vault_entry_id": stored_id,
@@ -2584,7 +2602,7 @@ def ensure_ftp_user(
         if not apply:
             return urirun.ok(
                 kind=mode, name=requested_name, home=plan_body["home"], domain=domain_name,
-                webspace=webspace_name,
+                webspace=webspace_name, scope_domains=normalized_scope_domains,
                 created=False, recreated=False, existed=mode == "system",
                 credential_vault_entry_id=stored_id, credential_origin=vault_origin,
                 dry_run=True, executed=False, mutation_attempted=False,
@@ -2618,7 +2636,7 @@ def ensure_ftp_user(
         password = f"{secrets.token_urlsafe(20)}aZ9!"
         deployment_scope = {
             "operations": ["plesk.site.sync"],
-            "targets": [f"domain:{domain_name}"],
+            "targets": [f"domain:{item}" for item in normalized_scope_domains],
         }
 
         if mode == "system":
@@ -2693,7 +2711,7 @@ def ensure_ftp_user(
                 raise RuntimeError(vault_readback["error"] or "deployment_credential_vault_readback_failed")
             return urirun.ok(
                 kind="system", name=login, home="/", domain=domain_name,
-                webspace=webspace_name,
+                webspace=webspace_name, scope_domains=normalized_scope_domains,
                 created=True, recreated=True, existed=True,
                 credential_vault_entry_id=stored_id,
                 credential_origin=vault_origin,
@@ -2748,7 +2766,7 @@ def ensure_ftp_user(
             raise RuntimeError(vault_readback["error"] or "deployment_credential_vault_readback_failed")
         return urirun.ok(
             kind="additional", name=login, home=home_path, domain=domain_name or None,
-            webspace=webspace_name,
+            webspace=webspace_name, scope_domains=normalized_scope_domains,
             created=created_new, recreated=not created_new, existed=not created_new,
             credential_vault_entry_id=stored_id,
             credential_origin=vault_origin,
