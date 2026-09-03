@@ -1901,6 +1901,37 @@ def _dns_plan(site_id: int, host: str, record_type: str, value: str, records: li
     return {**body, "changed": bool(delete or add), "plan_hash": digest, "artifact_sha256": digest}
 
 
+def _dns_plesk_add_host(host: str, records: list[dict[str, Any]] | None = None) -> str:
+    """Plesk DNS add_rec expects a name relative to the site zone, not an FQDN.
+
+    get_rec returns FQDNs (e.g. auth.subactor.com). Passing that FQDN into add_rec
+    appends the zone again (identity.subactor.com.subactor.com). Convert to the
+    leftmost relative label(s) before writing.
+    """
+    fqdn = (host or "").strip().rstrip(".").lower()
+    if not fqdn:
+        return ""
+    rows = records or []
+    suffixes = sorted(
+        {
+            row["host"]
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("host")
+            and fqdn != row["host"]
+            and fqdn.endswith(f".{row['host']}")
+        },
+        key=len,
+    )
+    if suffixes:
+        apex = suffixes[0]
+        return fqdn[: -(len(apex) + 1)]
+    parts = fqdn.split(".")
+    if len(parts) <= 2:
+        return ""
+    return ".".join(parts[:-2])
+
+
 def _dns_add_operation(site_id: int, record_type: str, host: str, value: str, opt: str | None = None) -> str:
     optional = f"<opt>{_xml_escape(opt)}</opt>" if opt else ""
     return (
@@ -2041,9 +2072,10 @@ def dns_replace(
                     provider_error=_dns_provider_error(raw, "del_rec"), rollback_attempted=False,
                 )
         if plan["add_record"]:
+            plesk_host = _dns_plesk_add_host(wanted_host, records)
             raw = _xml_agent(
                 base_url, username, password,
-                _dns_packet(_dns_add_operation(resolved_site_id, wanted_type, wanted_host, wanted_value)),
+                _dns_packet(_dns_add_operation(resolved_site_id, wanted_type, plesk_host, wanted_value)),
             )
             if not _xml_ok(raw):
                 rollback_attempted = bool(deleted_records)
@@ -2051,7 +2083,11 @@ def dns_replace(
                 if rollback_attempted:
                     restore_operations = "".join(
                         _dns_add_operation(
-                            resolved_site_id, row["type"], row["host"], row["value"], row.get("opt"),
+                            resolved_site_id,
+                            row["type"],
+                            _dns_plesk_add_host(row["host"], records),
+                            row["value"],
+                            row.get("opt"),
                         )
                         for row in deleted_records
                     )

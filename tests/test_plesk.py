@@ -488,6 +488,21 @@ def test_dns_replace_apply_fails_closed_before_credentials(monkeypatch):
     assert result["mutation_attempted"] is False
 
 
+def test_dns_plesk_add_host_is_relative_to_zone():
+    """Plesk add_rec appends the zone; FQDNs must be reduced to relative labels."""
+    zone_rows = [
+        {"host": "subactor.com"},
+        {"host": "auth.subactor.com"},
+        {"host": "www.subactor.com"},
+    ]
+    assert core._dns_plesk_add_host("identity.subactor.com", zone_rows) == "identity"
+    assert core._dns_plesk_add_host("auth.subactor.com", zone_rows) == "auth"
+    assert core._dns_plesk_add_host("subactor.com", zone_rows) == ""
+    assert core._dns_plesk_add_host("foo.bar.example.com", [{"host": "example.com"}]) == "foo.bar"
+    assert core._dns_plesk_add_host("status.example.com", []) == "status"
+    assert core._dns_plesk_add_host("example.com", []) == ""
+
+
 def test_dns_replace_apply_requires_grant_and_verifies_result(monkeypatch):
     reset_default_jti_replay_store()
     monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
@@ -505,7 +520,7 @@ def test_dns_replace_apply_requires_grant_and_verifies_result(monkeypatch):
             assert "<del_rec><filter><id>7</id>" in packet
             state[:] = []
             return "<packet><dns><del_rec><result><status>ok</status></result></del_rec></dns></packet>"
-        assert "<add_rec><site-id>185</site-id><type>A</type>" in packet
+        assert "<add_rec><site-id>185</site-id><type>A</type><host>status</host>" in packet
         state[:] = [{"id": 10, "type": "A", "host": "status.example.com", "value": "192.0.2.10"}]
         return "<packet><dns><add_rec><result><status>ok</status><id>10</id></result></add_rec></dns></packet>"
 
@@ -544,8 +559,9 @@ def test_dns_replace_compensates_deleted_record_when_add_fails(monkeypatch):
             state[:] = []
             return "<packet><dns><del_rec><result><status>ok</status></result></del_rec></dns></packet>"
         if "<type>A</type>" in packet:
+            assert "<host>status</host>" in packet
             return "<packet><dns><add_rec><result><status>error</status><errcode>1019</errcode><errtext>Invalid record</errtext></result></add_rec></dns></packet>"
-        assert "<type>CNAME</type>" in packet and "<value>old.example.net</value>" in packet
+        assert "<type>CNAME</type>" in packet and "<host>status</host>" in packet and "<value>old.example.net</value>" in packet
         state[:] = [{"id": 8, "type": "CNAME", "host": "status.example.com", "value": "old.example.net", "opt": None}]
         return "<packet><dns><add_rec><result><status>ok</status><id>8</id></result></add_rec></dns></packet>"
 
