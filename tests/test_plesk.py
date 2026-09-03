@@ -1262,6 +1262,80 @@ def test_ensure_ftp_user_system_rotate_uses_parent_webspace_for_subdomain(monkey
     assert any("<name>subactor.com</name>" in packet for packet in calls)
 
 
+def test_ensure_ftp_user_system_emits_ssh_disabled_when_enable_ssh_false(monkeypatch):
+    """enable_ssh=false must clear a prior shell; omitting the property leaves SSH on."""
+    reset_default_jti_replay_store()
+    monkeypatch.delenv("APPLY_GRANT_JTI_STORE", raising=False)
+    calls = []
+
+    def fake_lease(entry, origin, field, vault_url=""):
+        return {"username": "cust", "password": "cust-pass"}[field]
+
+    def fake_xml(base_url, username, password, packet):
+        calls.append(packet)
+        if "<webspace><set>" in packet.replace("\n", "").replace(" ", ""):
+            return "<packet><webspace><set><result><status>ok</status></result></set></webspace></packet>"
+        if "<webspace><get>" in packet.replace("\n", "").replace(" ", ""):
+            return (
+                "<packet><webspace><get><result><status>ok</status>"
+                "<name>ftp_login</name><value>subactor_ssh</value>"
+                "</result></get></webspace></packet>"
+            )
+        return "<packet><result><status>error</status></result></packet>"
+
+    monkeypatch.setattr(core, "_vault_lease", fake_lease)
+    monkeypatch.setattr(core, "_xml_agent", fake_xml)
+    monkeypatch.setattr(core, "_vault_store_secrets", lambda *a, **k: a[0])
+    monkeypatch.setattr(
+        core,
+        "_vault_entry_scope_metadata",
+        lambda *args, **kwargs: {"ok": True, "error": None},
+    )
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("PLESK_CREDENTIAL_APPLY", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "credential-test-secret")
+
+    dry = ensure_ftp_user(
+        kind="system",
+        domain="subactor.com",
+        enable_ssh=False,
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp",
+        also_ftp_vault_entry_id="plesk-ftp",
+    )
+    assert dry["ok"] and dry["plan"]["enable_ssh"] is False
+
+    issued = issue_apply_grant(
+        run_id="PLF-SSH-OFF",
+        actor="authority:founder",
+        intent_pack="plesk-deployment-credential@1",
+        plan_hash=dry["plan_hash"],
+        artifact_sha256=dry["artifact_sha256"],
+        target=dry["target"],
+        risk_class="governance",
+        jti="ssh-disabled-once",
+    )
+    result = ensure_ftp_user(
+        kind="system",
+        domain="subactor.com",
+        enable_ssh=False,
+        base_url="https://prototypowanie.pl:8443",
+        credential_vault_entry_id="plesk-sftp",
+        also_ftp_vault_entry_id="plesk-ftp",
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        apply_grant=issued["grant"],
+        actor="authority:founder",
+        pack_id="plesk-deployment-credential",
+        pack_version="1",
+    )
+    assert result["ok"]
+    set_packets = [p for p in calls if "<webspace><set>" in p.replace("\n", "").replace(" ", "")]
+    assert set_packets
+    assert "<name>ssh</name><value>/bin/bash_disabled</value>" in set_packets[0]
+    assert "<value>/bin/bash</value>" not in set_packets[0]
+
+
 def test_ensure_subdomain_idempotent_when_exists(monkeypatch):
     calls = []
 
@@ -2210,6 +2284,130 @@ def test_site_sync_rejects_absolute_vhost_path_for_another_domain(tmp_path):
 
     assert result["ok"] is False
     assert result["error"] == "plesk_site_sync_scope_mismatch"
+
+
+def test_sync_scope_accepts_webspace_absolute_subdomain_path():
+    """Non-chrooted SFTP uses /var/www/vhosts/<webspace>/<domain>, not OS-root /<domain>."""
+    assert (
+        core._sync_scope_error(
+            host="prototypowanie.pl",
+            domain="status.sub.actor",
+            remote_path="/var/www/vhosts/sub.actor/status.sub.actor",
+            transport="sftp",
+            sftp_vault_entry_id="plesk-sftp-status-sub-actor",
+            ftp_vault_entry_id="plesk-ftp-status-sub-actor",
+            deployment_webspace="sub.actor",
+        )
+        is None
+    )
+    assert (
+        core._sync_scope_error(
+            host="prototypowanie.pl",
+            domain="status.sub.actor",
+            remote_path="/var/www/vhosts/other.example/status.sub.actor",
+            transport="sftp",
+            sftp_vault_entry_id="",
+            ftp_vault_entry_id="",
+            deployment_webspace="sub.actor",
+        )
+        == "plesk_site_sync_scope_mismatch"
+    )
+
+
+def test_deployment_remote_paths_equivalent_relative_and_webspace_absolute():
+    assert core._deployment_remote_paths_equivalent(
+        "/status.sub.actor",
+        "/var/www/vhosts/sub.actor/status.sub.actor",
+        domain="status.sub.actor",
+        webspace="sub.actor",
+    )
+    assert not core._deployment_remote_paths_equivalent(
+        "/status.sub.actor",
+        "/var/www/vhosts/other.example/status.sub.actor",
+        domain="status.sub.actor",
+        webspace="sub.actor",
+    )
+    assert not core._deployment_remote_paths_equivalent(
+        "/status.sub.actor",
+        "/var/www/vhosts/sub.actor/status.sub.actor",
+        domain="status.sub.actor",
+        webspace="",
+    )
+
+
+def test_site_sync_accepts_absolute_path_equivalent_to_binding_relative(monkeypatch, tmp_path):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    binding = {
+        "id": "deployment:status-sub-actor:production",
+        "environment": "production",
+        "source_ref": "workspace:status-sub-actor",
+        "provider": "plesk",
+        "connector_uri": "plesk://host/site/command/sync",
+        "target": {
+            "domain": "status.sub.actor",
+            "webspace": "sub.actor",
+            "transport_host": "prototypowanie.pl",
+            "credential_origin": "https://prototypowanie.pl",
+            "remote_path": "/status.sub.actor",
+            "effective_docroot": "/httpdocs",
+            "path_mode": "subscription-relative",
+            "docroot_main_domain": "sub.actor",
+        },
+        "credential_refs": {
+            "sftp": "plesk-sftp-status-sub-actor",
+            "ftp": "plesk-ftp-status-sub-actor",
+        },
+        "verification": {
+            "url": "https://status.sub.actor/",
+            "mode": "sha256",
+            "entrypoint": "index.html",
+        },
+    }
+    registry_path = tmp_path / "deployment-bindings.json"
+    registry_path.write_text(
+        json.dumps({"schema": "subactor.deployment-bindings/v1", "version": 1, "bindings": [binding]}),
+        encoding="utf-8",
+    )
+    source_registry_path = tmp_path / "site-resources.json"
+    source_registry_path.write_text(
+        json.dumps({
+            "schema": "subactor.site-resources.v1",
+            "version": 1,
+            "resources": [{"id": binding["source_ref"], "path": str(www), "domain": binding["target"]["domain"]}],
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PLESK_DEPLOYMENT_BINDING_REQUIRED", "1")
+    monkeypatch.setenv("PLESK_DEPLOYMENT_BINDINGS_PATH", str(registry_path))
+    monkeypatch.setenv("PLESK_SITE_RESOURCES_PATH", str(source_registry_path))
+    monkeypatch.setenv("PLESK_SYNC_ALLOWED_SOURCES", str(tmp_path))
+    digest = core._deployment_binding_digest(binding)
+    monkeypatch.setattr(core, "_vault_settings", lambda _vault_url="": ("http://vault", "token"))
+    monkeypatch.setattr(
+        core,
+        "_request_json",
+        lambda *args, **kwargs: (200, {
+            "ok": True,
+            "scope": {"operations": ["plesk.site.sync"], "targets": ["domain:status.sub.actor"]},
+        }),
+    )
+    result = site_sync(
+        source_dir=str(www),
+        source_ref=binding["source_ref"],
+        deployment_binding_ref=binding["id"],
+        deployment_binding_hash=digest,
+        deployment_binding_version=1,
+        remote_path="/var/www/vhosts/sub.actor/status.sub.actor",
+        host=binding["target"]["transport_host"],
+        domain=binding["target"]["domain"],
+        deployment_webspace=binding["target"]["webspace"],
+        credential_origin=binding["target"]["credential_origin"],
+        sftp_vault_entry_id=binding["credential_refs"]["sftp"],
+        ftp_vault_entry_id=binding["credential_refs"]["ftp"],
+    )
+    assert result["ok"] is True and result["dry_run"] is True
 
 
 def test_immutable_manifest_stable_and_byte_sensitive(tmp_path):

@@ -692,6 +692,7 @@ def _sync_scope_error(
     ftp_vault_entry_id: str,
     credential_origin: str = "",
     credential_scope_verified: bool = False,
+    deployment_webspace: str = "",
 ) -> str | None:
     """Fail closed when a sync target is not bound to its declared domain."""
     clean_domain = str(domain or "").lower().rstrip(".")
@@ -702,10 +703,16 @@ def _sync_scope_error(
         return "plesk_site_sync_scope_mismatch"
     vhost_prefix = "/var/www/vhosts/"
     if normalized_path.startswith(vhost_prefix):
-        expected_prefix = f"{vhost_prefix}{clean_domain}/"
-        if not normalized_path.startswith(expected_prefix):
-            return "plesk_site_sync_scope_mismatch"
-        return None
+        expected_prefixes = [f"{vhost_prefix}{clean_domain}"]
+        webspace = str(deployment_webspace or "").lower().rstrip(".")
+        if webspace and webspace != clean_domain:
+            expected_prefixes.append(f"{vhost_prefix}{webspace}/{clean_domain}")
+        if any(
+            normalized_path == prefix or normalized_path.startswith(f"{prefix}/")
+            for prefix in expected_prefixes
+        ):
+            return None
+        return "plesk_site_sync_scope_mismatch"
     if normalized_path != "/httpdocs":
         return None
     origin = urllib.parse.urlparse(_transport_origin("sftp", host, credential_origin))
@@ -820,8 +827,43 @@ def _deployment_binding_error(
     if binding.get("provider") != "plesk" or binding.get("connector_uri") != "plesk://host/site/command/sync":
         return "plesk_site_deployment_binding_provider_mismatch"
     if expected != actual:
-        return "plesk_site_deployment_binding_target_mismatch"
+        # Non-chrooted SFTP may require the absolute vhost path while the
+        # registry keeps the subscription-relative form (/<domain>).
+        if not _deployment_remote_paths_equivalent(
+            expected.get("remote_path"),
+            actual.get("remote_path"),
+            domain=domain,
+            webspace=deployment_webspace,
+        ):
+            return "plesk_site_deployment_binding_target_mismatch"
+        mismatched = {
+            key: (expected.get(key), actual.get(key))
+            for key in expected
+            if key != "remote_path" and expected.get(key) != actual.get(key)
+        }
+        if mismatched:
+            return "plesk_site_deployment_binding_target_mismatch"
     return _registered_source_error(source_ref, source_dir)
+
+
+def _deployment_remote_paths_equivalent(
+    expected: str | None,
+    actual: str | None,
+    *,
+    domain: str = "",
+    webspace: str = "",
+) -> bool:
+    left = posixpath.normpath(str(expected or ""))
+    right = posixpath.normpath(str(actual or ""))
+    if left == right:
+        return True
+    clean_domain = str(domain or "").lower().rstrip(".")
+    clean_webspace = str(webspace or "").lower().rstrip(".")
+    if not clean_domain or not clean_webspace:
+        return False
+    relative = f"/{clean_domain}"
+    absolute = f"/var/www/vhosts/{clean_webspace}/{clean_domain}"
+    return {left, right} == {relative, absolute}
 
 
 def _twin_profile_contract(
@@ -2716,9 +2758,12 @@ def ensure_ftp_user(
         }
 
         if mode == "system":
+            # Enabling /bin/bash can escape the webspace chroot (OS-root SFTP).
+            # Always emit ssh explicitly so enable_ssh=false clears a prior shell.
             ssh_prop = (
                 "<property><name>ssh</name><value>/bin/bash</value></property>"
-                if enable_ssh else ""
+                if enable_ssh
+                else "<property><name>ssh</name><value>/bin/bash_disabled</value></property>"
             )
             webspace_xml = _xml_escape(webspace_name)
             packet = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -4425,6 +4470,7 @@ def _site_tree_sync(
         ftp_vault_entry_id=ftp_vault_entry_id,
         credential_origin=credential_origin,
         credential_scope_verified=bool(credential_preflight and credential_preflight["ok"]),
+        deployment_webspace=deployment_webspace,
     )
     if scope_error:
         return urirun.fail(scope_error, domain=domain, remote_path=remote_path, mutation_attempted=False)
