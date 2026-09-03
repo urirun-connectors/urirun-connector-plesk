@@ -100,6 +100,10 @@ _DEFAULT_EXCLUDE = (
 )
 
 
+PLESK_XML_API_PORT = 8443
+PLESK_XML_API_PATH = "/enterprise/control/agent.php"
+
+
 def _base_url(value: str = "") -> str:
     raw = value or os.environ.get("PLESK_BASE_URL", "")
     parsed = urllib.parse.urlparse(raw)
@@ -108,6 +112,37 @@ def _base_url(value: str = "") -> str:
     if not parsed.netloc or parsed.username or parsed.password:
         raise RuntimeError("plesk_base_url_invalid")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def panel_xml_origin_candidates(base_url: str) -> tuple[str, ...]:
+    """Origins to try for Plesk XML API. Implicit/443 HTTPS also tries :8443."""
+    origin = _base_url(base_url)
+    parsed = urllib.parse.urlparse(origin)
+    ordered = [origin]
+    if parsed.scheme == "https" and parsed.hostname and parsed.port in (None, 443):
+        ordered.append(f"https://{parsed.hostname}:{PLESK_XML_API_PORT}")
+    seen: list[str] = []
+    for item in ordered:
+        if item not in seen:
+            seen.append(item)
+    return tuple(seen)
+
+
+def canonical_panel_xml_origin(base_url: str) -> str:
+    """Prefer :8443 when the payload omitted a panel port or used :443."""
+    candidates = panel_xml_origin_candidates(base_url)
+    return candidates[-1] if len(candidates) > 1 else candidates[0]
+
+
+def _xml_agent_response_miss(raw: str, content_type: str = "", status: int = 200) -> bool:
+    if status in {301, 302, 303, 307, 308, 404}:
+        return True
+    body = (raw or "").lstrip()
+    ctype = (content_type or "").lower()
+    if body.startswith("<?xml") or body.startswith("<packet") or "xml" in ctype:
+        return False
+    lowered = body.lower()
+    return "html" in ctype or "<html" in lowered or "404 not found" in lowered
 
 
 def _ssl_context() -> ssl.SSLContext | None:
@@ -1376,34 +1411,74 @@ def _https_credential_origin(value: str, host: str = "") -> str:
 
 def _xml_agent(base_url: str, username: str, password: str, packet: str) -> str:
     """Call Plesk XML API (enterprise/control/agent.php) with HTTP_AUTH_* headers."""
-    origin = _base_url(base_url)
-    request = urllib.request.Request(
-        f"{origin}/enterprise/control/agent.php",
-        data=packet.encode("utf-8"),
-        method="POST",
-        headers={
-            "content-type": "text/xml",
-            "HTTP_AUTH_LOGIN": username,
-            "HTTP_AUTH_PASSWD": password,
-        },
+    last_error: BaseException | None = None
+    for origin in panel_xml_origin_candidates(base_url):
+        request = urllib.request.Request(
+            f"{origin}{PLESK_XML_API_PATH}",
+            data=packet.encode("utf-8"),
+            method="POST",
+            headers={
+                "content-type": "text/xml",
+                "HTTP_AUTH_LOGIN": username,
+                "HTTP_AUTH_PASSWD": password,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30, context=_ssl_context()) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                ctype = ""
+                try:
+                    ctype = response.headers.get("content-type", "")
+                except Exception:
+                    ctype = ""
+                if _xml_agent_response_miss(raw, ctype, getattr(response, "status", 200) or 200):
+                    last_error = RuntimeError("plesk_xml_transport_failed")
+                    continue
+                return raw
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else ""
+            ctype = ""
+            try:
+                ctype = error.headers.get("content-type", "") if error.headers else ""
+            except Exception:
+                ctype = ""
+            if error.code in {301, 302, 303, 307, 308, 404} or _xml_agent_response_miss(raw, ctype, error.code):
+                last_error = error
+                continue
+            raise RuntimeError("plesk_xml_transport_failed") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise RuntimeError("plesk_xml_transport_failed") from error
+    raise RuntimeError("plesk_xml_transport_failed") from last_error
+
+
+def _vault_lease_panel_pair(entry_id: str, base_url: str, vault_url: str = "") -> tuple[str, str, str]:
+    """Lease subscription/admin credentials, aligning origin with panel XML (:8443)."""
+    preferred = canonical_panel_xml_origin(base_url)
+    ordered = (preferred,) + tuple(
+        origin for origin in panel_xml_origin_candidates(base_url) if origin != preferred
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30, context=_ssl_context()) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, urllib.error.HTTPError) as error:
-        raise RuntimeError("plesk_xml_transport_failed") from error
+    last_error: RuntimeError | None = None
+    for origin in ordered:
+        try:
+            username = _vault_lease(entry_id, origin, "username", vault_url)
+            password = _vault_lease(entry_id, origin, "password", vault_url)
+            return origin, username, password
+        except RuntimeError as error:
+            if str(error).startswith("plesk_vault_lease_failed"):
+                last_error = error
+                continue
+            raise
+    raise last_error or RuntimeError("plesk_vault_lease_failed:username")
 
 
 def _admin_xml(
     *, base_url: str, packet: str, admin_vault_entry_id: str, vault_url: str,
 ) -> str:
     """Run an administrator-only XML API packet with vault-leased credentials."""
-    origin = _base_url(base_url)
     username = password = ""
     try:
-        username = _vault_lease(admin_vault_entry_id, origin, "username", vault_url)
-        password = _vault_lease(admin_vault_entry_id, origin, "password", vault_url)
-        return _xml_agent(base_url, username, password, packet)
+        origin, username, password = _vault_lease_panel_pair(admin_vault_entry_id, base_url, vault_url)
+        return _xml_agent(origin, username, password, packet)
     finally:
         username = password = ""
 
@@ -2574,7 +2649,7 @@ def ensure_ftp_user(
 
     password = login = cust_user = cust_pass = ""
     try:
-        origin_api = _base_url(base_url)
+        origin_api = canonical_panel_xml_origin(base_url)
         host = urllib.parse.urlparse(origin_api).hostname or ""
         vault_origin = _https_credential_origin(credential_origin, host)
         stored_id = credential_vault_entry_id
@@ -2631,8 +2706,9 @@ def ensure_ftp_user(
         if not consumed:
             return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
 
-        cust_user = _vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url)
-        cust_pass = _vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url)
+        origin_api, cust_user, cust_pass = _vault_lease_panel_pair(
+            subscription_vault_entry_id, origin_api, vault_url,
+        )
         password = f"{secrets.token_urlsafe(20)}aZ9!"
         deployment_scope = {
             "operations": ["plesk.site.sync"],
