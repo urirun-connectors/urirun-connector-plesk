@@ -100,6 +100,10 @@ _DEFAULT_EXCLUDE = (
 )
 
 
+PLESK_XML_API_PORT = 8443
+PLESK_XML_API_PATH = "/enterprise/control/agent.php"
+
+
 def _base_url(value: str = "") -> str:
     raw = value or os.environ.get("PLESK_BASE_URL", "")
     parsed = urllib.parse.urlparse(raw)
@@ -108,6 +112,37 @@ def _base_url(value: str = "") -> str:
     if not parsed.netloc or parsed.username or parsed.password:
         raise RuntimeError("plesk_base_url_invalid")
     return f"{parsed.scheme}://{parsed.netloc}"
+
+
+def panel_xml_origin_candidates(base_url: str) -> tuple[str, ...]:
+    """Origins to try for Plesk XML API. Implicit/443 HTTPS also tries :8443."""
+    origin = _base_url(base_url)
+    parsed = urllib.parse.urlparse(origin)
+    ordered = [origin]
+    if parsed.scheme == "https" and parsed.hostname and parsed.port in (None, 443):
+        ordered.append(f"https://{parsed.hostname}:{PLESK_XML_API_PORT}")
+    seen: list[str] = []
+    for item in ordered:
+        if item not in seen:
+            seen.append(item)
+    return tuple(seen)
+
+
+def canonical_panel_xml_origin(base_url: str) -> str:
+    """Prefer :8443 when the payload omitted a panel port or used :443."""
+    candidates = panel_xml_origin_candidates(base_url)
+    return candidates[-1] if len(candidates) > 1 else candidates[0]
+
+
+def _xml_agent_response_miss(raw: str, content_type: str = "", status: int = 200) -> bool:
+    if status in {301, 302, 303, 307, 308, 404}:
+        return True
+    body = (raw or "").lstrip()
+    ctype = (content_type or "").lower()
+    if body.startswith("<?xml") or body.startswith("<packet") or "xml" in ctype:
+        return False
+    lowered = body.lower()
+    return "html" in ctype or "<html" in lowered or "404 not found" in lowered
 
 
 def _ssl_context() -> ssl.SSLContext | None:
@@ -657,6 +692,7 @@ def _sync_scope_error(
     ftp_vault_entry_id: str,
     credential_origin: str = "",
     credential_scope_verified: bool = False,
+    deployment_webspace: str = "",
 ) -> str | None:
     """Fail closed when a sync target is not bound to its declared domain."""
     clean_domain = str(domain or "").lower().rstrip(".")
@@ -667,10 +703,16 @@ def _sync_scope_error(
         return "plesk_site_sync_scope_mismatch"
     vhost_prefix = "/var/www/vhosts/"
     if normalized_path.startswith(vhost_prefix):
-        expected_prefix = f"{vhost_prefix}{clean_domain}/"
-        if not normalized_path.startswith(expected_prefix):
-            return "plesk_site_sync_scope_mismatch"
-        return None
+        expected_prefixes = [f"{vhost_prefix}{clean_domain}"]
+        webspace = str(deployment_webspace or "").lower().rstrip(".")
+        if webspace and webspace != clean_domain:
+            expected_prefixes.append(f"{vhost_prefix}{webspace}/{clean_domain}")
+        if any(
+            normalized_path == prefix or normalized_path.startswith(f"{prefix}/")
+            for prefix in expected_prefixes
+        ):
+            return None
+        return "plesk_site_sync_scope_mismatch"
     if normalized_path != "/httpdocs":
         return None
     origin = urllib.parse.urlparse(_transport_origin("sftp", host, credential_origin))
@@ -785,8 +827,43 @@ def _deployment_binding_error(
     if binding.get("provider") != "plesk" or binding.get("connector_uri") != "plesk://host/site/command/sync":
         return "plesk_site_deployment_binding_provider_mismatch"
     if expected != actual:
-        return "plesk_site_deployment_binding_target_mismatch"
+        # Non-chrooted SFTP may require the absolute vhost path while the
+        # registry keeps the subscription-relative form (/<domain>).
+        if not _deployment_remote_paths_equivalent(
+            expected.get("remote_path"),
+            actual.get("remote_path"),
+            domain=domain,
+            webspace=deployment_webspace,
+        ):
+            return "plesk_site_deployment_binding_target_mismatch"
+        mismatched = {
+            key: (expected.get(key), actual.get(key))
+            for key in expected
+            if key != "remote_path" and expected.get(key) != actual.get(key)
+        }
+        if mismatched:
+            return "plesk_site_deployment_binding_target_mismatch"
     return _registered_source_error(source_ref, source_dir)
+
+
+def _deployment_remote_paths_equivalent(
+    expected: str | None,
+    actual: str | None,
+    *,
+    domain: str = "",
+    webspace: str = "",
+) -> bool:
+    left = posixpath.normpath(str(expected or ""))
+    right = posixpath.normpath(str(actual or ""))
+    if left == right:
+        return True
+    clean_domain = str(domain or "").lower().rstrip(".")
+    clean_webspace = str(webspace or "").lower().rstrip(".")
+    if not clean_domain or not clean_webspace:
+        return False
+    relative = f"/{clean_domain}"
+    absolute = f"/var/www/vhosts/{clean_webspace}/{clean_domain}"
+    return {left, right} == {relative, absolute}
 
 
 def _twin_profile_contract(
@@ -1376,34 +1453,74 @@ def _https_credential_origin(value: str, host: str = "") -> str:
 
 def _xml_agent(base_url: str, username: str, password: str, packet: str) -> str:
     """Call Plesk XML API (enterprise/control/agent.php) with HTTP_AUTH_* headers."""
-    origin = _base_url(base_url)
-    request = urllib.request.Request(
-        f"{origin}/enterprise/control/agent.php",
-        data=packet.encode("utf-8"),
-        method="POST",
-        headers={
-            "content-type": "text/xml",
-            "HTTP_AUTH_LOGIN": username,
-            "HTTP_AUTH_PASSWD": password,
-        },
+    last_error: BaseException | None = None
+    for origin in panel_xml_origin_candidates(base_url):
+        request = urllib.request.Request(
+            f"{origin}{PLESK_XML_API_PATH}",
+            data=packet.encode("utf-8"),
+            method="POST",
+            headers={
+                "content-type": "text/xml",
+                "HTTP_AUTH_LOGIN": username,
+                "HTTP_AUTH_PASSWD": password,
+            },
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=30, context=_ssl_context()) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+                ctype = ""
+                try:
+                    ctype = response.headers.get("content-type", "")
+                except Exception:
+                    ctype = ""
+                if _xml_agent_response_miss(raw, ctype, getattr(response, "status", 200) or 200):
+                    last_error = RuntimeError("plesk_xml_transport_failed")
+                    continue
+                return raw
+        except urllib.error.HTTPError as error:
+            raw = error.read().decode("utf-8", errors="replace") if hasattr(error, "read") else ""
+            ctype = ""
+            try:
+                ctype = error.headers.get("content-type", "") if error.headers else ""
+            except Exception:
+                ctype = ""
+            if error.code in {301, 302, 303, 307, 308, 404} or _xml_agent_response_miss(raw, ctype, error.code):
+                last_error = error
+                continue
+            raise RuntimeError("plesk_xml_transport_failed") from error
+        except (urllib.error.URLError, TimeoutError) as error:
+            raise RuntimeError("plesk_xml_transport_failed") from error
+    raise RuntimeError("plesk_xml_transport_failed") from last_error
+
+
+def _vault_lease_panel_pair(entry_id: str, base_url: str, vault_url: str = "") -> tuple[str, str, str]:
+    """Lease subscription/admin credentials, aligning origin with panel XML (:8443)."""
+    preferred = canonical_panel_xml_origin(base_url)
+    ordered = (preferred,) + tuple(
+        origin for origin in panel_xml_origin_candidates(base_url) if origin != preferred
     )
-    try:
-        with urllib.request.urlopen(request, timeout=30, context=_ssl_context()) as response:
-            return response.read().decode("utf-8", errors="replace")
-    except (urllib.error.URLError, TimeoutError, urllib.error.HTTPError) as error:
-        raise RuntimeError("plesk_xml_transport_failed") from error
+    last_error: RuntimeError | None = None
+    for origin in ordered:
+        try:
+            username = _vault_lease(entry_id, origin, "username", vault_url)
+            password = _vault_lease(entry_id, origin, "password", vault_url)
+            return origin, username, password
+        except RuntimeError as error:
+            if str(error).startswith("plesk_vault_lease_failed"):
+                last_error = error
+                continue
+            raise
+    raise last_error or RuntimeError("plesk_vault_lease_failed:username")
 
 
 def _admin_xml(
     *, base_url: str, packet: str, admin_vault_entry_id: str, vault_url: str,
 ) -> str:
     """Run an administrator-only XML API packet with vault-leased credentials."""
-    origin = _base_url(base_url)
     username = password = ""
     try:
-        username = _vault_lease(admin_vault_entry_id, origin, "username", vault_url)
-        password = _vault_lease(admin_vault_entry_id, origin, "password", vault_url)
-        return _xml_agent(base_url, username, password, packet)
+        origin, username, password = _vault_lease_panel_pair(admin_vault_entry_id, base_url, vault_url)
+        return _xml_agent(origin, username, password, packet)
     finally:
         username = password = ""
 
@@ -1784,6 +1901,37 @@ def _dns_plan(site_id: int, host: str, record_type: str, value: str, records: li
     return {**body, "changed": bool(delete or add), "plan_hash": digest, "artifact_sha256": digest}
 
 
+def _dns_plesk_add_host(host: str, records: list[dict[str, Any]] | None = None) -> str:
+    """Plesk DNS add_rec expects a name relative to the site zone, not an FQDN.
+
+    get_rec returns FQDNs (e.g. auth.subactor.com). Passing that FQDN into add_rec
+    appends the zone again (identity.subactor.com.subactor.com). Convert to the
+    leftmost relative label(s) before writing.
+    """
+    fqdn = (host or "").strip().rstrip(".").lower()
+    if not fqdn:
+        return ""
+    rows = records or []
+    suffixes = sorted(
+        {
+            row["host"]
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("host")
+            and fqdn != row["host"]
+            and fqdn.endswith(f".{row['host']}")
+        },
+        key=len,
+    )
+    if suffixes:
+        apex = suffixes[0]
+        return fqdn[: -(len(apex) + 1)]
+    parts = fqdn.split(".")
+    if len(parts) <= 2:
+        return ""
+    return ".".join(parts[:-2])
+
+
 def _dns_add_operation(site_id: int, record_type: str, host: str, value: str, opt: str | None = None) -> str:
     optional = f"<opt>{_xml_escape(opt)}</opt>" if opt else ""
     return (
@@ -1924,9 +2072,10 @@ def dns_replace(
                     provider_error=_dns_provider_error(raw, "del_rec"), rollback_attempted=False,
                 )
         if plan["add_record"]:
+            plesk_host = _dns_plesk_add_host(wanted_host, records)
             raw = _xml_agent(
                 base_url, username, password,
-                _dns_packet(_dns_add_operation(resolved_site_id, wanted_type, wanted_host, wanted_value)),
+                _dns_packet(_dns_add_operation(resolved_site_id, wanted_type, plesk_host, wanted_value)),
             )
             if not _xml_ok(raw):
                 rollback_attempted = bool(deleted_records)
@@ -1934,7 +2083,11 @@ def dns_replace(
                 if rollback_attempted:
                     restore_operations = "".join(
                         _dns_add_operation(
-                            resolved_site_id, row["type"], row["host"], row["value"], row.get("opt"),
+                            resolved_site_id,
+                            row["type"],
+                            _dns_plesk_add_host(row["host"], records),
+                            row["value"],
+                            row.get("opt"),
                         )
                         for row in deleted_records
                     )
@@ -2574,7 +2727,7 @@ def ensure_ftp_user(
 
     password = login = cust_user = cust_pass = ""
     try:
-        origin_api = _base_url(base_url)
+        origin_api = canonical_panel_xml_origin(base_url)
         host = urllib.parse.urlparse(origin_api).hostname or ""
         vault_origin = _https_credential_origin(credential_origin, host)
         stored_id = credential_vault_entry_id
@@ -2631,8 +2784,9 @@ def ensure_ftp_user(
         if not consumed:
             return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
 
-        cust_user = _vault_lease(subscription_vault_entry_id, origin_api, "username", vault_url)
-        cust_pass = _vault_lease(subscription_vault_entry_id, origin_api, "password", vault_url)
+        origin_api, cust_user, cust_pass = _vault_lease_panel_pair(
+            subscription_vault_entry_id, origin_api, vault_url,
+        )
         password = f"{secrets.token_urlsafe(20)}aZ9!"
         deployment_scope = {
             "operations": ["plesk.site.sync"],
@@ -2640,9 +2794,12 @@ def ensure_ftp_user(
         }
 
         if mode == "system":
+            # Enabling /bin/bash can escape the webspace chroot (OS-root SFTP).
+            # Always emit ssh explicitly so enable_ssh=false clears a prior shell.
             ssh_prop = (
                 "<property><name>ssh</name><value>/bin/bash</value></property>"
-                if enable_ssh else ""
+                if enable_ssh
+                else "<property><name>ssh</name><value>/bin/bash_disabled</value></property>"
             )
             webspace_xml = _xml_escape(webspace_name)
             packet = f"""<?xml version="1.0" encoding="UTF-8"?>
@@ -4349,6 +4506,7 @@ def _site_tree_sync(
         ftp_vault_entry_id=ftp_vault_entry_id,
         credential_origin=credential_origin,
         credential_scope_verified=bool(credential_preflight and credential_preflight["ok"]),
+        deployment_webspace=deployment_webspace,
     )
     if scope_error:
         return urirun.fail(scope_error, domain=domain, remote_path=remote_path, mutation_attempted=False)
