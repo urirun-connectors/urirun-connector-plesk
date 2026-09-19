@@ -11,3 +11,5 @@ build/
 .planfile/.koru/
 .koru/
 .planfile/sprints/*.bak-*
+
+/.worktrees/
