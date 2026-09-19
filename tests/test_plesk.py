@@ -1949,6 +1949,72 @@ def test_site_sync_dry_run_plans_without_upload(monkeypatch, tmp_path):
     assert fake_sftp.puts == []
 
 
+@pytest.mark.parametrize(
+    "domain,grant_target,allowed",
+    [
+        ("identity.subactor.com", "identity.subactor.com", True),
+        ("identity.subactor.com", "other.subactor.com", False),
+        ("identity.subactor.com", "prototypowanie.pl", False),
+        ("", "prototypowanie.pl", True),
+    ],
+)
+def test_site_sync_apply_grant_targets_domain_when_declared(
+    monkeypatch, tmp_path, domain, grant_target, allowed,
+):
+    www = tmp_path / "www"
+    www.mkdir()
+    _seed_site(www)
+    fake_sftp = _FakeSFTP()
+    monkeypatch.setenv("PLESK_SYNC_APPLY", "1")
+    monkeypatch.setenv("AUTONOMY_MUTATIONS_ENABLED", "1")
+    monkeypatch.setenv("APPLY_GRANT_HMAC_SECRET", "site-sync-domain-secret")
+    monkeypatch.setattr(
+        core,
+        "_sftp_connect",
+        lambda *a, **k: (_FakeTransport(), fake_sftp, "aa11bb22"),
+    )
+    monkeypatch.setattr(core, "_vault_lease", lambda *a, **k: "x")
+
+    dry = site_sync(
+        source_dir=str(www),
+        remote_path="/identity.subactor.com",
+        host="prototypowanie.pl",
+        domain=domain,
+    )
+    issued = issue_apply_grant(
+        run_id="PLF-SITE-DOMAIN",
+        actor="human:founder",
+        intent_pack="project-publication@1",
+        plan_hash=dry["plan_hash"],
+        artifact_sha256=dry["manifest"]["source_sha256"],
+        target=grant_target,
+        risk_class="reversible",
+        jti=f"site-domain-{domain}-{grant_target}",
+    )
+
+    result = site_sync(
+        source_dir=str(www),
+        remote_path="/identity.subactor.com",
+        host="prototypowanie.pl",
+        domain=domain,
+        apply=True,
+        plan_hash=dry["plan_hash"],
+        apply_grant=issued["grant"],
+        actor="human:founder",
+        pack_id="project-publication",
+        pack_version="1",
+    )
+
+    assert result["ok"] is allowed
+    assert bool(fake_sftp.puts) is allowed
+    if allowed:
+        assert result["executed"] is True
+        assert result.get("error") is None
+    else:
+        assert result["error"] == "apply_grant_target_mismatch"
+        assert result.get("mutation_attempted") is False
+
+
 def test_site_sync_requires_and_revalidates_portable_deployment_binding(monkeypatch, tmp_path):
     www = tmp_path / "www"
     www.mkdir()

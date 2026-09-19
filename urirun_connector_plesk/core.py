@@ -4526,7 +4526,7 @@ def _site_tree_sync(
         bool(apply),
         apply_grant=apply_grant,
         plan_hash=plan_hash,
-        target=host or "",
+        target=domain or host or "",
         actor=actor,
         pack_id=pack_id,
         pack_version=pack_version,
