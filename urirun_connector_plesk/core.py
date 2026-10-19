@@ -5,6 +5,7 @@ import base64
 import fnmatch
 import ftplib
 import hashlib
+import io
 import json
 import os
 import posixpath
@@ -373,7 +374,22 @@ def _sftp_connect(host: str, port: int, username: str, password: str, host_finge
         if wanted and wanted != fingerprint.lower():
             raise RuntimeError("plesk_sftp_host_key_mismatch")
         try:
-            transport.auth_password(username, password)
+            if str(password or "").lstrip().startswith("-----BEGIN "):
+                pkey = None
+                for kcls_name in ("Ed25519Key", "RSAKey", "ECDSAKey"):
+                    kcls = getattr(paramiko, kcls_name, None)
+                    if kcls is None:
+                        continue
+                    try:
+                        pkey = kcls.from_private_key(io.StringIO(password))
+                        break
+                    except Exception:
+                        continue
+                if pkey is None:
+                    raise RuntimeError("plesk_sftp_private_key_invalid")
+                transport.auth_publickey(username, pkey)
+            else:
+                transport.auth_password(username, password)
         except Exception as error:
             raise RuntimeError(map_exception(error, phase="connect")) from error
         sftp = paramiko.SFTPClient.from_transport(transport)
@@ -972,7 +988,13 @@ def _detect_transports(host: str, *, sftp_port: int, ftp_port: int, ftp_tls: boo
         origin = _transport_origin(name, host, credential_origin)
         try:
             username = _vault_lease(entry, origin, "username", vault_url)
-            password = _vault_lease(entry, origin, "password", vault_url)
+            try:
+                password = _vault_lease(entry, origin, "password", vault_url)
+            except RuntimeError:
+                if name == "sftp":
+                    password = _vault_lease(entry, origin, "private_key", vault_url)
+                else:
+                    raise
         except RuntimeError as error:
             results.append({"transport": name, "available": False, "detail": str(error)})
             continue
@@ -4397,7 +4419,13 @@ def _sync_transfer(*, chosen: str, source_dir: str, remote_path: str, host: str,
     username = password = ""
     try:
         username = _vault_lease(entry, origin, "username", vault_url)
-        password = _vault_lease(entry, origin, "password", vault_url)
+        try:
+            password = _vault_lease(entry, origin, "password", vault_url)
+        except RuntimeError:
+            if chosen == "sftp":
+                password = _vault_lease(entry, origin, "private_key", vault_url)
+            else:
+                raise
         if chosen == "sftp":
             uploaded, extra = _publish_over_sftp(
                 source_dir, remote_path, host, port, username, password, host_fingerprint, exclude_patterns,
