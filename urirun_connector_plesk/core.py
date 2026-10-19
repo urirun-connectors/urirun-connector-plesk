@@ -3770,7 +3770,8 @@ def _source_allowed(source_dir: str) -> bool:
             if abs_path == root or abs_path.startswith(root + os.sep):
                 return True
         return False
-    return os.path.basename(abs_path.rstrip(os.sep)) in {"www", "docs", "logo", "public-status"}
+    base_name = os.path.basename(abs_path.rstrip(os.sep))
+    return base_name in {"www", "docs", "logo", "public-status", "public", "dist", "podglad"} or base_name.startswith("www-")
 
 
 def _plan_local_tree(source_dir: str, remote_path: str, exclude: tuple[str, ...] = ()) -> list[dict[str, Any]]:
