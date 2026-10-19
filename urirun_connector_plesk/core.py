@@ -1083,23 +1083,46 @@ def bootstrap_api_key(
         return urirun.fail(replay_error or "apply_grant_replay", dry_run=False, mutation_attempted=False)
     username = password = api_key = auth = ""
     try:
-        username = _vault_lease(root_entry_id, origin, "username", vault_url)
-        password = _vault_lease(root_entry_id, origin, "password", vault_url)
-        auth = base64.b64encode(f"{username}:{password}".encode()).decode()
-        body = {"description": description[:160]}
-        if normalized_login:
-            body["login"] = normalized_login
-        if normalized_ip:
-            body["ip"] = normalized_ip
-        status, data = _request_json(
-            f"{origin}/api/v2/auth/keys",
-            method="POST",
-            headers={"authorization": f"Basic {auth}"},
-            body=body,
-        )
-        api_key = str(data.get("key") or "")
-        if status not in {200, 201} or len(api_key) < 8:
-            raise RuntimeError(f"plesk_api_key_create_failed:{status}")
+        try:
+            username = _vault_lease(root_entry_id, origin, "username", vault_url)
+            password = _vault_lease(root_entry_id, origin, "password", vault_url)
+            auth = base64.b64encode(f"{username}:{password}".encode()).decode()
+            body = {"description": description[:160]}
+            if normalized_login:
+                body["login"] = normalized_login
+            if normalized_ip:
+                body["ip"] = normalized_ip
+            status, data = _request_json(
+                f"{origin}/api/v2/auth/keys",
+                method="POST",
+                headers={"authorization": f"Basic {auth}"},
+                body=body,
+            )
+            api_key = str(data.get("key") or "")
+            if status not in {200, 201} or len(api_key) < 8:
+                raise RuntimeError(f"plesk_api_key_create_failed:{status}")
+        except RuntimeError as http_err:
+            ssh_host = (urllib.parse.urlparse(origin).hostname or "").strip().lower()
+            if not ssh_host:
+                raise http_err
+            try:
+                ssh_user = _vault_lease("plesk-root-ssh", origin, "username", vault_url)
+                try:
+                    ssh_secret = _vault_lease("plesk-root-ssh", origin, "private_key", vault_url)
+                except RuntimeError:
+                    ssh_secret = _vault_lease("plesk-root-ssh", origin, "password", vault_url)
+                transport, sftp, _fp = _sftp_connect(ssh_host, 22, ssh_user, ssh_secret, "")
+                try:
+                    sftp.close()
+                    cmd = f"plesk bin secret_key --create -description {shlex.quote(description[:160])}"
+                    code, out_txt = _ssh_command(transport, cmd)
+                    api_key = (out_txt.splitlines()[0] if out_txt else "").strip()
+                    if code != 0 or len(api_key) < 8:
+                        raise http_err
+                finally:
+                    transport.close()
+            except Exception:
+                raise http_err
         stored_id = _vault_store(entry_id, origin, api_key, vault_url)
         readback = auth_status(
             base_url=origin,
