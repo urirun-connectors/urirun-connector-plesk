@@ -374,7 +374,30 @@ def _sftp_connect(host: str, port: int, username: str, password: str, host_finge
         if wanted and wanted != fingerprint.lower():
             raise RuntimeError("plesk_sftp_host_key_mismatch")
         try:
-            if str(password or "").lstrip().startswith("-----BEGIN "):
+            if password == "__SSH_AGENT__":
+                authed = False
+                for akey in paramiko.Agent().get_keys():
+                    try:
+                        transport.auth_publickey(username, akey)
+                        authed = True
+                        break
+                    except Exception:
+                        continue
+                if not authed:
+                    ssh_dir = os.path.expanduser("~/.ssh")
+                    for kfile, kcls_name in (("id_ed25519", "Ed25519Key"), ("id_rsa", "RSAKey"), ("id_ecdsa", "ECDSAKey")):
+                        kpath = os.path.join(ssh_dir, kfile)
+                        kcls = getattr(paramiko, kcls_name, None)
+                        if kcls is not None and os.path.isfile(kpath):
+                            try:
+                                transport.auth_publickey(username, kcls.from_private_key_file(kpath))
+                                authed = True
+                                break
+                            except Exception:
+                                continue
+                if not authed:
+                    raise RuntimeError("plesk_sftp_ssh_agent_auth_failed")
+            elif str(password or "").lstrip().startswith("-----BEGIN "):
                 pkey = None
                 for kcls_name in ("Ed25519Key", "RSAKey", "ECDSAKey"):
                     kcls = getattr(paramiko, kcls_name, None)
@@ -723,6 +746,7 @@ def _sync_scope_error(
         webspace = str(deployment_webspace or "").lower().rstrip(".")
         if webspace and webspace != clean_domain:
             expected_prefixes.append(f"{vhost_prefix}{webspace}/{clean_domain}")
+            expected_prefixes.append(f"{vhost_prefix}{webspace}/httpdocs")
         if any(
             normalized_path == prefix or normalized_path.startswith(f"{prefix}/")
             for prefix in expected_prefixes
@@ -996,8 +1020,11 @@ def _detect_transports(host: str, *, sftp_port: int, ftp_port: int, ftp_tls: boo
                 else:
                     raise
         except RuntimeError as error:
-            results.append({"transport": name, "available": False, "detail": str(error)})
-            continue
+            if name == "sftp" and os.environ.get("PLESK_SFTP_SSH_AGENT") == "1":
+                username, password = os.environ.get("PLESK_SFTP_USER", "root"), "__SSH_AGENT__"
+            else:
+                results.append({"transport": name, "available": False, "detail": str(error)})
+                continue
         try:
             if name == "sftp":
                 ok, detail = _probe_sftp(host, port, username, password, host_fingerprint)
@@ -3911,6 +3938,12 @@ def _publish_over_sftp(
                 remote_path,
                 current_exists=_sftp_current_exists(sftp, remote_path),
             )
+            vhost_uid = None
+            if username == "root" and write_path.startswith("/var/www/vhosts/"):
+                try:
+                    vhost_uid = int(sftp.stat(write_path).st_uid or 0)
+                except Exception:
+                    vhost_uid = None
             uploaded = _sftp_upload_dir(
                 sftp,
                 source_dir,
@@ -3920,6 +3953,11 @@ def _publish_over_sftp(
                 verify_remote_hash=verify_remote_hash,
                 deadline=deadline,
             )
+            if vhost_uid and vhost_uid > 0:
+                try:
+                    _ssh_command(transport, f"chown -R {vhost_uid}:psacln {shlex.quote(write_path)} && chown {vhost_uid}:psaserv {shlex.quote(write_path)}")
+                except Exception:
+                    pass
         finally:
             sftp.close()
     finally:
@@ -4442,12 +4480,18 @@ def _sync_transfer(*, chosen: str, source_dir: str, remote_path: str, host: str,
     verify_remote_hash = os.environ.get("PLESK_SYNC_VERIFY_REMOTE_HASH", "").strip() == "1"
     username = password = ""
     try:
-        username = _vault_lease(entry, origin, "username", vault_url)
         try:
-            password = _vault_lease(entry, origin, "password", vault_url)
+            username = _vault_lease(entry, origin, "username", vault_url)
+            try:
+                password = _vault_lease(entry, origin, "password", vault_url)
+            except RuntimeError:
+                if chosen == "sftp":
+                    password = _vault_lease(entry, origin, "private_key", vault_url)
+                else:
+                    raise
         except RuntimeError:
-            if chosen == "sftp":
-                password = _vault_lease(entry, origin, "private_key", vault_url)
+            if chosen == "sftp" and os.environ.get("PLESK_SFTP_SSH_AGENT") == "1":
+                username, password = os.environ.get("PLESK_SFTP_USER", "root"), "__SSH_AGENT__"
             else:
                 raise
         if chosen == "sftp":
