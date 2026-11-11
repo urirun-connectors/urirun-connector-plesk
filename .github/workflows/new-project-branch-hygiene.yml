@@ -1,0 +1,27 @@
+name: new-project-branch-hygiene
+
+# GitHub's delete_branch_on_merge setting handles successfully merged branches.
+# Closing an unmerged pull request does not authorize discarding its work.
+# Explicit discard requires a separate owner decision and intent reconciliation.
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: read
+
+jobs:
+  preserve-unmerged-head:
+    if: github.event.pull_request.merged == false
+    runs-on: ${{ vars.NEW_PROJECT_RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Report preserved pull request branch
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const ref = context.payload.pull_request.head.ref;
+            core.notice(
+              `Preserved ${JSON.stringify(ref)}. Closing a pull request does not ` +
+              'authorize branch deletion. Reconcile remaining intent and obtain ' +
+              'an explicit owner discard decision before a separate deletion.',
+            );

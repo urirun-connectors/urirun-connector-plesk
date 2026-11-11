@@ -13,3 +13,12 @@ build/
 .planfile/sprints/*.bak-*
 
 /.worktrees/
+
+# Repository-local worktrees and operational state
+/.subactor/leases/
+/.subactor/sessions/
+/.subactor/recovery/
+/.subactor/receipts/
+/.subactor/cache/
+/.subactor/snapshots/
+*.egg
