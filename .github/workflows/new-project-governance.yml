@@ -1,0 +1,266 @@
+name: new-project-governance
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  remote-lifecycle:
+    name: governance / remote lifecycle
+    runs-on: ${{ vars.NEW_PROJECT_RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Check out governed repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Acquire GitHub branch lifecycle snapshot
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          BRANCH_LIFECYCLE_SNAPSHOT: ${{ runner.temp }}/new-project-branch-lifecycle.json
+        with:
+          script: |
+            const fs = require('fs');
+            const repository = await github.rest.repos.get({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            const settings = await github.graphql(`
+              query($owner: String!, $repo: String!) {
+                repository(owner: $owner, name: $repo) { deleteBranchOnMerge }
+              }
+            `, {owner: context.repo.owner, repo: context.repo.repo});
+            const branches = await github.paginate(github.rest.repos.listBranches, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              per_page: 100,
+            });
+            const snapshot = {
+              schema: 'new-project.branch-lifecycle-snapshot/v1',
+              repository: `${context.repo.owner}/${context.repo.repo}`,
+              defaultBranch: repository.data.default_branch,
+              deleteBranchOnMerge: settings.repository.deleteBranchOnMerge,
+              branches: branches.map(branch => branch.name).sort(),
+              openPullRequests: pulls.map(pull => ({
+                number: pull.number,
+                headRepository: pull.head.repo?.full_name ?? null,
+                headRef: pull.head.ref,
+              })).sort((left, right) => left.number - right.number),
+            };
+            fs.writeFileSync(
+              process.env.BRANCH_LIFECYCLE_SNAPSHOT,
+              `${JSON.stringify(snapshot)}\n`,
+              {encoding: 'utf8', mode: 0o600},
+            );
+      - name: Validate remote branch lifecycle
+        shell: bash
+        env:
+          BRANCH_LIFECYCLE_SNAPSHOT: ${{ runner.temp }}/new-project-branch-lifecycle.json
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          arguments=(
+            --snapshot "$BRANCH_LIFECYCLE_SNAPSHOT"
+            --expected-repository "$GITHUB_REPOSITORY"
+            --format text
+          )
+          if [[ -n "${HEAD_REF:-}" ]]; then
+            arguments+=(--focus-branch "$HEAD_REF")
+          fi
+          python3 .governance/branch_lifecycle_check.py "${arguments[@]}"
+
+  enforce:
+    name: governance / enforce
+    # A closed pull request has nothing left to gate; remote-lifecycle still runs.
+    if: github.event.action != 'closed'
+    runs-on: ${{ vars.NEW_PROJECT_RUNNER_LABEL || 'ubuntu-latest' }}
+    steps:
+      - name: Check out the exact revision under review
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      - name: Set up Python
+        if: runner.environment == 'github-hosted'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.11"
+      - name: Require provisioned Python on self-hosted runner
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v python3 >/dev/null
+          python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+      - name: Install wellman governance runtime
+        shell: bash
+        env:
+          PROTECTED_RUNTIME_SHA: ${{ vars.NEW_PROJECT_RUNTIME_SHA }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SHA: ${{ github.sha }}
+          EVENT_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GOVERNANCE_ROOT: .
+        run: |
+          set -euo pipefail
+          # Repository variable is protected configuration; candidate manifests are not.
+          runtime_ref="$(python3 -I - <<'PY_RUNTIME'
+          import json
+          import os
+          import re
+          import subprocess
+          from pathlib import PurePosixPath
+
+          def reject(message):
+              raise SystemExit("Trusted governance runtime pin: " + message)
+
+          def sha(value):
+              if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}", value):
+                  reject("a full lowercase commit SHA is required")
+              return value
+
+          def unique(pairs):
+              result = {}
+              for key, value in pairs:
+                  if key in result:
+                      reject("duplicate lock key")
+                  result[key] = value
+              return result
+
+          protected = os.environ.get("PROTECTED_RUNTIME_SHA", "")
+          if protected:
+              print(sha(protected))
+          else:
+              if os.environ.get("EVENT_NAME") == "pull_request":
+                  branch = os.environ.get("DEFAULT_BRANCH", "")
+                  if not branch or os.environ.get("BASE_REF") != branch:
+                      reject("PR base must be the default branch or use a protected SHA")
+                  base = sha(os.environ.get("BASE_SHA", ""))
+              else:
+                  branch = os.environ.get("DEFAULT_BRANCH", "")
+                  if not branch or os.environ.get("EVENT_REF") != "refs/heads/" + branch:
+                      reject("non-PR runs require the default branch or a protected SHA")
+                  base = sha(os.environ.get("EVENT_SHA", ""))
+              target = os.path.relpath(os.path.abspath(os.environ.get("GOVERNANCE_ROOT", ".")), os.getcwd())
+              if ".." in PurePosixPath(target).parts or "\\" in target:
+                  reject("target-root must stay inside the repository")
+              lock_path = str(PurePosixPath(target) / ".governance/manifest.lock.json")
+              observed = subprocess.run(["git", "show", base + ":" + lock_path],
+                                        capture_output=True, text=True)
+              if observed.returncode:
+                  reject("trusted base lock unavailable; configure protected NEW_PROJECT_RUNTIME_SHA for initial adoption")
+              try:
+                  lock = json.loads(observed.stdout, object_pairs_hook=unique)
+                  standard = lock["standard"]
+                  if (lock["schema"] != "new-project.lock/v1"
+                          or standard["id"] != "wellmanifest/new-project"
+                          or standard["sourceRepository"] != "wellmanifest/new-project"
+                          or standard["publicationStatus"] != "published"):
+                      reject("unsupported or unpublished trusted adoption")
+                  print(sha(standard["sourceRevision"]))
+              except (ValueError, KeyError, TypeError):
+                  reject("malformed trusted base lock")
+          PY_RUNTIME
+          )"
+          runtime_venv="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/wellman-governance.XXXXXX")"
+          python3 -I -m venv "$runtime_venv"
+          "$runtime_venv/bin/python" -I -m pip install --disable-pip-version-check "git+https://github.com/wellmanifest/new-project.git@${runtime_ref}#subdirectory=packages/wellman"
+          # Accept only a recognized console entrypoint from this isolated runtime.
+          runtime_command="$("$runtime_venv/bin/python" -I - <<'PY_RUNTIME_COMMAND'
+          import os
+          import sys
+          from importlib.metadata import distributions
+          from pathlib import Path
+
+          if sys.prefix == sys.base_prefix:
+              raise SystemExit("Governance runtime requires its isolated environment")
+          found = []
+          for name, command, module in (
+              ("wellmanifest-governance", "wellman-governance", "wellmanifest_governance_runtime"),
+              ("wellman", "wellman", "wellman"),
+          ):
+              matches = list(distributions(name=name))
+              if not matches:
+                  continue
+              if len(matches) != 1:
+                  raise SystemExit("Ambiguous governance runtime distribution: " + name)
+              installed = matches[0]
+              entries = [entry.value for entry in installed.entry_points
+                         if entry.group == "console_scripts" and entry.name == command]
+              launcher = Path(sys.executable).parent / command
+              if (entries != [module + ".check:main"]
+                      or not Path(installed.locate_file("")).resolve().is_relative_to(Path(sys.prefix).resolve())
+                      or launcher.is_symlink() or not launcher.is_file() or not os.access(launcher, os.X_OK)):
+                  raise SystemExit("Unsupported governance runtime identity: " + name)
+              found.append(command)
+          if len(found) != 1:
+              raise SystemExit("Expected exactly one supported governance runtime")
+          print(found[0])
+          PY_RUNTIME_COMMAND
+          )"
+          "$runtime_venv/bin/$runtime_command" --version
+          printf '%s\n' "$runtime_venv/bin" >> "$GITHUB_PATH"
+      - name: Run the managed governance gate
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # CI has no local clone hook; checks bound to a developer clone are
+          # skipped for the ci actor, exactly as for governance_check.py below.
+          range_arguments=()
+          if [[ -n "${BASE_SHA:-}" || -n "${HEAD_SHA:-}" ]]; then
+            if [[ -z "${BASE_SHA:-}" || -z "${HEAD_SHA:-}" ]]; then
+              echo "Both BASE_SHA and HEAD_SHA are required for PR validation." >&2
+              exit 1
+            fi
+            range_arguments=(--base "$BASE_SHA" --head "$HEAD_SHA")
+          fi
+          # Resolve only the runtime installed from the independently selected pin.
+          runtime_module="$(python -I - <<'PY_GATE_RUNTIME'
+          import sys
+          from importlib.metadata import PackageNotFoundError, distribution
+          from pathlib import Path
+
+          if sys.prefix == sys.base_prefix:
+              raise SystemExit("Governance runtime requires its isolated environment")
+          for name, command, module in (
+              ("wellmanifest-governance", "wellman-governance", "wellmanifest_governance_runtime"),
+              ("wellman", "wellman", "wellman"),
+          ):
+              try:
+                  installed = distribution(name)
+              except PackageNotFoundError:
+                  continue
+              expected = module + ".check:main"
+              entries = [entry.value for entry in installed.entry_points
+                         if entry.group == "console_scripts" and entry.name == command]
+              if (entries != [expected]
+                      or not Path(installed.locate_file("")).resolve().is_relative_to(Path(sys.prefix).resolve())):
+                  raise SystemExit("Unsupported governance runtime identity: " + name)
+              print(module)
+              break
+          else:
+              raise SystemExit("Governance runtime is not installed")
+          PY_GATE_RUNTIME
+          )"
+          python -I -m "$runtime_module" check --root . --actor ci --json "${range_arguments[@]}"
+          # The adopter's standard-adoption.json mode decides: "enforce" fails on
+          # missing packs, "audit" reports them without failing the gate.
+          python3 .governance/standard_pack_check.py --root . --format json
+          arguments=(--root . --manifest .governance/manifest.json
+            --lock .governance/manifest.lock.json
+            --stack-profiles .governance/stack-profiles.json --actor ci)
+          python3 .governance/governance_check.py "${arguments[@]}" "${range_arguments[@]}"

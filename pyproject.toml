@@ -28,3 +28,11 @@ include = ["urirun_connector_plesk*"]
 
 [tool.setuptools.package-data]
 urirun_connector_plesk = ["connector.manifest.json", "contracts.json", "extension_profiles.json"]
+
+[tool.wellmanifest]
+standard = "0.20.144"
+revision = "8724674cfa7eebf0c64df2db63ff528ad8dbd159"
+gate = "project/governance-check.sh"
+
+[tool.pytest.ini_options]
+addopts = "-p wellmanifest_governance"
